@@ -16,7 +16,12 @@ set(BUILD_SHARED_LIBS OFF)
 add_subdirectory(../whisper.cpp whisper_build EXCLUDE_FROM_ALL)
 
 #ÎÄ¼þÃû src/main.cpp  src/xxx.cpp 
-add_executable(Translator src/main.cpp src/miniaudio_impl.cpp)
+add_executable(Translator 
+        src/main.cpp 
+        src/miniaudio_impl.cpp
+        src/audio_capture.cpp
+        src/whisper_processor.cpp
+)
 
 target_include_directories(Translator
     PRIVATE

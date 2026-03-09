@@ -1,92 +1,100 @@
-﻿#include<iostream>
-#include "miniaudio.h"
-#include<thread>
+﻿#include "audio_capture.h"
 #include "whisper.h"
+#include <iostream>
+#include <chrono>
+#include <thread>
+#include <vector>
+#include <conio.h>
+#include <windows.h> // 必须包含，用于处理控制台编码
 
-ma_encoder my_encoder;
+whisper_context* whisper_ctx = nullptr;//模型本体非常大所以只能用指针去接受模型的句柄
 
+int main() {
+    // 强制控制台使用 UTF-8 编码，解决中文乱码
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
 
-//回调函数 传输的参数是按照miniaudio给的回调函数的格式来写的,此处在回调函数中往文件里写入数据
-//注意！！回调函数会被频繁的调用所以最好别进行cout等耗时长的操作，以防扰乱采样与数据的写入
-void My_Callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount)
-{
-	//判空
-	if (pInput == nullptr) return;
-	//写入
-	ma_encoder_write_pcm_frames(&my_encoder, pInput, frameCount, nullptr);
+    std::cout << "==========================================" << std::endl;
+    std::cout << "   AudioTranslator - 实时语音识别 (Release)" << std::endl;
+    std::cout << "==========================================" << std::endl;
 
-	
-	static int count = 0;
-	count++;
-	if (count % 20 == 0) {  // 每20次打印一次，避免刷屏
-		std::cout << "回调被调用 " << count << " 次，收到 " << frameCount << " 帧\n";
-	}
-}
-//全局的wav编码器
+    //模型路径与加载模型
+    const char* model_path = "C:/dev/projects/whisper.cpp/models/ggml-small.bin";
+    whisper_ctx = whisper_init_from_file(model_path);
+    if (!whisper_ctx) {
+        std::cerr << "加载模型失败！" << std::endl;
+        return -1;
+    }
 
+    AudioCapture capture;
+    if (!capture.init()) return -1;
+    capture.start();
 
-int main()
-{
-	//初始化配置
-	ma_device_config config = ma_device_config_init(ma_device_type_loopback);
-	config.sampleRate = 16000;
-	config.capture.format = ma_format_f32;
-	config.capture.channels = 1;
-	config.dataCallback = My_Callback;
+    std::cout << "\n>>> 正在监听... 按 'Q' 键安全退出 <<<\n" << std::endl;
 
-	//初始化WAV编码器
-	ma_encoder_config encoderConfig = ma_encoder_config_init(
-			ma_encoding_format_wav,
-		ma_format_f32,
-		1,
-		16000
-	);
+    auto last_process = std::chrono::steady_clock::now();
+    std::vector<float> accumulated_audio;
 
-	ma_result encResult = ma_encoder_init_file("test.wav", &encoderConfig, &my_encoder);
-	if ((encResult != MA_SUCCESS)) {
-		std::cout << "WAV文件创建失败 ,错误码为" << encResult << std::endl;
-		return -1;
-	}
+    while (true) {
+        // 非阻塞退出检测
+        if (_kbhit()) {//读取一个键盘的输入并判断是否为"q/Q"
+            char c = _getch();
+            if (c == 'q' || c == 'Q') break;
+        }
 
-	std::cout << "已准备写入文件" << std::endl;
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - last_process).count();
 
+        // 每 3 秒检查一次
+        if (elapsed >= 3.0) {
+            std::vector<float> new_samples = capture.get_buffer_and_clear();
+            accumulated_audio.insert(accumulated_audio.end(), new_samples.begin(), new_samples.end());
 
+            // 积攒够 5 秒音频才处理
+            if (accumulated_audio.size() >= 16000 * 5) {
 
+                whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+                params.language = "zh";       // 固定中文，减少乱猜
+                params.n_threads = 8;        // 核心数
+                params.print_timestamps = false;
+                params.no_context = true;    // 实时识别设为 true，减少幻听重复文字
+                params.single_segment = true; // 强制输出单段，适合短句实时显示
 
-	//初始化设备
-	ma_device device;
-	ma_result result = ma_device_init(nullptr, &config, &device);
-	//检查结果
-	if (result != MA_SUCCESS) {
-		std::cout << "设备打开失败，错误码:" << result << std::endl;
-		return -1;
-	}
+                auto start_t = std::chrono::steady_clock::now();
 
-	std::cout << "音频设备已初始化" << std::endl;
+                if (whisper_full(whisper_ctx, params, accumulated_audio.data(), (int)accumulated_audio.size()) == 0) {
+                    int n = whisper_full_n_segments(whisper_ctx);
+                    for (int i = 0; i < n; ++i) {
+                        const char* text = whisper_full_get_segment_text(whisper_ctx, i);
+                        // 过滤掉只有符号或过短的干扰项
+                        if (strlen(text) > 3) {
+                            std::cout << "[识别] " << text << std::endl;
+                        }
+                    }
+                }
 
-	//启动采集
-	ma_device_start(&device);
-	if (result != MA_SUCCESS) {
-		std::cout << "启动捕获失败，错误码: " << result << std::endl;
-		ma_device_uninit(&device);
-		ma_encoder_uninit(&my_encoder);
-		return -1;
-	}
-	std::cout << "采集已启动，正在捕获系统音频" << std::endl;
+                auto end_t = std::chrono::steady_clock::now();
+                double dur = std::chrono::duration<double>(end_t - start_t).count();
+                // std::cout << "  (耗时: " << dur << "s)" << std::endl; // 调试用
 
-	//按键退出机制,阻塞main线程，但是miniaudio的函数中创建的线程自己会运行
-	std::cout << "播放声音后进行测试，按q + Enter退出" << std::endl;
-	char ch;
-	do {
-		std::cin >> ch;
-	} while (ch != 'q' && ch != 'Q');
+                // --- 【核心改进：滑动窗口】 ---
+                // 识别完后不要 clear 全库，保留最后 1.5 秒的音频。
+                // 这样如果一句话没说完，它的结尾会作为下一段的开头，识别更准。
+                size_t keep_samples = (size_t)(16000 * 1.5);
+                if (accumulated_audio.size() > keep_samples) {
+                    accumulated_audio.erase(accumulated_audio.begin(), accumulated_audio.end() - keep_samples);
+                }
+            }
+            last_process = std::chrono::steady_clock::now();
+        }
 
-	std::cout << "正在停止设备并保存文件...\n";
-	ma_device_stop(&device);       // 先停止采集
-	ma_device_uninit(&device);     // 释放设备资源
-	ma_encoder_uninit(&my_encoder); // 关闭文件，写入头信息
-	std::cout << "文件 test.wav 已保存完成\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 
+    std::cout << "\n正在停止采集并释放资源..." << std::endl;
+    capture.stop();
+    if (whisper_ctx) whisper_free(whisper_ctx);
 
-	return 0;
+    std::cout << "程序已安全退出。" << std::endl;
+    return 0;
 }
