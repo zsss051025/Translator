@@ -19,7 +19,7 @@ int main() {
     std::cout << "==========================================" << std::endl;
 
     //模型路径与加载模型
-    const char* model_path = "C:/dev/projects/whisper.cpp/models/ggml-small.bin";
+    const char* model_path = "C:/dev/projects/whisper.cpp/models/ggml-base.bin";
     whisper_ctx = whisper_init_from_file(model_path);
     if (!whisper_ctx) {
         std::cerr << "加载模型失败！" << std::endl;
@@ -33,7 +33,7 @@ int main() {
     std::cout << "\n>>> 正在监听... 按 'Q' 键安全退出 <<<\n" << std::endl;
 
     auto last_process = std::chrono::steady_clock::now();
-    std::vector<float> accumulated_audio;
+    std::vector<float> accumulated_audio;//整体的音频数据存储的地方
 
     while (true) {
         // 非阻塞退出检测
@@ -43,7 +43,7 @@ int main() {
         }
 
         auto now = std::chrono::steady_clock::now();
-        double elapsed = std::chrono::duration<double>(now - last_process).count();
+        double elapsed = std::chrono::duration<double>(now - last_process).count();//计算时间差
 
         // 每 3 秒检查一次
         if (elapsed >= 3.0) {
@@ -62,7 +62,7 @@ int main() {
 
                 auto start_t = std::chrono::steady_clock::now();
 
-                if (whisper_full(whisper_ctx, params, accumulated_audio.data(), (int)accumulated_audio.size()) == 0) {
+                if ( whisper_full(whisper_ctx, params, accumulated_audio.data(), (int)accumulated_audio.size() ) == 0) {
                     int n = whisper_full_n_segments(whisper_ctx);
                     for (int i = 0; i < n; ++i) {
                         const char* text = whisper_full_get_segment_text(whisper_ctx, i);
@@ -80,8 +80,8 @@ int main() {
                 // --- 【核心改进：滑动窗口】 ---
                 // 识别完后不要 clear 全库，保留最后 1.5 秒的音频。
                 // 这样如果一句话没说完，它的结尾会作为下一段的开头，识别更准。
-                size_t keep_samples = (size_t)(16000 * 1.5);
-                if (accumulated_audio.size() > keep_samples) {
+                size_t keep_samples = (size_t)(16000 * 3);
+                if (accumulated_audio.size() > keep_samples) {//擦除3s之前的数据，带着这些数据进行下一次循环
                     accumulated_audio.erase(accumulated_audio.begin(), accumulated_audio.end() - keep_samples);
                 }
             }
