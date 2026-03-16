@@ -1,100 +1,91 @@
-﻿#include "audio_capture.h"
-#include "whisper.h"
-#include <iostream>
+﻿#include <iostream>
+#include <vector>
+#include <string>
+#include <conio.h>    // 用于 _kbhit() 和 _getch()
 #include <chrono>
 #include <thread>
-#include <vector>
-#include <conio.h>
-#include <windows.h> // 必须包含，用于处理控制台编码
-
-whisper_context* whisper_ctx = nullptr;//模型本体非常大所以只能用指针去接受模型的句柄
+#include "audio_capture.h"
+#include "SpeechEngine.h"
 
 int main() {
-    // 强制控制台使用 UTF-8 编码，解决中文乱码
-    SetConsoleOutputCP(65001);
-    SetConsoleCP(65001);
+    // 1. 设置控制台为 UTF-8 编码，防止中文乱码
+    system("chcp 65001");
 
-    std::cout << "==========================================" << std::endl;
-    std::cout << "   AudioTranslator - 实时语音识别 (Release)" << std::endl;
-    std::cout << "==========================================" << std::endl;
+    // 2. 初始化引擎（建议使用 small 模型，精度与速度的平衡点）
+    SpeechEngine engine;
+    const std::string model_path = "C:/dev/projects/whisper.cpp/models/ggml-large-v3.bin";
 
-    //模型路径与加载模型
-    const char* model_path = "C:/dev/projects/whisper.cpp/models/ggml-base.bin";
-    whisper_ctx = whisper_init_from_file(model_path);
-    if (!whisper_ctx) {
-        std::cerr << "加载模型失败！" << std::endl;
+    std::cout << "[System] 正在加载模型: " << model_path << " ..." << std::endl;
+    if (!engine.init(model_path)) {
+        std::cerr << "[Error] 模型加载失败，请检查路径！" << std::endl;
         return -1;
     }
 
+    // 3. 启动后台推理线程
+    engine.start();
+
+    // 4. 初始化音频采集
     AudioCapture capture;
-    if (!capture.init()) return -1;
+    if (!capture.init()) {
+        std::cerr << "[Error] 音频设备初始化失败！" << std::endl;
+        return -1;
+    }
     capture.start();
 
-    std::cout << "\n>>> 正在监听... 按 'Q' 键安全退出 <<<\n" << std::endl;
+    std::cout << "\n>>> 实时翻译系统已就绪 <<<" << std::endl;
+    std::cout << ">>> 提示：对着麦克风说话，按 'Q' 键退出系统 <<<" << std::endl;
+    std::cout << "------------------------------------------------" << std::endl;
 
-    auto last_process = std::chrono::steady_clock::now();
-    std::vector<float> accumulated_audio;//整体的音频数据存储的地方
+    // --- 核心逻辑变量 ---
+    std::vector<float> audio_accumulator;      // 音频累加缓冲区
+    const int sample_rate = 16000;             // Whisper 标准采样率
+    const float trigger_seconds = 3.0f;        // 攒够 2 秒音频再进行一次推理
+    const size_t trigger_size = static_cast<size_t>(sample_rate * trigger_seconds);
 
     while (true) {
-        // 非阻塞退出检测
-        if (_kbhit()) {//读取一个键盘的输入并判断是否为"q/Q"
-            char c = _getch();
-            if (c == 'q' || c == 'Q') break;
+        // A. 退出检测
+        if (_kbhit()) {
+            char ch = static_cast<char>(_getch());
+            if (ch == 'q' || ch == 'Q') break;
         }
 
-        auto now = std::chrono::steady_clock::now();
-        double elapsed = std::chrono::duration<double>(now - last_process).count();//计算时间差
+        // B. 采集音频片段
+        std::vector<float> pcm_chunk = capture.get_buffer_and_clear();
 
-        // 每 3 秒检查一次
-        if (elapsed >= 3.0) {
-            std::vector<float> new_samples = capture.get_buffer_and_clear();
-            accumulated_audio.insert(accumulated_audio.end(), new_samples.begin(), new_samples.end());
 
-            // 积攒够 5 秒音频才处理
-            if (accumulated_audio.size() >= 16000 * 5) {
-
-                whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-                params.language = "zh";       // 固定中文，减少乱猜
-                params.n_threads = 8;        // 核心数
-                params.print_timestamps = false;
-                params.no_context = true;    // 实时识别设为 true，减少幻听重复文字
-                params.single_segment = true; // 强制输出单段，适合短句实时显示
-
-                auto start_t = std::chrono::steady_clock::now();
-
-                if ( whisper_full(whisper_ctx, params, accumulated_audio.data(), (int)accumulated_audio.size() ) == 0) {
-                    int n = whisper_full_n_segments(whisper_ctx);
-                    for (int i = 0; i < n; ++i) {
-                        const char* text = whisper_full_get_segment_text(whisper_ctx, i);
-                        // 过滤掉只有符号或过短的干扰项
-                        if (strlen(text) > 3) {
-                            std::cout << "[识别] " << text << std::endl;
-                        }
-                    }
-                }
-
-                auto end_t = std::chrono::steady_clock::now();
-                double dur = std::chrono::duration<double>(end_t - start_t).count();
-                // std::cout << "  (耗时: " << dur << "s)" << std::endl; // 调试用
-
-                // --- 【核心改进：滑动窗口】 ---
-                // 识别完后不要 clear 全库，保留最后 1.5 秒的音频。
-                // 这样如果一句话没说完，它的结尾会作为下一段的开头，识别更准。
-                size_t keep_samples = (size_t)(16000 * 3);
-                if (accumulated_audio.size() > keep_samples) {//擦除3s之前的数据，带着这些数据进行下一次循环
-                    accumulated_audio.erase(accumulated_audio.begin(), accumulated_audio.end() - keep_samples);
-                }
-            }
-            last_process = std::chrono::steady_clock::now();
+        if (!pcm_chunk.empty()) {
+            // 将当前采集到的一丁点声音放入“大池子”
+            audio_accumulator.insert(audio_accumulator.end(), pcm_chunk.begin(), pcm_chunk.end());
         }
 
+        // C. 检查是否达到推理长度阈值
+        if (audio_accumulator.size() >= trigger_size) {
+            // 将攒够的 2 秒音频通过生产者接口塞入 SpeechEngine
+            // 这里使用的是 std::move 来减少一次内存拷贝，符合高性能 C++ 习惯
+            engine.push_audio(audio_accumulator);
+
+            // 发送后清空累加器，准备下一次积累
+            audio_accumulator.clear();
+        }
+
+        // D. 获取并显示最新文字结果
+        std::string result = engine.get_last_text();
+
+        int count = engine.get_inference_count();
+        if (!result.empty()) {
+            // \r 会让光标回到行首，实现原地刷新的效果
+            // 后面加一些空格是为了覆盖掉之前可能更长的文字
+            std::cout << "\r[第 " << count << " 次推理] 文字: " << result << "          " << std::flush;
+        }
+
+        // E. 适当休眠，避免主线程空转占满 CPU
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    std::cout << "\n正在停止采集并释放资源..." << std::endl;
+    // 5. 资源清理
+    std::cout << "\n\n[System] 正在关闭系统..." << std::endl;
     capture.stop();
-    if (whisper_ctx) whisper_free(whisper_ctx);
+    engine.stop();
 
-    std::cout << "程序已安全退出。" << std::endl;
     return 0;
 }

@@ -1,5 +1,5 @@
 #集成vcpkg
-set(CMAKE_TOOLCHAIN_FILE "C:\dev\vcpkg\scripts\buildsystems\vcpkg.cmake" CACHE STRING "")
+set(CMAKE_TOOLCHAIN_FILE "C:/dev/vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE STRING "")
 
 cmake_minimum_required(VERSION 3.20)
 project(AudioTranslator LANGUAGES CXX)
@@ -10,6 +10,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # 关闭 shared，生成静态库
 set(BUILD_SHARED_LIBS OFF)
+set(GGML_CUDA ON CACHE BOOL "Enable CUDA acceleration" FORCE)
 
 
 # 添加 whisper 子工程
@@ -20,7 +21,7 @@ add_executable(Translator
         src/main.cpp 
         src/miniaudio_impl.cpp
         src/audio_capture.cpp
-        src/whisper_processor.cpp
+        src/SpeechEngine.cpp
 )
 
 target_include_directories(Translator
@@ -28,6 +29,7 @@ target_include_directories(Translator
         ${CMAKE_CURRENT_SOURCE_DIR}/external/miniaudio
         ${CMAKE_CURRENT_SOURCE_DIR}/inc
 )
+
 
 
 # 链接 whisper
