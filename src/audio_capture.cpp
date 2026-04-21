@@ -56,7 +56,7 @@ void AudioCapture::stop() {
 //数据传给whisper
 std::vector<float> AudioCapture::get_buffer_and_clear() {
     std::lock_guard<std::mutex> lock(buffer_mutex);
-    std::vector<float> temp = std::move(audio_buffer);//暂时先用vector，后面还环形缓冲
+    std::vector<float> temp = std::move(audio_buffer);//暂时先用vector，后面改环形缓冲
     audio_buffer.clear();
     return temp;
 }

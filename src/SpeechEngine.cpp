@@ -67,9 +67,9 @@ void SpeechEngine::run_inference_loop() {
 		//执行模型推理
 		whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
 		wparams.n_threads = 8;
-		wparams.language = "zh";
+		wparams.language = "auto";
 		wparams.print_timestamps = false;
-		wparams.no_context = true; // 实时模式建议开启
+		wparams.no_context = "auto"; // 实时模式开启
 		wparams.offset_ms = 0;
 		wparams.single_segment = false;
 
