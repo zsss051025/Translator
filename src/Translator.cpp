@@ -6,7 +6,8 @@
 
 using json = nlohmann::json;
 
-Translator::Translator(const std::string& api_key) : api_key_(api_key) {//这里提前为类内的成员进行赋值
+Translator::Translator(const std::string& api_key) : api_key_(api_key),running_(true)//这里提前为类内的成员进行赋值,显示初始化
+{
 	worker_thread_ = std::thread(&Translator::network_worker, this);//需要传入this指针来告诉函数我传入的函数属于哪个对象
 
 }
@@ -59,7 +60,7 @@ void Translator::network_worker() {
 		json payload = {
 					{"model", "deepseek-chat"},
 					{"messages", json::array({
-						{{"role", "system"}, {"content", "你是一个翻译官，直接把文本翻译成中文，不要废话。"}},
+						{{"role", "system"}, {"content", (const char*)u8"你是一个翻译官，直接把文本翻译成中文，不要废话。"}},//强转成utf-8编码的字符串，防止中文乱码
 						{{"role", "user"}, {"content", text_to_translate}}
 					})}
 		};
@@ -79,8 +80,8 @@ void Translator::network_worker() {
 				std::cout << "重试第 " << current_try + 1 << " 次..." << std::endl;
 			}
 
-			if (auto res = cli.Post("/chat/completions", headers, payload.dump(), "application/json")) {
-				if (res->status == 200) {
+			if (auto res = cli.Post("/chat/completions", headers, payload.dump(-1, ' ', false, json::error_handler_t::replace), "application/json")) {// 传参解释：-1(不缩进格式化), ' '(空格符), false(不强制ASCII),
+				if (res->status == 200) {																																										 //json::error_handler_t::replace(遇到乱码自动替换而不是崩溃)
 					try {
 						auto response_json = json::parse(res->body);
 						std::string translated_text = response_json["choices"][0]["message"]["content"];

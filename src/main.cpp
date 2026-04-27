@@ -6,14 +6,26 @@
 #include <thread>
 #include <cmath>
 
+#include "Translator.h"
 #include "audio_capture.h"
 #include "SpeechEngine.h"
 
 
 
 int main() {
-    // 1. 设置控制台为 UTF-8 编码，防止中文乱码
+    //  设置控制台为 UTF-8 编码，防止中文乱码
     system("chcp 65001");
+
+
+    // 1. 从环境变量读取 API Key
+    const char* env_api_key = std::getenv("DEEPSEEK_API_KEY");
+    if (!env_api_key) {
+        std::cerr << "[Error] 未检测到环境变量 DEEPSEEK_API_KEY，请先设置 API Key！" << std::endl;
+        return -1;
+    }
+    std::string api_key = env_api_key;
+    Translator translator(api_key);
+
 
     // 2. 初始化引擎
     SpeechEngine engine;
@@ -138,6 +150,8 @@ int main() {
                 int count = engine.get_inference_count();
                 std::cout << "\r[第 " << count << " 次推理] 文字: " << result << "     " << std::flush;
 				last_displayed_text = result;
+
+				translator.push_text(result);
 			}
             // \r 会让光标回到行首，实现原地刷新的效果
             // 后面加一些空格是为了覆盖掉之前可能更长的文字
@@ -152,6 +166,7 @@ int main() {
     std::cout << "\n\n[System] 正在关闭系统..." << std::endl;
     capture.stop();
     engine.stop();
+	translator.stop();
 
     return 0;
 }

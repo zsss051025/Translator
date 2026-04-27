@@ -22,8 +22,10 @@ private:
 	std::string api_key_;
 	std::queue<std::string> text_queue_;
 	
-	std::thread worker_thread_;
+	//互斥锁和标志位必须在线程对象之前声明，保证它们的生命周期足够长，避免线程访问已经销毁的成员变量导致未定义行为
 	std::mutex queue_mutex_;
 	std::condition_variable cv_;
 	std::atomic<bool> running_{ true };
+	//.h文件中永远要将线程对象放在最后面，保证其他成员变量的生命周期足够长，避免线程访问已经销毁的成员变量导致未定义行为
+	std::thread worker_thread_;
 };
