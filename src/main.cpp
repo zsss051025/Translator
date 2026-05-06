@@ -15,12 +15,10 @@
 int main() {
     //  设置控制台为 UTF-8 编码，防止中文乱码
     system("chcp 65001");
-
-
     // 1. 从环境变量读取 API Key
     const char* env_api_key = std::getenv("DEEPSEEK_API_KEY");
     if (!env_api_key) {
-        std::cerr << "[Error] 未检测到环境变量 DEEPSEEK_API_KEY，请先设置 API Key！" << std::endl;
+        std::cerr << "[Error] 未检测到环境变量 DEEPSEEK_API_KEY,请先设置 API Key!" << std::endl;
         return -1;
     }
     std::string api_key = env_api_key;
@@ -62,6 +60,7 @@ int main() {
 
     float silence_threshold = 0.001f;
     int silence_count = 0;
+    bool has_speech = false;
 
 	std::string last_displayed_text; // 记录上次显示的文本，避免重复输出
     while (true) {
@@ -93,24 +92,26 @@ int main() {
             if (rms <= silence_threshold) {//小于设计的阈值说明没有说话
                 silence_count++;
                 // 池子里有超过 1 秒的声音，就说明一句话说完了
-                if (silence_count > 20 && audio_accumulator.size() > sample_rate * 1) {
+                if (silence_count > 20 && audio_accumulator.size() > sample_rate * 1 && has_speech) {
                     engine.push_audio(audio_accumulator);
                     audio_accumulator.clear();
                     silence_count = 0;
+                    has_speech = false;
                     continue;
                 }
             }
             else {
+                has_speech = true;
                 silence_count = 0;
             }
 
         // C. 检查是否达到推理长度阈值
-        if (audio_accumulator.size() >= trigger_size) {
-            // 将攒够的 2 秒音频通过生产者接口塞入 SpeechEngine
-            // 这里使用的是 std::move 来减少一次内存拷贝，符合高性能 C++ 习惯
+        if (audio_accumulator.size() >= trigger_size && has_speech) {
+            // 将攒够的 3 秒音频通过生产者接口塞入 SpeechEngine
+            // 这里使用的是 std::move 来减少一次内存拷贝，
             engine.push_audio(audio_accumulator);
 
-            // 发送后，不要全清空！采用“滑动窗口”保留最后 1.75 秒的音频作为上下文
+            // 发送后，不要全清空！采用“滑动窗口”保留最后 1.5 秒的音频作为上下文
             const float keep_seconds = 1.5f;
             const size_t keep_size = static_cast<size_t>(sample_rate * keep_seconds);
 
@@ -133,7 +134,7 @@ int main() {
         }
         std::vector<std::string> blacklist = {
             "谢谢观看", "请不吝点赞", "订阅", "打赏", "明镜与点点",
-            "字幕", "Amara", "[音乐]", "(音乐)", "翻译","yoyo"
+            "字幕", "Amara", "[音乐]", "(音乐)", "翻译","yoyo",
             "♪"
         };
 
@@ -148,7 +149,10 @@ int main() {
         if (!result.empty() && !is_hallucination) {
             if(result != last_displayed_text) {
                 int count = engine.get_inference_count();
-                std::cout << "\r[第 " << count << " 次推理] 文字: " << result << "     " << std::flush;
+                std::cout << "\r[第" << count << "] " << result
+                << " | 推理:" << engine.get_last_inference_ms() << "ms"
+                << " 翻译:" << translator.get_last_api_ms() << "ms"
+                << "     " << std::flush;
 				last_displayed_text = result;
 
 				translator.push_text(result);
