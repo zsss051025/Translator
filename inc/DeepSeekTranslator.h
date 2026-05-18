@@ -6,15 +6,18 @@
 #include <condition_variable>
 #include <atomic>
 
-class Translator {
+#include "ITranslator.h"
+
+
+class DeepSeekTranslator : public ITranslator {//云端翻译的类继承自ITranslator虚类
 public:
-	Translator(const std::string& api_key);
-	~Translator();
+	DeepSeekTranslator(const std::string& api_key);
+	~DeepSeekTranslator();																///写到这里了////
 
-	void push_text(const std::string& text); // SpeechEngine 调用此方法传入待翻译文本
+	void push_text(const std::string& text)	override; // SpeechEngine 调用此方法传入待翻译文本
 
-	void stop();
-	long long get_last_api_ms();
+	void stop()	override;
+	long long get_last_api_ms()	override;
 
 
 private:

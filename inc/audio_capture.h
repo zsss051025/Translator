@@ -17,7 +17,6 @@ public:
 
 private:
 	ma_device device;
-	//ma_encoder encoder;
 
 	std::vector<float> audio_buffer;
 	std::mutex buffer_mutex;

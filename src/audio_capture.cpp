@@ -15,22 +15,14 @@ bool AudioCapture::init() {
 	config.sampleRate = 16000;
 	config.capture.format = ma_format_f32;
 	config.capture.channels = 1;
-	config.pUserData = this;
+	config.pUserData = this;//在这里传入this指针，以便在回调函数中访问类成员
 	config.dataCallback = data_callback;
 
-	//// WAV 文件编码初始化（已注释）
-	//ma_encoder_config encoderConfig = ma_encoder_config_init(ma_encoding_format_wav, ma_format_f32, 1, 16000);
-	//ma_result encResult = ma_encoder_init_file("test.wav", &encoderConfig, &encoder);
-	//if (encResult != MA_SUCCESS) {
-	//    std::cout << "WAV文件创建失败，错误码: " << encResult << std::endl;
-	//    return false;
-	//}
 
 	// 初始化设备
 	ma_result result = ma_device_init(nullptr, &config, &device);
 	if (result != MA_SUCCESS) {
 		std::cout << "设备初始化失败，错误码: " << result << std::endl;
-		//ma_encoder_uninit(&encoder);
 		return false;
 	}
 
@@ -48,7 +40,6 @@ void AudioCapture::start() {
 void AudioCapture::stop() {
 	ma_device_stop(&device);
 	ma_device_uninit(&device);
-	//ma_encoder_uninit(&encoder);
 	std::cout << "采集已停止，资源已释放" << std::endl;
 }
 
@@ -62,14 +53,14 @@ std::vector<float> AudioCapture::get_buffer_and_clear() {
 
 void AudioCapture::data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
 	AudioCapture* self = static_cast<AudioCapture*> (pDevice->pUserData);
-	if (self == nullptr) return;
+	if (self == nullptr) return;//类指针为空，无法访问类成员，直接返回
 
-	if (pInput == nullptr) return;
+	if (pInput == nullptr) return;//要采集的内容为空
 
 	//ma_encoder_write_pcm_frames(&self->encoder, pInput, frameCount, nullptr);
 
 	std::lock_guard<std::mutex> lock(self->buffer_mutex);
-	const float* src = static_cast<const float*>(pInput);
+	const float* src = static_cast<const float*>(pInput);//显示转换为 float* 类型，以便插入到缓冲区
 	self->audio_buffer.insert(self->audio_buffer.end(), src, src + frameCount);
 
 	static int count = 0;

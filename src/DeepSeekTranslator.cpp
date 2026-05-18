@@ -1,4 +1,4 @@
-#include "Translator.h"
+#include "DeepSeekTranslator.h"
 #define CPPHTTPLIB_OPENSSL_SUPPORT             // 启用 HTTPS 支持
 #include "httplib.h"
 #include "json.hpp"
@@ -7,17 +7,17 @@
 
 using json = nlohmann::json;
 
-Translator::Translator(const std::string& api_key) : api_key_(api_key), running_(true)
+DeepSeekTranslator::DeepSeekTranslator(const std::string& api_key) : api_key_(api_key), running_(true)
 {
-	worker_thread_ = std::thread(&Translator::network_worker, this);
+	worker_thread_ = std::thread(&DeepSeekTranslator::network_worker, this);
 
 }
 
-Translator::~Translator() {
+DeepSeekTranslator::~DeepSeekTranslator() {
 	stop();
 }
 
-void Translator::push_text(const std::string& text) {
+void DeepSeekTranslator::push_text(const std::string& text) {
 	if (text.empty()) {                       // 空文本直接跳过
 		return;
 	}
@@ -32,7 +32,7 @@ void Translator::push_text(const std::string& text) {
 	cv_.notify_one();
 }
 
-void Translator::stop() {
+void DeepSeekTranslator::stop() {
 	running_ = false;                         // 标记为需要退出的状态
 	cv_.notify_all();
 	if (worker_thread_.joinable()) {
@@ -40,7 +40,7 @@ void Translator::stop() {
 	}
 }
 
-void Translator::network_worker() {
+void DeepSeekTranslator::network_worker() {
 	httplib::Client cli("https://api.deepseek.com");
 	cli.set_connection_timeout(5, 0);
 	cli.set_read_timeout(10, 0);
@@ -126,6 +126,6 @@ void Translator::network_worker() {
 
 }
 
-long long Translator::get_last_api_ms() {
+long long DeepSeekTranslator::get_last_api_ms() {
     return last_api_ms_.load();
 }

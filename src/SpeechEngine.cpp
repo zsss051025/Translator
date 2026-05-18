@@ -14,14 +14,14 @@ SpeechEngine::~SpeechEngine() {
 
 bool SpeechEngine::init(const std::string& model_path) {
 	whisper_context_params params = whisper_context_default_params(); // 默认参数
-	params.use_gpu = true;                         // 启用GPU加速，检测不到GPU自动退回CPU
+	params.use_gpu = true;                    // 启用GPU加速，检测不到GPU自动退回CPU
 
 	whisper_ctx = whisper_init_from_file_with_params(model_path.c_str(), params);
 	return whisper_ctx != nullptr;
 
 }
 void SpeechEngine::start() {
-	if (is_running_) return;
+	if (is_running_) return;//如果已经在运行，直接返回，避免重复启动线程
 	is_running_ = true;
 	worker_thread_ = std::thread(&SpeechEngine::run_inference_loop, this);
 }
@@ -38,7 +38,7 @@ void SpeechEngine::push_audio(const std::vector<float>& data) {
 	std::unique_lock<std::mutex> lock(queue_mutex_);
 
 	// 防堆积
-	if (audio_queue_.size() >= MAX_QUEUE_SIZE) {
+	if (audio_queue_.size() >= MAX_QUEUE_SIZE) {//背压机制：如果队列满了，丢弃最旧的音频段，保持系统响应性
 		std::cerr << "[警告] 推理队列已满(" << MAX_QUEUE_SIZE << ")，丢弃最旧音频段" << std::endl;
 		audio_queue_.pop();
 	}
@@ -68,9 +68,11 @@ void SpeechEngine::run_inference_loop() {
 		}
 		// 执行模型推理
 		whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_BEAM_SEARCH);
-		wparams.n_threads = 8;
+		wparams.n_threads = std::min(4, (int)std::thread::hardware_concurrency() / 2);
 		wparams.language = "auto";                     //自动语言识别，提升多语种环境下的准确率
 		wparams.print_timestamps = false;
+		wparams.strategy = WHISPER_SAMPLING_BEAM_SEARCH;
+		wparams.beam_search.beam_size = 2; // 兼顾极速与高精度
 		wparams.no_context = true;              // 实时模式参数
 		wparams.offset_ms = 0;
 		wparams.single_segment = false;

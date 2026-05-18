@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.20)
 project(AudioTranslator LANGUAGES CXX)
 
 # C++20 标准
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # 关闭 shared 库，只生成静态库
@@ -18,8 +18,12 @@ find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 
 
+# 引入 llama 子工程
+add_subdirectory(../llama.cpp llama_build EXCLUDE_FROM_ALL)
 # 引入 whisper 子工程
 add_subdirectory(../whisper.cpp whisper_build EXCLUDE_FROM_ALL)
+
+
 
 # 可执行文件
 add_executable(Translator
@@ -27,7 +31,11 @@ add_executable(Translator
 	src/miniaudio_impl.cpp
 	src/audio_capture.cpp
 	src/SpeechEngine.cpp
-	"inc/Translator.h" "src/Translator.cpp")
+	"src/DeepSeekTranslator.cpp"
+	"src/HunyuanTranslator.cpp"
+	"inc/DeepSeekTranslator.h" 
+	"inc/ITranslator.h"
+	"inc/HunyuanTranslator.h")
 
 target_include_directories(Translator
 	PRIVATE
@@ -38,6 +46,9 @@ target_include_directories(Translator
 
 # 链接 whisper
 target_link_libraries(Translator PRIVATE whisper)
+
+# 链接 llama
+target_link_libraries(Translator PRIVATE llama)
 
 # 链接 OpenSSL 和 C++ 线程库
 target_link_libraries(Translator
@@ -64,4 +75,5 @@ endif()
 
 if(MSVC)
     target_compile_options(Translator PRIVATE /utf-8)
+	add_compile_options(/Zc:char8_t-)
 endif()
