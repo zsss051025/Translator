@@ -28,13 +28,7 @@ int main() {
         return -1;
     }
     engine.start(); // 让推理线程在后台长亮待机
-
-    // 初始化麦克风设备
-    AudioCapture capture;
-    if (!capture.init()) {
-        std::cerr << "[Error] 音频设备初始化失败！" << std::endl;
-        return -1;
-    }    
+  
 
     while(1) {
         // 1. 选择翻译器
@@ -74,7 +68,12 @@ int main() {
         std::cout << "\n>>> 实时翻译系统已就绪 <<<" << std::endl;
         std::cout << ">>>    按 'Q' 键退出系统 <<<" << std::endl;
         std::cout << "------------------------------------------------" << std::endl;
-        capture.init();
+            // 初始化麦克风设备
+        AudioCapture capture;
+        if (!capture.init()) {
+            std::cerr << "[Error] 音频设备初始化失败！" << std::endl;
+            return -1;
+        }  
         capture.start();
 
         // --- 核心逻辑变量 ---

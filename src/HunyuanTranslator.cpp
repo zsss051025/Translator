@@ -220,10 +220,8 @@ void HunyuanTranslator::translation_worker() {
         auto t2 = std::chrono::steady_clock::now();
         last_api_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
 
-        size_t pos = output.find("<|im_end|>");
-        if (pos != std::string::npos) {
-            output.erase(pos);
-        }
+        size_t pos = output.find("<|im_end");
+        if (pos != std::string::npos) output.erase(pos);
         std::cout << "\n[混元翻译] " << output << " | 耗时:" << last_api_ms_.load() << "ms\n" << std::endl;
 
 
