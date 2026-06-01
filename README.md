@@ -3,18 +3,19 @@
 实时语音翻译系统 —— 采集系统音频 → Whisper 语音识别 → 双后端翻译（云端 DeepSeek / 本地混元 1.8B），支持 GPU 加速与运行时切换。
 
 ## 架构
+```mermaid
+flowchart LR
+    A[🎤 AudioCapture<br/>miniaudio Loopback<br/>16kHz / mono] -->|PCM 音频流| B[🗣️ SpeechEngine<br/>whisper.cpp GPU/CUDA<br/>生产者-消费者队列]
+    B -->|识别文本| C{ITranslator<br/>抽象接口}
 
-```
-┌─────────────────┐     ┌─────────────────┐     ┌──────────────────────┐
-│  AudioCapture   │ ──▶ │   SpeechEngine   │ ──▶ │     ITranslator       │
-│  (miniaudio)    │     │  (whisper.cpp)   │     │  (抽象接口/运行时切换)   │
-│                 │     │                  │     ├──────────────────────┤
-│  Loopback 采集   │     │  GPU/CUDA 推理   │     │ DeepSeekTranslator   │ ← 云端 API
-│  16kHz / mono   │     │  生产者-消费者队列  │     │ HunyuanTranslator    │ ← 本地 llama.cpp
-└─────────────────┘     └─────────────────┘     └──────────────────────┘
-        ↑                       ↑                        ↑
-        │                       │                        │
-    回调写入缓冲          VAD 分句触发推理           虚函数多态分发
+    C -->|虚函数多态| D[☁️ DeepSeekTranslator<br/>HTTP API + 指数退避]
+    C -->|虚函数多态| E[🏠 HunyuanTranslator<br/>本地 llama.cpp GGUF]
+
+    style A fill:#7b9e6d,color:#fff
+    style B fill:#4a90d9,color:#fff
+    style C fill:#d9a443,color:#fff
+    style D fill:#9b59b6,color:#fff
+    style E fill:#9b59b6,color:#fff
 ```
 
 ## 性能实测
