@@ -1,6 +1,3 @@
-# 集成 vcpkg
-set(CMAKE_TOOLCHAIN_FILE "C:/dev/vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE STRING "")
-
 cmake_minimum_required(VERSION 3.20)
 project(AudioTranslator LANGUAGES CXX)
 
@@ -11,7 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # 关闭 shared 库，只生成静态库
 set(BUILD_SHARED_LIBS OFF)
 set(GGML_CUDA ON CACHE BOOL "Enable CUDA acceleration" FORCE)
-
+set(WHISPER_CUDA ON CACHE BOOL "Enable CUDA for whisper" FORCE)
 
 # 寻找系统依赖 (OpenSSL 和多线程)
 find_package(OpenSSL REQUIRED)
@@ -35,7 +32,9 @@ add_executable(Translator
 	"src/HunyuanTranslator.cpp"
 	"inc/DeepSeekTranslator.h" 
 	"inc/ITranslator.h"
-	"inc/HunyuanTranslator.h")
+	"inc/HunyuanTranslator.h"
+	"inc/wav_reader.h"
+)
 
 target_include_directories(Translator
 	PRIVATE
@@ -59,7 +58,7 @@ target_link_libraries(Translator
 )
 
 
-# 链接 Windows 平台库
+# 链接平台库
 if(WIN32)
 	target_link_libraries(Translator
 		PRIVATE
@@ -67,9 +66,14 @@ if(WIN32)
 			winmm
 			dsound
 			ksuser
-			ws2_32   # Windows Socket 2 (网络底层)
-			crypt32  # 证书验证 (HTTPS 连接必需)
-			bcrypt   # 现代加密支持
+			ws2_32
+			crypt32
+			bcrypt
+	)
+elseif(UNIX)
+	target_link_libraries(Translator
+		PRIVATE
+			${CMAKE_DL_LIBS}
 	)
 endif()
 

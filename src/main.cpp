@@ -1,7 +1,9 @@
 ﻿#include <iostream>
 #include <vector>
 #include <string>
-#include <conio.h>    // 用于 _kbhit() 和 _getch()
+#include <termios.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include <chrono>
 #include <thread>
 #include <cmath>
@@ -12,18 +14,46 @@
 #include "DeepSeekTranslator.h"
 #include "audio_capture.h"
 #include "SpeechEngine.h"
+#include "wav_reader.h"
+
+//在linux下模拟win的_kbhit()和_getch()函数
+#ifndef _WIN32
+#include <sys/select.h>
+static int _kbhit() {
+    struct timeval tv = {0,0};
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+    return select(STDIN_FILENO+1, &fds, NULL, NULL, &tv) > 0;
+}
+
+static char _getch() {
+    char ch;
+    struct termios oldt,newt;
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    read(STDIN_FILENO, &ch, 1);
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    return ch;
+}
+
+#endif
 
 
 
 int main() {
     //  设置控制台为 UTF-8 编码，防止中文乱码
-    system("chcp 65001");
+    #ifdef _WIN32
+        system("chcp 65001");//在linux中无效，包一层判断是否在win下
+    #endif
 
     std::cout << "[System] 系统启动中，正在预热基础引擎..." << std::endl;
             
             // 初始化 Whisper 语音引擎
     SpeechEngine engine;
-    if (!engine.init("../../../models/ggml-large-v3.bin")) {
+    if (!engine.init("../../models/ggml-large-v3.bin")) {
         std::cerr << "[Error] Whisper模型加载失败！" << std::endl;
         return -1;
     }
@@ -32,7 +62,7 @@ int main() {
 
     while(1) {
         // 1. 选择翻译器
-        std::cout<< "选择翻译器[1 = DeepSeek / 2 = Hunyuan本地] ,0为退出";
+        std::cout<< "选择翻译器[1 = DeepSeek / 2 = Hunyuan本地 / 3 = WAV文件测试] ,0为退出";
         int choice;
         if (!(std::cin >> choice)) { // 防止非法输入死循环
             std::cin.clear();
@@ -44,7 +74,7 @@ int main() {
 
         std::unique_ptr<ITranslator> translator;
         if(choice == 2) {
-            auto* Hy = new HunyuanTranslator("../../../models/HY-MT1.5-1.8B-Q4_K_M.gguf");
+            auto* Hy = new HunyuanTranslator("../../models/HY-MT1.5-1.8B-Q4_K_M.gguf");
             if(!Hy->init()) {
                 std::cerr << "[Error] Hunyuan翻译器初始化失败!" << std::endl;
                 delete Hy;
@@ -59,6 +89,16 @@ int main() {
                 return -1;
             }
             translator = std::make_unique<DeepSeekTranslator>(env_api_key);
+        } else if(choice == 3) {
+            std::string wav_path;
+            std::cout << "输入 WAV 文件路径: ";
+            std::cin >> wav_path;
+            auto wav_data = read_wav(wav_path, 16000);
+            if (wav_data.empty()) continue;
+            engine.push_audio(wav_data);
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            std::cout << "识别结果: " << engine.get_last_text() << std::endl;
+            continue;
         } else {
             std::cout << "输入无效，请重新选择。" << std::endl;
             continue;

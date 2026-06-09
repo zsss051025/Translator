@@ -11,7 +11,7 @@ AudioCapture::~AudioCapture() {
 
 bool AudioCapture::init() {
 	// 初始化配置
-	ma_device_config config = ma_device_config_init(ma_device_type_loopback);
+	ma_device_config config = ma_device_config_init(ma_device_type_capture);
 	config.sampleRate = 16000;
 	config.capture.format = ma_format_f32;
 	config.capture.channels = 1;
