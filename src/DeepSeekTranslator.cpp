@@ -4,30 +4,38 @@
 #include "json.hpp"
 #include <iostream>
 #include <chrono>
+#include "SessionStore.h"
+#include "CaBundle.h"
 
 using json = nlohmann::json;
 
-DeepSeekTranslator::DeepSeekTranslator(const std::string& api_key) : api_key_(api_key), running_(true)
+DeepSeekTranslator::DeepSeekTranslator(const std::string& api_key) : api_key_(api_key)
 {
-	worker_thread_ = std::thread(&DeepSeekTranslator::network_worker, this);
-
+	// 构造阶段只保存配置，线程统一由 start() 启动，
+	// 与 HunyuanTranslator 的生命周期保持一致。
 }
 
 DeepSeekTranslator::~DeepSeekTranslator() {
 	stop();
 }
 
-void DeepSeekTranslator::push_text(const std::string& text) {
+void DeepSeekTranslator::start() {
+	if (running_) return;                     // 幂等：避免重复启动线程
+	running_ = true;
+	worker_thread_ = std::thread(&DeepSeekTranslator::network_worker, this);
+}
+
+void DeepSeekTranslator::push_text(const std::string& text, double confidence) {
 	if (text.empty()) {                       // 空文本直接跳过
 		return;
 	}
 	{
 		std::lock_guard<std::mutex> lock(queue_mutex_);
 		if(text_queue_.size() >= MAX_QUEUE_SIZE) {
-			std::cerr << "[警告] 翻译队列已满(" << MAX_QUEUE_SIZE<< ")，丢弃最旧文本: " << text_queue_.front() << std::endl;
+			std::cerr << "[警告] 翻译队列已满(" << MAX_QUEUE_SIZE<< ")，丢弃最旧文本: " << text_queue_.front().text << std::endl;
 			text_queue_.pop();
 		}
-		text_queue_.push(text);
+		text_queue_.push(TranslationRequest{text, confidence});
 	}
 	cv_.notify_one();
 }
@@ -40,13 +48,53 @@ void DeepSeekTranslator::stop() {
 	}
 }
 
+void DeepSeekTranslator::set_target_language(const std::string& lang) {
+	if (!lang.empty()) target_lang_ = lang;
+}
+
+std::string DeepSeekTranslator::get_last_translation() const {
+	std::lock_guard<std::mutex> lock(result_mutex_);
+	return last_translation_;
+}
+
+int DeepSeekTranslator::get_translation_count() const {
+	return translation_count_.load();
+}
+
+std::string DeepSeekTranslator::get_last_source() const {
+	std::lock_guard<std::mutex> lock(result_mutex_);
+	return last_source_;
+}
+
+std::string DeepSeekTranslator::target_name() const {
+	if (target_lang_ == "zh")  return "Simplified Chinese";
+	if (target_lang_ == "en")  return "English";
+	if (target_lang_ == "ja")  return "Japanese";
+	if (target_lang_ == "ko")  return "Korean";
+	if (target_lang_ == "fr")  return "French";
+	if (target_lang_ == "de")  return "German";
+	if (target_lang_ == "es")  return "Spanish";
+	if (target_lang_ == "ru")  return "Russian";
+	return target_lang_;
+}
+
 void DeepSeekTranslator::network_worker() {
 	httplib::Client cli("https://api.deepseek.com");
 	cli.set_connection_timeout(5, 0);
 	cli.set_read_timeout(10, 0);
 
+	// OpenSSL 在 Windows 上没有默认 CA 路径，不显式指定的话
+	// HTTPS 校验必定失败（"SSL server verification failed"），云端后端等于不可用。
+	const std::string ca = find_ca_bundle();
+	if (!ca.empty()) {
+		cli.set_ca_cert_path(ca);
+	} else {
+		std::cerr << "[警告] 未找到 CA 证书包，HTTPS 请求可能失败。"
+		             "可设置环境变量 SSL_CERT_FILE 指向 ca-bundle.crt" << std::endl;
+	}
+
 	while (running_) {
-		std::string text_to_translate;
+		TranslationRequest req;
 
 		// 等待数据
 		{
@@ -57,15 +105,22 @@ void DeepSeekTranslator::network_worker() {
 
 			if (!running_ && text_queue_.empty()) break;
 
-			text_to_translate = text_queue_.front();
+			req = text_queue_.front();
 			text_queue_.pop();
 		}
+		const std::string& text_to_translate = req.text;
 
 		// 构建请求体
+		// system prompt 由目标语言决定，不再硬编码"翻译成中文"
+		const std::string sys_prompt =
+			"You are a professional translator. Translate the user's message into " +
+			target_name() +
+			". Output only the translation itself, with no explanation and no quotation marks.";
+
 		json payload = {
 			{"model", "deepseek-chat"},
 			{"messages", json::array({
-				{{"role", "system"}, {"content", "你是一个翻译官，直接把文本翻译成中文，不要废话"}},
+				{{"role", "system"}, {"content", sys_prompt}},
 				{{"role", "user"}, {"content", text_to_translate}}
 			})}
 		};
@@ -94,6 +149,13 @@ void DeepSeekTranslator::network_worker() {
 						auto response_json = json::parse(res->body);
 						std::string translated_text = response_json["choices"][0]["message"]["content"];
 						std::cout << "翻译结果: " << translated_text << std::endl;
+						SessionStore::instance().log_segment(text_to_translate, translated_text, name(), last_api_ms_.load(), req.confidence);
+						{
+							std::lock_guard<std::mutex> lock(result_mutex_);
+							last_translation_ = translated_text;
+							last_source_      = text_to_translate;
+						}
+						translation_count_.fetch_add(1);
 						success = true;
 					}
 					catch (const std::exception& e) {

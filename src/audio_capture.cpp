@@ -1,7 +1,7 @@
 #include "audio_capture.h"
 #include <iostream>
 
-AudioCapture::AudioCapture() {
+AudioCapture::AudioCapture(CaptureSource source) : source_(source) {
 
 }
 
@@ -10,8 +10,16 @@ AudioCapture::~AudioCapture() {
 }
 
 bool AudioCapture::init() {
-	// 初始化配置
-	ma_device_config config = ma_device_config_init(ma_device_type_loopback);
+	if (initialized_) return true;   // 幂等：重复 init 不重复创建设备
+
+	// 环回采集系统播放的声音；麦克风采集默认录音设备。
+	// miniaudio 会自动把设备的原生采样率/声道/格式转换成下面配置的形式，
+	// 所以麦克风不是 16kHz 也没关系。
+	const ma_device_type dev_type = (source_ == CaptureSource::Microphone)
+	                              ? ma_device_type_capture
+	                              : ma_device_type_loopback;
+
+	ma_device_config config = ma_device_config_init(dev_type);
 	config.sampleRate = 16000;
 	config.capture.format = ma_format_f32;
 	config.capture.channels = 1;
@@ -22,25 +30,34 @@ bool AudioCapture::init() {
 	// 初始化设备
 	ma_result result = ma_device_init(nullptr, &config, &device);
 	if (result != MA_SUCCESS) {
-		std::cout << "设备初始化失败，错误码: " << result << std::endl;
+		std::cerr << "[Audio] " << source_name() << " 设备初始化失败，错误码: "
+		          << result << " (" << ma_result_description(result) << ")" << std::endl;
 		return false;
 	}
 
-	std::cout << "音频采集初始化成功" << std::endl;
+	initialized_ = true;
+	std::cout << "[Audio] " << source_name() << " 采集初始化成功" << std::endl;
 	return true;
 }
 
 // 开始采集
 void AudioCapture::start() {
-	ma_device_start(&device);;
-	std::cout << "采集已启动" << std::endl;
+	if (!initialized_) {
+		std::cerr << "[Error] 采集设备尚未初始化，无法启动" << std::endl;
+		return;
+	}
+	ma_device_start(&device);
+	std::cout << "[Audio] " << source_name() << " 采集已启动" << std::endl;
 }
 
-// 停止采集
+// 停止采集（幂等：显式 stop 后析构再次调用不会二次释放设备）
 void AudioCapture::stop() {
+	if (!initialized_) return;
+
 	ma_device_stop(&device);
 	ma_device_uninit(&device);
-	std::cout << "采集已停止，资源已释放" << std::endl;
+	initialized_ = false;
+	std::cout << "[Audio] " << source_name() << " 采集已停止，资源已释放" << std::endl;
 }
 
 // 数据传输给 whisper

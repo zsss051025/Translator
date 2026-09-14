@@ -2,9 +2,10 @@
 set(CMAKE_TOOLCHAIN_FILE "C:/dev/vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE STRING "")
 
 cmake_minimum_required(VERSION 3.20)
-project(AudioTranslator LANGUAGES CXX)
+# sqlite3.c 是 C 源文件，本项目自身也需要 C 语言支持
+project(AudioTranslator LANGUAGES C CXX)
 
-# C++20 标准
+# C++17（原注释写 C++20，与实际设置及 README 不一致，已统一）
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -28,18 +29,36 @@ add_subdirectory(../whisper.cpp whisper_build EXCLUDE_FROM_ALL)
 # 可执行文件
 add_executable(Translator
 	src/main.cpp
+	src/AppConfig.cpp
 	src/miniaudio_impl.cpp
 	src/audio_capture.cpp
 	src/SpeechEngine.cpp
-	"src/DeepSeekTranslator.cpp"
-	"src/HunyuanTranslator.cpp"
-	"inc/DeepSeekTranslator.h" 
-	"inc/ITranslator.h"
-	"inc/HunyuanTranslator.h")
+	src/DeepSeekTranslator.cpp
+	src/HunyuanTranslator.cpp
+	src/SessionStore.cpp
+	src/DeliverableWriter.cpp
+	src/LlmSummarizer.cpp
+	src/CaBundle.cpp
+	src/SubtitleWindow.cpp
+	src/TermFixer.cpp
+
+	inc/AppConfig.h
+	inc/DeepSeekTranslator.h
+	inc/ITranslator.h
+	inc/HunyuanTranslator.h
+	inc/SessionStore.h
+	inc/DeliverableWriter.h
+	inc/LlmSummarizer.h
+	inc/CaBundle.h
+	inc/SubtitleWindow.h
+	inc/TermFixer.h
+
+	external/sqlite3/sqlite3.c)
 
 target_include_directories(Translator
 	PRIVATE
 		${CMAKE_CURRENT_SOURCE_DIR}/external/miniaudio
+		${CMAKE_CURRENT_SOURCE_DIR}/external/sqlite3
 		${CMAKE_CURRENT_SOURCE_DIR}/inc
 		${CMAKE_CURRENT_SOURCE_DIR}/external
 )
