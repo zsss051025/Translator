@@ -31,6 +31,7 @@
 | 改任何代码 | 三 §3.5 + **八** |
 | 碰知识 / 术语 / 记忆 | **六** |
 | 决定接下来做什么 | 一 §1.6 + 七 |
+| 想移植到别的平台 | **三 §3.6**（结论：不做桌面版；要 Linux 就做无界面批处理版） |
 
 ---
 
@@ -87,12 +88,15 @@
 
 | 不做 | 原因 |
 |---|---|
+| **Linux / macOS 桌面版** | 主要用户是 Windows 桌面用户；而且两个核心卖点（**系统音频采集**、**置顶字幕窗**）在 Linux 上要么重写、要么做不到（详见 §3.6）。**移植会先丢掉卖点，再换来一个能跑的壳** |
 | 说话人分离（Diarization） | 赛道里不是硬指标；在线会议改用"双流分轨"绕开（见 §3.5⑨） |
 | **跨会话逐句字幕浏览** | **数量级不成立**：一次会议几百句、一个月上万句，靠滚轮翻等于没有。跨会话要的是"问"和"跳"，不是"翻"（做法见 §6.9 / §6.8 Evidence） |
 | 更强的长期记忆检索 | 属于 P2，会挤掉 P0 |
 | 个人知识图谱、多轮 Agent Planning | 同上 |
 
-> ⚠️ 别把"自增长知识库"和这里的"个人知识图谱"搞混：**知识库是 P0（第六章），知识图谱是它的加强版，属 P2。**
+> ⚠️ **两处别搞混：**
+> 1. "自增长知识库"（第六章）是 **P0**，"个人知识图谱"是它的加强版，属 P2。
+> 2. **不做 Linux 桌面版 ≠ 永远没有 Linux。** 真要 Linux，做的是**无界面批处理版**（喂文件、不出字幕），那个版本恰好**不需要**上面那两个平台专有部件，反而更简单。见 §3.6。
 
 ---
 
@@ -277,6 +281,71 @@ Windows 上 OpenSSL 不会自动用系统证书库，`SSL server verification fa
 
 ---
 
+### 3.6 平台依赖边界（**本项目只做 Windows 桌面版**）
+
+> 结论先写：**不做 Linux/macOS 桌面版**（§1.6）。这一节把边界记清楚，
+> 免得以后有人以为"C++ 写的应该好移植"而低估它。
+
+**各模块的平台依赖实测**
+
+| 模块 | 平台依赖 | 能否直接移植 |
+|---|---|---|
+| `SpeechEngine`（whisper.cpp） | **零** | ✅ 直接可用 |
+| `HunyuanTranslator` / `DeepSeekTranslator` | 零（llama.cpp + httplib/OpenSSL 本身跨平台） | ✅ 直接可用 |
+| `SessionStore` / `DeliverableWriter` / `LlmSummarizer` / `TermFixer` | 零 | ✅ 直接可用 |
+| `AppConfig` | 零（路径分隔符是小事） | ✅ |
+| `CaBundle` | 环境变量 + 相对路径已跨平台；只有两条 Windows Git 路径 | ✅ 加一条 Linux 路径即可 |
+| `main.cpp` | **4 处**：`<conio.h>`、`system("chcp 65001")`、`_kbhit()`、`_getch()` | ✅ 半天级（termios 替身） |
+| `CMakeLists.txt` | vcpkg 工具链硬编码为 `C:/dev/vcpkg`；已有 `if(WIN32)` / `if(MSVC)` 分支 | ✅ 把那一行改条件即可 |
+| **`audio_capture`** | `ma_device_type_loopback`（WASAPI 环回，**Windows 专有**） | ❌ **要换后端** |
+| **`SubtitleWindow`** | 分层窗口 / `WS_EX_*` / `RegisterHotKey` / `WH_MOUSE_LL` / GDI，**整个文件就是平台代码** | ❌ **要重写** |
+
+**两个真障碍（都不是代码量问题）**
+
+**① 系统音频采集：miniaudio 在 Linux 上没有 loopback。**
+Windows 上一行 `ma_device_type_loopback` 拿到扬声器输出；Linux 上必须走 PulseAudio 的 monitor source（`pactl list short sources` 里的 `.monitor`）或 PipeWire。而且"能不能听到 Zoom 里的对方"取决于音频路由——应用输出到哪个 sink 由桌面环境决定，不是程序能假定的。
+
+**② 半透明置顶字幕窗：Wayland 下可能根本做不到。**
+普通应用**不允许**把自己放到任意位置、置顶、且不抢焦点——这是协议层限制，不是代码问题（GNOME 不支持 `wlr-layer-shell`）。X11 下能做，但 X11 正在被淘汰。
+**也就是说"边看画面边看字幕"这个体验，在 Linux/Wayland 上只能退化成全屏覆盖或终端字幕。**
+
+**这两条恰好就是产品的核心卖点。** 移植会先丢掉卖点，再换来一个能跑的壳。
+
+**但"要 Linux"的正确形态不是移植桌面版，而是无界面批处理版：**
+
+```
+输入音频文件/流 → 识别 → 翻译 → 落库 → 出纪要
+```
+
+| 桌面版需要 | 无界面版 |
+|---|---|
+| 采系统声音（要换 PulseAudio/PipeWire 后端） | ❌ 不需要，直接喂文件 |
+| 置顶半透明字幕窗（Wayland 做不到） | ❌ 不需要，没有屏幕 |
+
+而它需要的（whisper.cpp / llama.cpp / SQLite / OpenSSL）**本来就全是跨平台的**。
+所以：**无界面批处理版在 Linux 上比桌面版更简单，因为它砍掉的正是那两个平台专有部件。**
+
+**因此不需要为 Linux 做任何额外工作**，只要把 `--wav <file>` 这个**文件输入入口**做出来（见 §7 P1）：
+它现在就让 L3 端到端测试可脚本化，将来也直接是无界面版的地基。
+
+#### 历史决策：不合并 `da97d96`
+
+远程 `main` 上有一笔早于本线的提交 `da97d96`（2026-06-09「适配 Linux 编译，新增 WAV 文件测试模式」），
+与本文档描述的新线在 `7717ace` 分叉。**决定：不合并。**
+
+| 它的内容 | 处置 |
+|---|---|
+| CMakeLists 去掉硬编码 vcpkg 路径 + `elseif(UNIX)` 链接 `dl` | 可取，十几行，等真需要时再拿 |
+| `_kbhit/_getch` 的 termios 替身、`chcp` 加 `#ifdef _WIN32` | 可取，小且无害 |
+| `inc/wav_reader.h`（WAV 读入 + 重采样到 16k）、菜单式 WAV 测试 | **摘出来**做成正经的 `--wav` 参数（§7 P1） |
+| `ma_device_type_loopback` → `ma_device_type_capture`，**无 `#ifdef` 保护** | ❌ **不能要**：这会让 Windows 上从"采系统声音"退化成"采麦克风"，**把核心能力弄坏** |
+| 模型路径 `../../../models/` → `../../models/` | ❌ 更硬的硬编码；`AppConfig` 已解决，合并是倒退 |
+
+> 当前代码在这点上是对的（`audio_capture.cpp`）：按来源选 `ma_device_type_capture`（麦克风）
+> 还是 `ma_device_type_loopback`（系统声音）。
+
+---
+
 ## 四、怎么跑、怎么测
 
 ### 4.1 构建
@@ -350,6 +419,10 @@ verify_out\session-1\transcript.srt   1611 B
 | `FindWindowW` 返回 0 且 `lastErr=5(ACCESS_DENIED)` | 本机（沙箱）限制，**与本程序无关**。测试脚本请用 `EnumWindows` 按类名找窗口 |
 | 合成滚轮（`SendInput`）有时送不到目标进程的钩子 | 探针进程自己也装一个 `WH_MOUSE_LL` 钩子即可稳定复现 |
 | 屏幕 2560×1600 @150% DPI | 布局常量按 96 DPI 写、用 `MulDiv` 缩放 |
+| `git push` 报 `schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS` | 本机 git 默认 schannel 拿不到凭据。**加 `-c http.sslBackend=openssl` 即可**（`git ls-remote` 匿名可读所以不受影响，容易误判成"远程没问题"） |
+| `git push` 报 `sh.exe: couldn't create signal pipe` 且"读不到用户名" | 沙箱禁止命名管道 → 凭据助手起不来。**在普通终端里推送**，或申报更宽权限 |
+| `Get-Content` 读中文源码显示乱码（`绾跨▼瀹夊叏`） | **误报**：文件是合法 UTF-8，是 PowerShell 用 GBK 解码显示。**别据此"修编码"**，用字节级校验（`UTF8Encoding($false,$true)`）确认 |
+| PowerShell 的 `Select-String` 默认**不区分大小写** | 扫描平台 API 时 `WPARAM` 会撞上 `wparams`，产生假命中。统计前先确认，别据此下结论 |
 
 ---
 
@@ -357,6 +430,7 @@ verify_out\session-1\transcript.srt   1611 B
 
 | 限制 | 影响 | 处置 |
 |---|---|---|
+| **只能在 Windows 上运行** | 换平台跑不起来 | **有意为之**（§1.6 / §3.6）。系统音频采集与置顶字幕窗是平台专有，且 Wayland 下置顶字幕可能做不到。真要 Linux 就做无界面批处理版，不做桌面版移植 |
 | 麦克风双路端到端未实测 | 会议场景（你 + 对方）未验证 | 下次实测 |
 | 云端后端无 API key | 云端翻译/摘要未端到端验证 | 有 key 时补测 |
 | 本地摘要需 instruct 模型 | 默认混元会复读 | 用 `--llm-model` 指定，或退回规则摘要 |
@@ -566,10 +640,11 @@ Erika 是谁？                 → 查 kind=person, key=erika
 | # | 事项 | 说明 |
 |---|---|---|
 | 7 | **Evidence（证据链）** | 摘要/行动项可追溯到 `Session / Segment / Timestamp / 原文`。**这才是"回看"的正确形态**：从结论跳回证据，而不是给窗口接个更大的缓冲。字段已在 §6.8 预留 |
-| 8 | **补全自动场景识别** | 现状：大模型摘要路径会直接给出 `content_type`；**规则兜底路径只靠关键词粗判**（`课`/`lesson`/`lecture`→课程，`会议`/`meeting`→会议），判不出就按"会议"，视频/对话判不出来。要让"打开就用"在任何后端下都成立 |
-| 9 | **去掉启动时的后端选择题** | 现在回车即用默认，但仍是交互步骤。改由参数/环境自动决定，才真正是"打开就听" |
-| 10 | **Action 看板** | 展示 Todo / Doing / Done |
-| 11 | **知识更新时间** | 例："当前 Qwen ASR / 历史 Whisper large-v3"，数据来自 `knowledge_history` |
+| 8 | **WAV 文件输入入口 `--wav <file>`** | 一举两得：① 把 §8.2 的 **L3（真音频端到端）从"要真人说话/放视频"变成可脚本化、可复现**；② 是未来**无界面批处理版**的地基（§3.6）。素材从 `da97d96` 的 `inc/wav_reader.h` 摘（WAV 读入 + 重采样到 16k），但要做成正经参数，不要那笔提交里的菜单选项和写死的 `sleep(5)` |
+| 9 | **补全自动场景识别** | 现状：大模型摘要路径会直接给出 `content_type`；**规则兜底路径只靠关键词粗判**（`课`/`lesson`/`lecture`→课程，`会议`/`meeting`→会议），判不出就按"会议"，视频/对话判不出来。要让"打开就用"在任何后端下都成立 |
+| 10 | **去掉启动时的后端选择题** | 现在回车即用默认，但仍是交互步骤。改由参数/环境自动决定，才真正是"打开就听" |
+| 11 | **Action 看板** | 展示 Todo / Doing / Done |
+| 12 | **知识更新时间** | 例："当前 Qwen ASR / 历史 Whisper large-v3"，数据来自 `knowledge_history` |
 
 ### P2 — 后续研究，**不阻塞比赛版本**
 
@@ -593,37 +668,43 @@ Erika 是谁？                 → 查 kind=person, key=erika
 > 这一章是**操作手册**，不是理念。每一条都是从本项目实际踩过的事里长出来的。
 > 判断标准只有一句：**能不能让"改坏了"在 10 秒内被发现。**
 
-### 8.0 先做这一步：补上基线提交
+### 8.0 仓库纪律
 
-**现状（2026-09-14 核实）**
+#### 已完成：基线提交（2026-09-14）
 
-| | |
-|---|---|
-| 最后一次提交 | `7717ace 2026-06-01` —— **3.5 个月前** |
-| 未提交 | **12 个修改 + 24 个新增**，共 36 个条目 |
-| 未提交里包含 | `SessionStore` / `DeliverableWriter` / `LlmSummarizer` / `SubtitleWindow` / `TermFixer` / `CaBundle` / `AppConfig` / `TranslationLogger` **全部新模块** |
+补上之前 3.5 个月的空档——此前最后一次提交是 `7717ace`（2026-06-01），
+而 `SessionStore` / `DeliverableWriter` / `LlmSummarizer` / `SubtitleWindow` /
+`TermFixer` / `CaBundle` / `AppConfig` 等**全部新模块一行都没提交**。
+**当时的处境是：没有任何可回退的点**，改坏了只能靠记忆恢复——这正是"修好了过两周又改回去"（§8.8⑤）的根因：没有 diff 可看，没有 commit 可退。
 
-**这意味着：这 3.5 个月没有任何可回退的点。** 改坏了只能靠记忆恢复——而"修好了过两周又改回去"正是本项目反复出现的问题（§8.7），根因就在这里：**没有 diff 可看，没有 commit 可退。**
+已落地的 9 笔，按模块边界切，**每一笔都能编译**（①②–⑦ 只新增不被编译的文件，⑧ 才接进 `CMakeLists.txt`）：
 
-**动作（按顺序）**
+| # | 提交 | 内容 |
+|---|---|---|
+| ① | `3419898` | chore: `.gitignore` + CA 证书 + 内置 sqlite3 + 调研材料 |
+| ② | `2e5f3d2` | feat(config): `AppConfig` + `CaBundle` |
+| ③ | `fa0a070` | feat(store): `SessionStore` + `TranslationLogger` |
+| ④ | `71c1b45` | feat(deliverable): 四类交付物 + 离线规则摘要 |
+| ⑤ | `b807ff5` | feat(summary): 大模型摘要与降级 |
+| ⑥ | `b0c3cc0` | feat(term): 专名纠错 |
+| ⑦ | `f14496a` | feat(ui): 悬浮字幕窗 |
+| ⑧ | `a6f4ffd` | feat: 接入构建 + 实时链路改造 |
+| ⑨ | `bc72fd7` | docs: `PROJECT.md` + README 横幅 |
 
-1. `.gitignore` 补 `*.db`（`t.db` 是测试库，不该进仓库）
-2. 按模块边界**分几次提交**，不要一个巨型提交。建议切法：
+配套：
+- tag **`translator-final`** → `7717ace`，把"实时语音翻译版本"封存
+- 分支 **`assistant-baseline`** → 推送远程备份（当时与远程 `main` 有关键分叉，见 §3.6 末）
 
-| 提交 | 内容 |
-|---|---|
-| ① `chore:` | `.gitignore` + `certs/` + `external/sqlite3/` + `tools/` + `terms.sample.txt`（基础设施） |
-| ② `feat: 配置与证书` | `AppConfig` + `CaBundle` |
-| ③ `feat: 会话存储与交付物` | `SessionStore` + `DeliverableWriter` + `TranslationLogger` |
-| ④ `feat: 摘要层` | `LlmSummarizer` |
-| ⑤ `feat: 术语纠错` | `TermFixer` |
-| ⑥ `feat: 悬浮字幕窗` | `SubtitleWindow` |
-| ⑦ `refactor:` | 已有模块的 12 处修改（识别质量、双路采集、语言锁定等） |
-| ⑧ `docs:` | `PROJECT.md` + `README.md` 横幅 + 建议稿 |
+#### 常规提交纪律（长期有效）
 
-3. 提交信息写**为什么**，不写"改了哪些文件"——参考仓库里已有的 `fd5cbb8 加入了延迟测量并解决了一些bug`（这条就没说清是什么 bug、为什么）
-
-> 分这么细不是为了好看：是为了**以后能 `git bisect`**。一个 36 文件的巨型提交，出问题时只能整体回退。
+1. **一次改动一次提交**，提交信息写**为什么**，不写"改了哪些文件"。
+   反例：仓库里已有的 `fd5cbb8 加入了延迟测量并解决了一些bug`——没说清是什么 bug、为什么这么修。
+2. **不要一个巨型提交。** 一个 36 文件的提交出问题时只能整体回退，无法 `git bisect`。
+3. **提交信息里带上"现象/原因/判断"**（若这次是修 bug）。理由同 §8.7：**没有测试框架，提交历史和注释就是回归记忆。**
+4. `.gitignore` 已覆盖 `build/` `out/` `*.db` `*.exe` 等。**加文件前先 `git status` 确认**，
+   不要 `git add -A`——`t.db`（运行时库）和 `out/`（798MB 的 VS 构建目录）都不该进仓库。
+5. **推送前先 `git fetch` 并确认没有分叉。** 这台机器上 `git push` 需要
+   `-c http.sslBackend=openssl`（原因见 §4.5），且**永远不要 `--force`**。
 
 ---
 
@@ -663,6 +744,8 @@ Erika 是谁？                 → 查 kind=person, key=erika
   新写的纯逻辑（如知识库的归一化、缺口检测规则）**先做成可进 L1 的静态函数**，别绑死在模型链路上。
 - **L2 的边界**：`--test-window` 里的时序**必须照抄真实路径**。它自己模拟了一遍"识别→翻译→入历史"，一旦和 `main.cpp` 不一致，就会出现"演示通过但功能是坏的"——这个坑已经踩过（§8.7②）。
 - **L3 需要真实音频**。没有音频源时，说"应该没问题"等于没测，必须如实标注为 ⚠️（§二 的验证状态就是这么来的）。
+  > 现状：L3 只能靠真人说话或放个视频，**不可脚本化**。
+  > 等 `--wav <file>` 做出来（§7 P1 #8），L3 就能变成一条可复现的命令。
 - **L4 不可替代**：DPI 缩放、对比度、字号这些只能人看。但**看了之后要把结论变成 L1/L2 能断言的数字**（例：对比度算出来 2.68:1 → 改成 3.5:1）。
 
 ---
