@@ -1,3 +1,8 @@
+> ⚠️ **本文件已过时**，描述的是早期版本（例如"按提示选择后端"、目录结构、工作流程都已变化）。
+>
+> **开发基准文档请看 [`PROJECT.md`](PROJECT.md)** —— 功能目标、架构、关键设计决定、已知限制、规划都在那里。
+> 两者冲突时，以 `PROJECT.md` 为准。
+
 # AudioTranslator
 
 实时语音翻译系统 —— 采集系统音频 → Whisper 语音识别 → 双后端翻译（云端 DeepSeek / 本地混元 1.8B），支持 GPU 加速与运行时切换。
@@ -31,7 +36,7 @@ flowchart LR
 | 依赖 | 用途 |
 |------|------|
 | CMake >= 3.20 | 构建系统 |
-| MSVC 2022 或 GCC 13+ | 编译器（需支持 C++20） |
+| MSVC 2022 或 GCC 13+ | 编译器（需支持 C++17） |
 | vcpkg | 包管理（安装 OpenSSL） |
 | CUDA Toolkit 12.x | GPU 加速（可选） |
 | [whisper.cpp](https://github.com/ggerganov/whisper.cpp) | 语音识别 |
