@@ -1,0 +1,65 @@
+#pragma once
+#include <string>
+
+// 全局运行配置。
+// 解析优先级：命令行参数 > 环境变量 > 自动探测 > 内置默认值。
+// 这样现场演示时不必依赖某个固定的工作目录（原实现硬编码 "../../../models/"，
+// 换个 cwd 就找不到模型）。
+struct AppConfig {
+    std::string whisper_model;      // Whisper GGML 模型路径
+    std::string hunyuan_model;      // 混元 GGUF 模型路径
+    std::string db_path;            // 翻译记录 SQLite 路径
+    std::string deepseek_api_key;   // 可为空，选择云端后端时才要求非空
+    bool        list_only = false;  // --help / --list：只打印配置后退出
+    bool        selftest  = false;  // --selftest：不加载模型，只验证数据层通路
+    long long   export_session = -1; // --export <id>：把指定会话导出为交付物后退出
+    std::string deliverable_dir = "deliverables";  // --out <目录>：交付物输出根目录
+    bool        demo_session = false; // --demo-session：写入一场演示会话后退出（用于验证导出）
+    bool        test_window  = false; // --test-window：只弹悬浮字幕窗看外观，不加载模型/不采集音频
+
+    // --mic：同时采集麦克风。
+    // 系统音频环回能听见"对方/视频在说什么"，但听不见"你和房间里在说什么"。
+    // 面对面交谈、以及线上通话里你自己说的话，都要靠麦克风。
+    bool        enable_mic = false;
+
+    // ---- 语言策略 ----
+    // source_lang: 源语言。"auto" = 首次自动检测后锁定（默认）；
+    //              也可直接指定 "en"/"zh"/"ja"/"ko" 等，跳过检测。
+    // target_lang: 目标语言（译文语言），默认中文。
+    // lang_recheck_sec: auto 模式下多久重新检测一次源语言（应对中途换内容）。
+    std::string source_lang = "auto";
+    std::string target_lang = "zh";
+    int         lang_recheck_sec = 120;
+
+    // --dump-prompt <文本>：加载混元模型，打印实际 prompt 与 tokenize 结果后退出。
+    // 用于验证特殊 token 是否被正确识别（不需要声卡）。
+    std::string dump_prompt;
+
+    // --glossary <文件>：术语表（每行一个词/短语，# 为注释）。
+    // 内容会作为 initial_prompt 喂给 Whisper，让专有名词识别更稳定。
+    std::string glossary_path;
+
+    // --summarizer auto|rules|local|cloud：导出交付物时用哪种摘要方式。
+    //   auto  —— 有 --llm-model 就用它本地生成；否则有 API Key 就用云端；都没有则用规则
+    //   rules —— 纯规则抽取，完全离线（兜底路径）
+    //   local —— 用 --llm-model 指定的本地模型生成（内容不出本机）
+    //   cloud —— DeepSeek 生成（质量好，但转录会上云）
+    // 任何一种失败都会自动回退到 rules，保证导出永不失败。
+    std::string summarizer = "auto";
+
+    // --llm-model <gguf>：做"理解"任务（摘要、行动项抽取）的本地模型。
+    //
+    // 重要：这里不能用 HY-MT 那个翻译模型。HY-MT1.5-1.8B 是翻译专用模型，
+    // 实测它面对摘要指令会把转录原样回显，完全不执行任务。
+    // 建议指向一个小型指令模型，例如 Qwen2.5-1.5B-Instruct 的 Q4_K_M GGUF（约 1GB）。
+    std::string llm_model;
+
+    // 从命令行与环境变量组装配置
+    static AppConfig from(int argc, char** argv);
+
+    // 打印最终生效的配置，便于现场排查路径问题
+    void dump() const;
+
+    // 配置是否足以启动（whisper 模型存在、云端后端所需的 key 已就绪）
+    bool whisper_ready() const;
+};
