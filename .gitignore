@@ -1,3 +1,4 @@
+# ---- 构建产物 ----
 build/
 Debug/
 Release/
@@ -10,3 +11,12 @@ Release/
 CMakeFiles/
 CMakeCache.txt
 whisper_trt_env/
+
+# Visual Studio 的 CMake 集成输出目录（CMakeSettings.json 生成）
+# 注：这个目录本来就被上面的 build/ 规则匹配到（无前导斜杠的模式匹配任意层级），
+# 这里显式写一条，是为了把意图说清楚，也防止以后有人直接往 out/ 根下放文件。
+out/
+
+# ---- 运行时数据 ----
+# 每次运行都会生成的会话库，属于用户数据，不进仓库
+*.db
