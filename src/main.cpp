@@ -288,11 +288,14 @@ static DeliverableOutcome generate_deliverables(const AppConfig& cfg, long long 
     // 放在这里是刻意的：云端大模型、本地大模型、规则抽取三条路都汇到这一点，
     // 校验一次就能全覆盖。校验规则见 DeliverableWriter::sanitize_actions。
     {
-        std::vector<std::string> dropped;
-        const int n_drop = DeliverableWriter::sanitize_actions(summary.actions, &dropped);
-        if (n_drop > 0) {
-            std::cout << "[摘要] 已剔除 " << n_drop << " 条可疑行动项（宁缺勿滥）：" << std::endl;
-            for (const auto& d : dropped) std::cout << "        - " << d << std::endl;
+        std::vector<std::string> notes;
+        const int n_drop = DeliverableWriter::sanitize_actions(summary.actions, &notes);
+        if (!notes.empty()) {
+            // 措辞注意：n_drop 只数"被丢弃的条目"，而 notes 里还包含
+            // "截止日期无依据已清空"这类**保留但被修正**的条目，两者数量不等。
+            std::cout << "[摘要] 行动项校验：丢弃 " << n_drop << " 条，共 " << notes.size()
+                      << " 处改动（宁缺勿滥）" << std::endl;
+            for (const auto& d : notes) std::cout << "        - " << d << std::endl;
         }
     }
 
@@ -733,6 +736,11 @@ static int run_selftest(const AppConfig& cfg) {
                     "", "Thank you all for joining today's review."},
             // ⑦ 太短
             {false, u8"好的。", "", "Okay."},
+            // ⑧ 词边界回归：裸 find("test") 会命中 "latest"，
+            //    导致这句纯陈述句通过"必须有动作词"这一关（code review 发现）
+            {false, "The latest results are in.", "", "The latest results are in."},
+            // ⑨ 同理 "fix" 不能命中 "prefix"
+            {false, "Use the prefix here.", "", "Use the prefix here."},
         };
 
         bool act_ok = true;

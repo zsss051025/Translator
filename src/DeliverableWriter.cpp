@@ -108,6 +108,30 @@ bool contains_any(const std::string& hay, const std::vector<std::string>& needle
     return false;
 }
 
+// 按"词"匹配（英文动作词专用），不用裸 find()。
+//
+// 【现象】"The latest results are in." 被当成行动项留了下来
+// 【原因】裸 find("test") 命中了 "latest"；同理 "fix" 会命中 "prefix"，
+//         这种误命中让纯陈述句通过了"必须有动作词"这一关
+// 【判断】加新的英文短动词时，务必确认它不会被更长的常见词包进去
+bool contains_word(const std::string& hay_lower, const std::vector<std::string>& words) {
+    auto word_char = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '\'';
+    };
+    for (const auto& w : words) {
+        if (w.empty()) continue;
+        size_t pos = 0;
+        while ((pos = hay_lower.find(w, pos)) != std::string::npos) {
+            const size_t end = pos + w.size();
+            const bool left_ok  = (pos == 0) || !word_char(hay_lower[pos - 1]);
+            const bool right_ok = (end >= hay_lower.size()) || !word_char(hay_lower[end]);
+            if (left_ok && right_ok) return true;
+            pos = end;
+        }
+    }
+    return false;
+}
+
 // UTF-8 安全的"取前 n 个字符"
 std::string utf8_prefix(const std::string& s, size_t max_chars) {
     size_t chars = 0, i = 0;
@@ -169,24 +193,30 @@ std::string normalize_action_text(const std::string& s) {
 // 而判定"是不是真的待办"要看有没有能落地执行的动作。
 // 会话 #11 那句"那么，您应该向我们介绍一下今天这堂课的内容。"就是被"应该"触发的，
 // 它一个严格动作词都没有 —— 这正是要拦的形态。
+//
+// 收录标准：**能接宾语的动词**。名词一律不收——
+// 曾把 u8"报价" 放进来（想覆盖"报价给客户"），结果"这个报价太高了。"这种
+// 纯陈述句也会通过，等于开了个后门。
 const std::vector<std::string>& strict_verbs_zh() {
     static const std::vector<std::string> v = {
         u8"完成", u8"提交", u8"发送", u8"发给", u8"提供", u8"确认", u8"安排",
         u8"准备", u8"跟进", u8"更新", u8"评审", u8"联系", u8"回复", u8"检查",
         u8"整理", u8"汇总", u8"输出", u8"交付", u8"对接", u8"落实", u8"推动",
         u8"部署", u8"上线", u8"测试", u8"推迟", u8"协调", u8"起草", u8"核对",
-        u8"统计", u8"归档", u8"预约", u8"修订", u8"补齐", u8"报价", u8"反馈",
+        u8"统计", u8"归档", u8"预约", u8"修订", u8"补齐", u8"反馈", u8"同步",
     };
     return v;
 }
 
+// 英文动作词。注意：匹配走 contains_word()（按词边界），
+// 所以这里可以放 "book" / "test" 这类短词，不会误命中 "facebook" / "latest"。
 const std::vector<std::string>& strict_verbs_en() {
     static const std::vector<std::string> v = {
         "send", "submit", "provide", "confirm", "schedule", "prepare", "follow up",
         "update", "review", "contact", "reply", "check", "organize", "summarize",
         "deliver", "deploy", "release", "test", "postpone", "coordinate", "draft",
-        "verify", "collect", "archive", "book ", "finalize", "complete", "share",
-        "fix", "revise", "circle back", "sync up",
+        "verify", "collect", "archive", "book", "finalize", "complete", "share",
+        "fix", "revise", "circle back", "sync up", "reach out", "take care of",
     };
     return v;
 }
@@ -492,7 +522,7 @@ int DeliverableWriter::sanitize_actions(std::vector<ActionItem>& actions,
         // R3 没有任何可落地执行的动作词 —— 这一条是主力
         if (reason.empty()) {
             const bool hit_zh = contains_any(a.task, strict_verbs_zh());
-            const bool hit_en = contains_any(lower_ascii(a.task), strict_verbs_en());
+            const bool hit_en = contains_word(lower_ascii(a.task), strict_verbs_en());
             if (!hit_zh && !hit_en) reason = u8"没有可执行的动作词";
         }
 
