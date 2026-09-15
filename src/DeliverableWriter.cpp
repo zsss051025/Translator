@@ -837,6 +837,16 @@ DeliverableWriter::Result DeliverableWriter::write(long long session_id,
     Result r;
     std::error_code ec;
 
+    // 兜底：本函数自己再过一遍行动项校验。
+    //
+    // 校验的主调用点在 main.cpp（那里要打印"丢弃了几条"的日志），但**只放在那里不够**——
+    // 以后谁直接调 write()，假待办就会原样写进交付物。
+    // ActionItem 归本类所有，所以这个不变量就该由本类自己保证。
+    // sanitize_actions 幂等（第二遍没有可改的），重复调用无副作用。
+    MeetingSummary safe = summary;
+    sanitize_actions(safe.actions, nullptr);
+    const MeetingSummary& sum = safe;
+
     const fs::path dir = fs::path(out_root) / ("session-" + std::to_string(session_id));
     fs::create_directories(dir, ec);
     if (ec) {
@@ -853,10 +863,10 @@ DeliverableWriter::Result DeliverableWriter::write(long long session_id,
         bool        bom;
     };
     const Item items[] = {
-        {dir / (base + ".md"),  render_markdown(session_id, segs, meta, summary), false},
-        {dir / (base + ".html"), render_html(session_id, segs, meta, summary),    false},
-        {dir / "actions.csv",    render_actions_csv(summary),                     true},
-        {dir / "transcript.srt", render_srt(segs),                                false},
+        {dir / (base + ".md"),  render_markdown(session_id, segs, meta, sum), false},
+        {dir / (base + ".html"), render_html(session_id, segs, meta, sum),    false},
+        {dir / "actions.csv",    render_actions_csv(sum),                     true},
+        {dir / "transcript.srt", render_srt(segs),                            false},
     };
 
     for (const auto& it : items) {

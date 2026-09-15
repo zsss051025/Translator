@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
 #include <fstream>
 
 // 仅对 ASCII 做小写化（中文不受影响）。
@@ -783,6 +784,40 @@ static int run_selftest(const AppConfig& cfg) {
             std::cout << "[SelfTest] 截止日期无依据时清空: " << (ok ? "✅ 通过" : "❌ 失败")
                       << std::endl;
             if (!ok) return 1;
+        }
+
+        // 单独验"write() 自己会兜底校验"：直接把假条目塞进 summary 交给 write()，
+        // 出来的 actions.csv 里必须没有它。防的是"以后有人绕过 main.cpp 直接调 write()"。
+        {
+            MeetingSummary dirty;
+            dirty.content_type = u8"课程";
+            ActionItem bad;
+            bad.task   = u8"那么，您应该向我们介绍一下今天这堂课的内容。";
+            bad.due    = "today";
+            bad.source = "So, you should tell us a little bit about this lesson for today.";
+            dirty.actions.push_back(bad);
+
+            namespace tfs = std::filesystem;
+            const tfs::path tmp = tfs::current_path() / "_selftest_write";
+            std::error_code ec;
+            tfs::remove_all(tmp, ec);
+
+            const auto wr = DeliverableWriter::write(999999, {}, SessionMeta{}, dirty, tmp.string());
+            std::string csv;
+            if (wr.ok) {
+                std::ifstream f(tfs::path(wr.dir) / "actions.csv", std::ios::binary);
+                csv.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+            }
+            tfs::remove_all(tmp, ec);
+
+            const bool ok = wr.ok && csv.find(u8"您应该") == std::string::npos;
+            std::cout << "[SelfTest] write() 兜底校验（假条目不得落盘）: "
+                      << (ok ? "✅ 通过" : "❌ 失败") << std::endl;
+            if (!ok) {
+                std::cerr << "    write.ok=" << wr.ok << " err=" << wr.error
+                          << "\n    csv 内容: " << csv << std::endl;
+                return 1;
+            }
         }
     }
 
