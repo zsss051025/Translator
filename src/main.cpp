@@ -201,6 +201,32 @@ static void open_with_default_app(const std::string& path) {
     std::system(cmd.c_str());
 }
 
+// 决定用哪个翻译后端：1 = 云端 DeepSeek，2 = 本地混元。
+//
+// 刻意做成**纯函数**（不碰 std::cin、不加载模型），这样能进 L1 自检——
+// §8.2 的"把纯逻辑做成静态函数"就是为这种场合：决策规则要能被秒级验证，
+// 而不是每次都得真启动一遍程序、手敲一遍。
+//
+// 关键规则：**有 --api-key 不代表要用云端翻译**。
+// 用户完全可能只让摘要上云，翻译必须留本机（"数据不出本机"是卖点）。
+// 所以云端翻译只能由 --translator cloud 显式选择。
+static int choose_translator_backend(const AppConfig& cfg, std::string& why) {
+    if (cfg.translator == "cloud") {
+        if (cfg.deepseek_api_key.empty()) {
+            why = "--translator cloud 需要 --api-key（或环境变量 DEEPSEEK_API_KEY），已回退本地";
+            return 2;
+        }
+        why = "--translator cloud";
+        return 1;
+    }
+    if (cfg.translator != "local") {
+        why = "无法识别的 --translator 取值「" + cfg.translator + "」，已按 local 处理";
+        return 2;
+    }
+    why = "--translator local（默认；云端翻译需显式指定 cloud）";
+    return 2;
+}
+
 // 生成一场会话的交付物。
 // 命令行（--export）和会话结束时的自动导出共用这一条路径，
 // 保证两种入口产出的东西完全一致。
@@ -928,6 +954,43 @@ static int run_selftest(const AppConfig& cfg) {
         }
     }
 
+    // ---- 7) 翻译后端选择（纯函数，取代了启动时那道选择题）----
+    {
+        struct TCase { const char* name; const char* translator; const char* key; int want; };
+        const TCase t_cases[] = {
+            // 默认：不指定就是本地（离线、免费、数据不出本机）
+            {"默认",                "local", "",     2},
+            {"显式 local",          "local", "sk-x", 2},
+            // 关键用例：**给了 key 也不能自动走云端翻译** ——
+            // 用户可能只让"摘要"上云，翻译必须留本机
+            {"有 key 但仍默认本地",  "local", "sk-x", 2},
+            {"显式 cloud",          "cloud", "sk-x", 1},
+            // cloud 但没 key：回退本地，而不是崩掉或原地死循环
+            {"cloud 无 key",        "cloud", "",     2},
+            // 拼错的取值：按 local 处理并给出原因，不要静默
+            {"拼错的值",            "clud",  "sk-x", 2},
+        };
+
+        bool t_ok = true;
+        int  t_pass = 0;
+        for (const auto& c : t_cases) {
+            AppConfig tmp;
+            tmp.translator       = c.translator;
+            tmp.deepseek_api_key = c.key;
+            std::string why;
+            const int got = choose_translator_backend(tmp, why);
+            if (got == c.want && !why.empty()) { ++t_pass; continue; }
+            t_ok = false;
+            std::cerr << "[SelfTest] 翻译后端选择失败: " << c.name
+                      << " 期望=" << c.want << " 实际=" << got
+                      << " why为空=" << why.empty() << std::endl;
+        }
+        std::cout << "[SelfTest] 翻译后端选择规则: " << (t_ok ? "✅ " : "❌ ")
+                  << t_pass << "/" << (sizeof(t_cases) / sizeof(t_cases[0]))
+                  << " 通过" << std::endl;
+        if (!t_ok) return 1;
+    }
+
     auto& store = SessionStore::instance();
     if (!store.init(cfg.db_path)) {
         std::cerr << "[SelfTest] init 失败" << std::endl;
@@ -1004,11 +1067,21 @@ int main(int argc, char** argv) {
     std::cout << "[System] 系统启动中，正在预热基础引擎..." << std::endl;
 
             // 初始化 Whisper 语音引擎
+    //
+    // 计时是**产品指标**，不是调试信息：这段时间用户是听不到任何东西的。
+    // 实测（RTX 4060 Laptop + large-v3）加载要 ~100 秒，比一开始估的"20~40 秒"长得多，
+    // 也就是"打开就听"在加载完成前是不成立的。把这个数字打在屏幕上，
+    // 既是给用户的解释，也是以后做优化时的基线。
+    const auto t_load0 = std::chrono::steady_clock::now();
     SpeechEngine engine;
     if (!engine.init(cfg.whisper_model)) {
         std::cerr << "[Error] Whisper模型加载失败！" << std::endl;
         return -1;
     }
+    const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - t_load0).count();
+    std::cout << "[System] Whisper 加载完成，耗时 " << load_ms << " ms"
+              << "（这段时间还在预热，尚未开始记录）" << std::endl;
     // 语言策略：默认"首次检测后锁定"，不再每段重新检测。
     // 实测日志显示 auto 在 3 秒碎片上经常只有 20% 把握，判错一次整段识别就废了。
     engine.set_language_policy(cfg.source_lang, cfg.lang_recheck_sec);
@@ -1025,31 +1098,21 @@ int main(int argc, char** argv) {
     engine.start(); // 让推理线程在后台长亮待机
 
     while(1) {
-        // 1. 选择翻译后端。回车即用默认（本地混元）——产品的承诺是"打开就听"，
-        //    不该让用户先做一道选择题。
+        // 1. 选择翻译后端。
         //
-        // --wav 是测试入口，必须**完全非交互**：这个提示会阻塞在 getline 上，
-        // 自动化脚本没法应答；而且本机实测过，进程内的 system("chcp 65001")
-        // 在 stdin 被重定向时会把管道里的输入吃掉，getline 直接拿到 EOF 退出。
-        // （把那道选择题彻底去掉是 §7 第 1 阶段的 1.2，这里先让 --wav 绕过它。）
-        int choice = 2;   // 默认本地
-        if (cfg.wav_path.empty()) {
-            std::cout << "\n选择翻译后端 [回车 = 本地混元 / 1 = DeepSeek 云端 / 2 = 本地混元 / 0 = 退出]: "
-                      << std::flush;
-            std::string line;
-            if (!std::getline(std::cin, line)) break;
-
-            if (!line.empty()) {
-                try { choice = std::stoi(line); }
-                catch (const std::exception&) { choice = -1; }
-            }
-            if (choice == 0) break;
-        } else {
-            // --api-key 给了就走云端，否则本地。与 --summarizer 的 auto 逻辑同口径。
-            choice = cfg.deepseek_api_key.empty() ? 2 : 1;
-            std::cout << "\n[WAV] 非交互模式，自动选择后端: "
-                      << (choice == 1 ? "DeepSeek 云端" : "本地混元") << std::endl;
-        }
+        // **不再问用户**：产品的承诺是"打开就听"，开始记录之前先答一道选择题
+        // 直接违背它。选择改由 --translator 决定，默认 local（离线、免费、数据不出本机）。
+        //
+        // 【曾经的现象】无参启动后被一道选择题挡住，必须敲回车才开始录
+        // 【为什么必须去掉】① 违背"打开就听"；② 它阻塞在 getline 上，
+        //   自动化（--wav / 脚本 / 批处理）没法应答；
+        //   而且实测 process 内的 system("chcp 65001") 在 stdin 被重定向时
+        //   会把管道里的输入吃掉，getline 直接拿到 EOF 退出
+        // 【判断】若又出现"等你输入"的行为，先查这里是不是把 getline 加回来了
+        std::string why;
+        const int choice = choose_translator_backend(cfg, why);
+        std::cout << "\n[翻译后端] " << (choice == 1 ? "DeepSeek 云端" : "本地混元")
+                  << " —— " << why << std::endl;
 
         std::unique_ptr<ITranslator> translator;
         if(choice == 2) {
@@ -1059,16 +1122,15 @@ int main(int argc, char** argv) {
                 return -1;
             }
             translator = std::move(hy);
-        } else if (choice == 1) {
-            if(cfg.deepseek_api_key.empty()) {
-                std::cerr << "[Error] 未检测到 DeepSeek API Key,请设置环境变量 DEEPSEEK_API_KEY "
-                             "或使用 --api-key 参数!" << std::endl;
-                continue;
+        } else {
+            // choose_translator_backend 保证走到这里时 key 一定非空。
+            // 万一不成立也**不能 continue** —— 选择题已经删掉，下一轮会得到完全相同的
+            // 决策，continue 就是原地死循环。宁可报错退出。
+            if (cfg.deepseek_api_key.empty()) {
+                std::cerr << "[Error] 云端后端缺少 API Key（内部逻辑异常）" << std::endl;
+                return -1;
             }
             translator = std::make_unique<DeepSeekTranslator>(cfg.deepseek_api_key);
-        } else {
-            std::cout << "输入无效，请重新选择。" << std::endl;
-            continue;
         }
 
         translator->start();   // 统一由接口启动工作线程，不再需要向下转型
@@ -1125,6 +1187,12 @@ int main(int argc, char** argv) {
         std::unique_ptr<AudioCapture> capture_mic;
         AudioCapture capture_sys(CaptureSource::SystemLoopback);
         if (!cfg.wav_path.empty()) {
+            // --wav 下麦克风通道无意义（音频来自文件）。显式告知，不要静默忽略 ——
+            // 用户传了 --mic 却听不到自己的声音，会以为麦克风坏了。
+            if (cfg.enable_mic) {
+                std::cout << "[提示] --mic 在 --wav 模式下不生效（音频来源是文件，不是声卡）"
+                          << std::endl;
+            }
             std::cout << "[Audio] --wav 模式：不打开任何音频设备，只回放文件" << std::endl;
         } else {
             if (!capture_sys.init()) {
@@ -1164,7 +1232,13 @@ int main(int argc, char** argv) {
         size_t             wav_pos = 0;
         size_t             wav_silence_left = 0;    // 文件放完后还要喂多久静音
         bool               wav_flushing = false;    // 是否已进入收尾阶段
-        const size_t       wav_block = static_cast<size_t>(sample_rate / 100);   // 10ms
+        // 分块取 1600 采样 = 100ms。**这个数字不是随便定的**：
+        // 实时路径每轮结尾有 sleep(100ms)，而 miniaudio 回调每 ~10ms 往里填一次，
+        // 所以主循环一次 get_buffer_and_clear() 实际拿到的是 ~100ms 的音频。
+        // 回放必须对齐这个量，否则循环里"多少块连续静音"的计数语义会差 10 倍：
+        // 实测按 10ms 喂时 silence_count>20 只等于 200ms 静音（实时是 2 秒），
+        // 分句边界和生产完全不同，A/B 对照就不成立了。
+        const size_t       wav_block = static_cast<size_t>(sample_rate / 10);   // 100ms
         if (!cfg.wav_path.empty()) {
             const WavReader::Result wr = WavReader::read_file(cfg.wav_path, sample_rate);
             if (!wr.ok) {
@@ -1222,8 +1296,9 @@ int main(int argc, char** argv) {
                     pcm_chunk.assign(wav_pcm.begin() + static_cast<ptrdiff_t>(wav_pos),
                                      wav_pcm.begin() + static_cast<ptrdiff_t>(wav_pos + n));
                     wav_pos += n;
-                    // 刻意不用 sleep 模拟实时：分句只取决于"多少个采样点、多少块"，
-                    // 不取决于墙上时钟，所以快速回放的切分结果与实时一致。
+                    // 刻意不用 sleep 模拟实时：分句只取决于"多少采样点、多少块"，
+                    // 不取决于墙上时钟；块大小已按实时路径对齐（100ms），
+                    // 所以快速回放的切分结果与实时一致。
                 } else {
                     // 文件放完了 —— **不能直接 break**。
                     // stop() 里 run_inference_loop 是"先判 is_running_ 再取队列"，
@@ -1453,7 +1528,15 @@ int main(int argc, char** argv) {
             }
 
             // E. 适当休眠，避免主线程空转占满 CPU
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            //
+            // 【为什么 --wav 模式不能睡】实测：11 秒的素材有 1100 块，
+            // 每轮睡 100ms 就是 110 秒 —— 回放被拖成 0.1 倍速，
+            // 一段 5 分钟的测试素材要跑 50 分钟，"可脚本化"就名存实亡了。
+            // 这条 sleep 只对实时路径有意义（没声音时别空转），
+            // 回放的节奏由背压（get_queue_depth）控制。
+            if (wav_pcm.empty()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
         }
 
         // 5. 资源清理
@@ -1490,14 +1573,16 @@ int main(int argc, char** argv) {
             }
         }
 
-        // --wav 是自动化测试入口：**回放一次就退出**，不要回到外层再选一次后端。
-        // 【现象】跑完第一场后自动开了第二场，反复回放同一个文件
-        // 【原因】wav_pcm 声明在外层 while(1) 里，每轮都重新读文件、重置游标
-        // 【判断】若看到"会话 #2 / #3"连开，就是这个 break 被删了或放错了位置
-        if (!cfg.wav_path.empty()) {
-            std::cout << "[WAV] 测试入口完成，退出（不循环）" << std::endl;
-            break;
-        }
+        // 一次运行 = 一场会话：**结束就退出**。
+        //
+        // 【为什么不再循环回开头】外层 while(1) 原本的唯一用途是"结束后让用户换后端再开一场"。
+        // 选择题删掉之后，回开头就是**立刻用同样的配置自动开下一场**——
+        // 用户刚按完 Ctrl+Alt+Q 说"结束"，程序马上又开始录，那是坏行为
+        // （何况再按一次热键会结束一场空会话，产生"本次没有记录到内容"）。
+        // 【判断】若看到会话 #2 自动开起来，先查这个 break 被删了没有。
+        // 代价：想连做两场要重新启动，模型需重新加载（实测见 §2.5）。
+        std::cout << "\n[System] 本次会话已结束。要再记一场请重新运行程序。" << std::endl;
+        break;
     }
     std::cout << "[System] 正在彻底关闭系统..." << std::endl;
     engine.stop();
