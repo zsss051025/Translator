@@ -233,6 +233,80 @@ const std::vector<std::string>& preamble_prefixes() {
     return v;
 }
 
+// 把中英日期表达归一成同一套英文 token，供**跨语言比对**。
+//
+// 【现象】实测云端大模型给出的截止日期「下周五」被判为"无依据"并清空，
+//         但来源原文确实写着 "...by next Friday." —— 是**误杀**
+// 【原因】只比字面。而云端大模型把日期翻成中文是**正常行为**，不是异常，
+//         所以这不是低频边界，是常规路径
+// 【判断】凡是要比对中英混排的字段，都得先归一化再比，不能直接 find
+//
+// 表按**长词优先**排列：u8"下周五" 必须排在 u8"下周" 前面，
+// 否则 "下周五" 会被 "下周" 先吃掉，剩一个孤零零的 "五"。
+std::string canonicalize_date(const std::string& s) {
+    static const std::vector<std::pair<std::string, std::string>> map = {
+        // 复合形式：下/这/本 + 周X（最常见的相对日期）
+        {u8"下周一", " next monday "},    {u8"下周二", " next tuesday "},
+        {u8"下周三", " next wednesday "}, {u8"下周四", " next thursday "},
+        {u8"下周五", " next friday "},    {u8"下周六", " next saturday "},
+        {u8"下周日", " next sunday "},    {u8"下星期天", " next sunday "},
+        {u8"这周五", " this friday "},    {u8"本周五", " this friday "},
+        {u8"这周", " this week "},        {u8"本周", " this week "},
+        {u8"下周", " next week "},        {u8"上周", " last week "},
+        {u8"月底", " end of the month "}, {u8"月末", " end of the month "},
+        {u8"季度末", " end of the quarter "},
+        {u8"今天", " today "},            {u8"今日", " today "},
+        {u8"明天", " tomorrow "},         {u8"明日", " tomorrow "},
+        {u8"周一", " monday "},   {u8"周二", " tuesday "},  {u8"周三", " wednesday "},
+        {u8"周四", " thursday "}, {u8"周五", " friday "},   {u8"周六", " saturday "},
+        {u8"周日", " sunday "},   {u8"星期天", " sunday "}, {u8"星期日", " sunday "},
+    };
+
+    std::string out;
+    out.reserve(s.size() + 16);
+    for (size_t i = 0; i < s.size();) {
+        bool hit = false;
+        for (const auto& kv : map) {
+            if (s.compare(i, kv.first.size(), kv.first) == 0) {
+                out += kv.second;
+                i += kv.first.size();
+                hit = true;
+                break;
+            }
+        }
+        if (hit) continue;
+
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 0x80) {
+            // 这里用不带 locale 的简单小写，避免 <cctype> 的 tolower 受区域设置影响
+            out.push_back(c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : static_cast<char>(c));
+            ++i;
+        } else {
+            // 多字节字符整段拷贝，不能只拷首字节
+            const size_t len = (c & 0xF8) == 0xF0 ? 4 : (c & 0xF0) == 0xE0 ? 3 : 2;
+            if (i + len > s.size()) break;
+            out += s.substr(i, len);
+            i += len;
+        }
+    }
+
+    // 折叠连续空格并去掉首尾：否则 " next friday " 匹配不上 "…next friday."
+    std::string folded;
+    folded.reserve(out.size());
+    bool prev_space = true;                 // 初值 true 让开头的空格被吃掉
+    for (char c : out) {
+        if (c == ' ') {
+            if (!prev_space) folded.push_back(' ');
+            prev_space = true;
+        } else {
+            folded.push_back(c);
+            prev_space = false;
+        }
+    }
+    while (!folded.empty() && folded.back() == ' ') folded.pop_back();
+    return folded;
+}
+
 bool write_file(const fs::path& p, const std::string& content, bool with_bom) {
     std::ofstream f(p, std::ios::binary);
     if (!f) return false;
@@ -534,13 +608,22 @@ int DeliverableWriter::sanitize_actions(std::vector<ActionItem>& actions,
             continue;   // 丢弃
         }
 
-        // R4 截止日期必须有文本依据。
-        // 没有依据的日期比没有日期更糟——用户会照着一个编出来的 deadline 安排工作。
-        // 依据查两处：来源原文（英文）与任务文本（中文译文），覆盖跨语言的情况。
-        if (!a.due.empty()) {
-            const std::string due_l = lower_ascii(a.due);
-            const bool in_src  = lower_ascii(a.source).find(due_l) != std::string::npos;
-            const bool in_task = lower_ascii(a.task).find(due_l)   != std::string::npos;
+        // R4 截止日期必须有文本依据（**只针对相对时间**）。
+        //
+        // 含阿拉伯数字的日期不判定：「10 月 31 日」与「October 31st」这种
+        // 跨语言的月份/序数写法差异太大（10 月 vs October、31 日 vs 31st），
+        // 靠文本比对必然误杀；而具体日期几乎都是从转录里翻译来的，捏造概率低。
+        // 这里只拦「今天 / 下周 / 月底」这类相对时间被凭空造出来的情况。
+        //
+        // 比对前必须 canonicalize_date() 归一化 —— 否则中文 due 对英文 source
+        // 永远对不上，会把正确日期全清空（实测踩过，见该函数的注释）。
+        if (!a.due.empty() &&
+            a.due.find_first_of("0123456789") == std::string::npos) {
+            const std::string due_c  = canonicalize_date(a.due);
+            const std::string src_c  = canonicalize_date(a.source);
+            const std::string task_c = canonicalize_date(a.task);
+            const bool in_src  = !due_c.empty() && src_c.find(due_c)  != std::string::npos;
+            const bool in_task = !due_c.empty() && task_c.find(due_c) != std::string::npos;
             if (!in_src && !in_task) {
                 if (dropped) dropped->push_back(u8"截止日期无依据，已清空：「" + a.due +
                                                 u8"」← " + utf8_prefix(a.task, 30));

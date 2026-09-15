@@ -771,19 +771,48 @@ static int run_selftest(const AppConfig& cfg) {
                   << " 通过" << std::endl;
         if (!act_ok) return 1;
 
-        // 单独验"截止日期必须有依据"：给一个原文里查不到的日期，应被清空而不是丢条目
+        // 单独验"截止日期必须有依据"这一段。
+        // 三个用例全部来自真实运行，不是编的。
         {
-            std::vector<ActionItem> v;
-            ActionItem a;
-            a.task   = u8"请在下周五前提交报价。";
-            a.due    = u8"下周三";                       // 原文里没有
-            a.source = "Please submit the quotation by next Friday.";
-            v.push_back(a);
-            DeliverableWriter::sanitize_actions(v);
-            const bool ok = (v.size() == 1) && v[0].due.empty();
-            std::cout << "[SelfTest] 截止日期无依据时清空: " << (ok ? "✅ 通过" : "❌ 失败")
-                      << std::endl;
-            if (!ok) return 1;
+            struct DueCase { const char* task; const char* due; const char* source; bool keep_due; };
+            const DueCase due_cases[] = {
+                // ① 实测**误杀**：云端大模型把 "next Friday" 翻成「下周五」，
+                //    只比字面必然对不上。归一化之后必须保留。
+                {u8"准备更新后的路线图", u8"下周五",
+                 "Alice will prepare the updated roadmap by next Friday.", true},
+                // ② 具体数字日期不判定：跨语言（10 月 vs October、31 日 vs 31st）没法比
+                {u8"我们需要把交付推迟到 10 月 31 日。", u8"10 月 31 日",
+                 "We need to push the delivery to October 31st.", true},
+                // ③ 真的没依据：原文只说 next Friday，没提下周三
+                {u8"请在下周五前提交报价。", u8"下周三",
+                 "Please submit the quotation by next Friday.", false},
+            };
+
+            bool due_ok = true;
+            int  due_pass = 0;
+            for (const auto& c : due_cases) {
+                std::vector<ActionItem> v;
+                ActionItem a;
+                a.task   = c.task;
+                a.due    = c.due;
+                a.source = c.source;
+                v.push_back(a);
+                DeliverableWriter::sanitize_actions(v);
+
+                const bool kept_due = (v.size() == 1) && !v[0].due.empty();
+                if (kept_due == c.keep_due) { ++due_pass; continue; }
+                due_ok = false;
+                std::cerr << "[SelfTest] 截止日期依据判定失败\n"
+                          << "    任务: " << c.task << "\n"
+                          << "    截止: " << c.due << "\n"
+                          << "    来源: " << c.source << "\n"
+                          << "    期望: " << (c.keep_due ? "保留截止" : "清空截止") << "\n"
+                          << "    实际: " << (kept_due ? "保留截止" : "清空截止") << std::endl;
+            }
+            std::cout << "[SelfTest] 截止日期依据（含跨语言）: " << (due_ok ? "✅ " : "❌ ")
+                      << due_pass << "/" << (sizeof(due_cases) / sizeof(due_cases[0]))
+                      << " 通过" << std::endl;
+            if (!due_ok) return 1;
         }
 
         // 单独验"write() 自己会兜底校验"：直接把假条目塞进 summary 交给 write()，
