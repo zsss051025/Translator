@@ -18,6 +18,7 @@
 #include "SubtitleWindow.h"
 #include "TermFixer.h"
 #include "AppConfig.h"
+#include "WavReader.h"
 
 #include <algorithm>
 #include <cctype>
@@ -850,6 +851,83 @@ static int run_selftest(const AppConfig& cfg) {
         }
     }
 
+    // ---- 6) WAV 读取（--wav 测试入口的输入层）----
+    // 用例现场造 WAV 字节：不依赖磁盘文件，也不依赖模型，秒级可跑。
+    {
+        std::vector<float> sine;
+        sine.reserve(16000);
+        for (int i = 0; i < 16000; ++i) {
+            sine.push_back(0.5f * std::sin(2.0 * 3.14159265358979 * 440.0 * i / 16000.0));
+        }
+
+        // ① 16k 单声道：不做重采样，长度应原样
+        {
+            const auto bytes = WavReader::make_test_wav(sine, 16000, 1);
+            const auto r = WavReader::parse(bytes, 16000);
+            const bool ok = r.ok && r.samples.size() == sine.size() &&
+                            r.src_rate == 16000 && r.src_channels == 1 && r.src_bits == 16;
+            std::cout << "[SelfTest] WAV 16k 单声道直通: " << (ok ? "✅ 通过" : "❌ 失败");
+            if (!ok) std::cout << "  ok=" << r.ok << " err=" << r.error
+                               << " len=" << r.samples.size() << " 期望=" << sine.size();
+            std::cout << std::endl;
+            if (!ok) return 1;
+        }
+
+        // ② 立体声混单声道：长度不变（每帧取平均，不是相加——相加会削顶）
+        {
+            const auto bytes = WavReader::make_test_wav(sine, 16000, 2);
+            const auto r = WavReader::parse(bytes, 16000);
+            const bool ok = r.ok && r.samples.size() == sine.size() && r.src_channels == 2;
+            std::cout << "[SelfTest] WAV 立体声混单声道: " << (ok ? "✅ 通过" : "❌ 失败");
+            if (!ok) std::cout << "  ok=" << r.ok << " err=" << r.error
+                               << " len=" << r.samples.size() << " 期望=" << sine.size();
+            std::cout << std::endl;
+            if (!ok) return 1;
+        }
+
+        // ③ 32k 源 → 16k：长度应减半。这条专门盯"忘了重采样"——
+        //    da97d96 那份 wav_reader.h 就收下了 expected_rate 却从不使用。
+        {
+            std::vector<float> sine32k;
+            sine32k.reserve(32000);
+            for (int i = 0; i < 32000; ++i) {
+                sine32k.push_back(0.5f * std::sin(2.0 * 3.14159265358979 * 440.0 * i / 32000.0));
+            }
+            const auto bytes = WavReader::make_test_wav(sine32k, 32000, 1);
+            const auto r = WavReader::parse(bytes, 16000);
+            const size_t want = 16000;
+            const bool ok = r.ok && r.samples.size() == want && r.src_rate == 32000;
+            std::cout << "[SelfTest] WAV 32k→16k 重采样: " << (ok ? "✅ 通过" : "❌ 失败");
+            if (!ok) std::cout << "  ok=" << r.ok << " err=" << r.error
+                               << " len=" << r.samples.size() << " 期望=" << want;
+            std::cout << std::endl;
+            if (!ok) return 1;
+        }
+
+        // ④ 错误路径必须**报错**，不能静默返回空样本
+        {
+            std::vector<std::pair<std::string, std::vector<unsigned char>>> errs;
+            errs.emplace_back("非 RIFF", std::vector<unsigned char>(100, 'x'));
+            errs.emplace_back("文件过短", std::vector<unsigned char>(10, 0));
+            auto truncated = WavReader::make_test_wav(sine, 16000, 1);
+            truncated.resize(20);
+            errs.emplace_back("头部被截断", std::move(truncated));
+
+            bool err_ok = true;
+            for (const auto& c : errs) {
+                const auto r = WavReader::parse(c.second, 16000);
+                if (r.ok || r.error.empty()) {
+                    err_ok = false;
+                    std::cerr << "[SelfTest] WAV 错误路径失败: " << c.first
+                              << " 应报错，实际 ok=" << r.ok << std::endl;
+                }
+            }
+            std::cout << "[SelfTest] WAV 错误路径要报错(不静默): " << (err_ok ? "✅ " : "❌ ")
+                      << errs.size() << " 例" << std::endl;
+            if (!err_ok) return 1;
+        }
+    }
+
     auto& store = SessionStore::instance();
     if (!store.init(cfg.db_path)) {
         std::cerr << "[SelfTest] init 失败" << std::endl;
@@ -949,18 +1027,29 @@ int main(int argc, char** argv) {
     while(1) {
         // 1. 选择翻译后端。回车即用默认（本地混元）——产品的承诺是"打开就听"，
         //    不该让用户先做一道选择题。
-        std::cout << "\n选择翻译后端 [回车 = 本地混元 / 1 = DeepSeek 云端 / 2 = 本地混元 / 0 = 退出]: "
-                  << std::flush;
-        std::string line;
-        if (!std::getline(std::cin, line)) break;
-
+        //
+        // --wav 是测试入口，必须**完全非交互**：这个提示会阻塞在 getline 上，
+        // 自动化脚本没法应答；而且本机实测过，进程内的 system("chcp 65001")
+        // 在 stdin 被重定向时会把管道里的输入吃掉，getline 直接拿到 EOF 退出。
+        // （把那道选择题彻底去掉是 §7 第 1 阶段的 1.2，这里先让 --wav 绕过它。）
         int choice = 2;   // 默认本地
-        if (!line.empty()) {
-            try { choice = std::stoi(line); }
-            catch (const std::exception&) { choice = -1; }
-        }
+        if (cfg.wav_path.empty()) {
+            std::cout << "\n选择翻译后端 [回车 = 本地混元 / 1 = DeepSeek 云端 / 2 = 本地混元 / 0 = 退出]: "
+                      << std::flush;
+            std::string line;
+            if (!std::getline(std::cin, line)) break;
 
-        if(choice == 0) break;
+            if (!line.empty()) {
+                try { choice = std::stoi(line); }
+                catch (const std::exception&) { choice = -1; }
+            }
+            if (choice == 0) break;
+        } else {
+            // --api-key 给了就走云端，否则本地。与 --summarizer 的 auto 逻辑同口径。
+            choice = cfg.deepseek_api_key.empty() ? 2 : 1;
+            std::cout << "\n[WAV] 非交互模式，自动选择后端: "
+                      << (choice == 1 ? "DeepSeek 云端" : "本地混元") << std::endl;
+        }
 
         std::unique_ptr<ITranslator> translator;
         if(choice == 2) {
@@ -1029,23 +1118,30 @@ int main(int argc, char** argv) {
                  + tail
                  + u8"   结束: " + SubtitleWindow::hotkey_hint();
         };
-        // 音频来源：系统音频环回（对方/视频），可选叠加麦克风（你/房间）
-        AudioCapture capture_sys(CaptureSource::SystemLoopback);
-        if (!capture_sys.init()) {
-            std::cerr << "[Error] 系统音频设备初始化失败！" << std::endl;
-            return -1;
-        }
-        capture_sys.start();
-
+        // 音频来源：系统音频环回（对方/视频），可选叠加麦克风（你/房间）。
+        //
+        // --wav 模式下**完全不初始化音频设备**：测试入口不该依赖声卡，
+        // 否则"没有音频输出设备的机器上跑不了回归"——那就失去可脚本化的意义了。
         std::unique_ptr<AudioCapture> capture_mic;
-        if (cfg.enable_mic) {
-            capture_mic = std::make_unique<AudioCapture>(CaptureSource::Microphone);
-            if (!capture_mic->init()) {
-                std::cerr << "[警告] 麦克风初始化失败，本次只采集系统音频" << std::endl;
-                capture_mic.reset();
-            } else {
-                capture_mic->start();
-                std::cout << "[Audio] 双路采集已启用（系统音频 + 麦克风）" << std::endl;
+        AudioCapture capture_sys(CaptureSource::SystemLoopback);
+        if (!cfg.wav_path.empty()) {
+            std::cout << "[Audio] --wav 模式：不打开任何音频设备，只回放文件" << std::endl;
+        } else {
+            if (!capture_sys.init()) {
+                std::cerr << "[Error] 系统音频设备初始化失败！" << std::endl;
+                return -1;
+            }
+            capture_sys.start();
+
+            if (cfg.enable_mic) {
+                capture_mic = std::make_unique<AudioCapture>(CaptureSource::Microphone);
+                if (!capture_mic->init()) {
+                    std::cerr << "[警告] 麦克风初始化失败，本次只采集系统音频" << std::endl;
+                    capture_mic.reset();
+                } else {
+                    capture_mic->start();
+                    std::cout << "[Audio] 双路采集已启用（系统音频 + 麦克风）" << std::endl;
+                }
             }
         }
 
@@ -1054,6 +1150,37 @@ int main(int argc, char** argv) {
         const int sample_rate = 16000;             // Whisper 标准采样率
         const float trigger_seconds = 3.0f;        // 攒够3秒音频再进行一次推理
         const size_t trigger_size = static_cast<size_t>(sample_rate * trigger_seconds);
+
+        // ---- WAV 回放模式（--wav）----
+        //
+        // 关键设计：**只替换"音频从哪来"，循环体其余部分一行不改**。
+        // 如果为测试另写一条管线，它迟早会和真实路径分叉——
+        // 这正是 §8.8② 踩过的坑（--test-window 自己编时序，结果演示通过、真实路径是坏的）。
+        //
+        // 分块大小取 160 采样 = 10ms，与 WASAPI 回调的典型周期一致。
+        // 这一点必须对齐：循环里的静音计数是"多少个连续静音块"，块变大会让
+        // 分句边界整体变长，测出来的东西就和实时路径不是一回事了。
+        std::vector<float> wav_pcm;
+        size_t             wav_pos = 0;
+        size_t             wav_silence_left = 0;    // 文件放完后还要喂多久静音
+        bool               wav_flushing = false;    // 是否已进入收尾阶段
+        const size_t       wav_block = static_cast<size_t>(sample_rate / 100);   // 10ms
+        if (!cfg.wav_path.empty()) {
+            const WavReader::Result wr = WavReader::read_file(cfg.wav_path, sample_rate);
+            if (!wr.ok) {
+                std::cerr << "[WAV] 读取失败：" << wr.error << std::endl;
+                return -1;
+            }
+            wav_pcm = wr.samples;
+            std::cout << "[WAV] " << cfg.wav_path << " -> "
+                      << wr.src_rate << "Hz " << wr.src_channels << "ch "
+                      << wr.src_bits << "bit，共 " << wr.src_seconds << " 秒；"
+                      << "已转为 16kHz 单声道 " << wav_pcm.size() << " 个采样点" << std::endl;
+            if (wr.src_rate != sample_rate) {
+                std::cout << "[WAV] 注意：源采样率不是 16kHz，已线性插值重采样"
+                             "（未做抗混叠滤波，人声内容影响可忽略）" << std::endl;
+            }
+        }
 
 
         float silence_threshold = 0.001f;
@@ -1077,10 +1204,56 @@ int main(int argc, char** argv) {
                 if (ch == 'q' || ch == 'Q') break;
             }
 
-            // B. 采集音频片段（两路混流）
-            std::vector<float> pcm_chunk = capture_sys.get_buffer_and_clear();
-            if (capture_mic) {
-                mix_audio(pcm_chunk, capture_mic->get_buffer_and_clear());
+            // B. 取得音频片段
+            //
+            // 这里是**两条路径唯一的交汇点**：
+            //   实时：从系统环回取，可选叠加麦克风
+            //   回放（--wav）：从文件里按 10ms 一块取
+            // 往下的 VAD、推理投递、文本清洗、翻译配对、落库、字幕推送全部共用。
+            std::vector<float> pcm_chunk;
+            if (!wav_pcm.empty()) {
+                if (wav_pos < wav_pcm.size()) {
+                    // 背压：队列满时 push_audio 会**丢弃最旧音频段**，
+                    // 那样测试会静默丢内容。所以这里等一等，别把引擎喂爆。
+                    while (engine.get_queue_depth() >= 5) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    }
+                    const size_t n = std::min(wav_block, wav_pcm.size() - wav_pos);
+                    pcm_chunk.assign(wav_pcm.begin() + static_cast<ptrdiff_t>(wav_pos),
+                                     wav_pcm.begin() + static_cast<ptrdiff_t>(wav_pos + n));
+                    wav_pos += n;
+                    // 刻意不用 sleep 模拟实时：分句只取决于"多少个采样点、多少块"，
+                    // 不取决于墙上时钟，所以快速回放的切分结果与实时一致。
+                } else {
+                    // 文件放完了 —— **不能直接 break**。
+                    // stop() 里 run_inference_loop 是"先判 is_running_ 再取队列"，
+                    // 直接退出会把队列里还没推理的段全部丢掉，
+                    // 表现为"WAV 最后 1~2 句没进纪要"。所以改喂静音：
+                    //   ① 静音触发 VAD 把最后一句正常收尾（silence_count > 20）
+                    //   ② 循环继续跑，识别结果照常被翻译、落库、推字幕
+                    //   ③ 队列排空后才退出
+                    if (!wav_flushing) {
+                        wav_flushing = true;
+                        wav_silence_left = static_cast<size_t>(sample_rate) * 5;   // 5 秒
+                        std::cout << "\n[WAV] 回放完毕，喂 5 秒静音让最后一句收尾并排空队列..."
+                                  << std::endl;
+                    }
+                    if (wav_silence_left > 0) {
+                        const size_t n = std::min(wav_block, wav_silence_left);
+                        pcm_chunk.assign(n, 0.0f);
+                        wav_silence_left -= n;
+                    } else if (engine.get_queue_depth() == 0) {
+                        std::cout << "[WAV] 队列已排空，结束回放" << std::endl;
+                        break;
+                    } else {
+                        pcm_chunk.assign(wav_block, 0.0f);   // 继续喂静音，等队列排空
+                    }
+                }
+            } else {
+                pcm_chunk = capture_sys.get_buffer_and_clear();
+                if (capture_mic) {
+                    mix_audio(pcm_chunk, capture_mic->get_buffer_and_clear());
+                }
             }
 
 
@@ -1304,7 +1477,8 @@ int main(int argc, char** argv) {
                     std::cout << "[纪要] 完成：" << out.segment_count << " 条转录，"
                               << out.action_count << " 条行动项" << std::endl;
                     std::cout << "[纪要] 目录: " << out.dir << std::endl;
-                    if (!out.html_path.empty()) {
+                    if (!out.html_path.empty() && cfg.wav_path.empty()) {
+                        // --wav 是自动化测试入口，不要弹浏览器打断脚本
                         std::cout << "[纪要] 正在打开网页..." << std::endl;
                         open_with_default_app(out.html_path);
                     }
@@ -1314,6 +1488,15 @@ int main(int argc, char** argv) {
             } else {
                 std::cout << "[纪要] 本次没有记录到内容，跳过生成" << std::endl;
             }
+        }
+
+        // --wav 是自动化测试入口：**回放一次就退出**，不要回到外层再选一次后端。
+        // 【现象】跑完第一场后自动开了第二场，反复回放同一个文件
+        // 【原因】wav_pcm 声明在外层 while(1) 里，每轮都重新读文件、重置游标
+        // 【判断】若看到"会话 #2 / #3"连开，就是这个 break 被删了或放错了位置
+        if (!cfg.wav_path.empty()) {
+            std::cout << "[WAV] 测试入口完成，退出（不循环）" << std::endl;
+            break;
         }
     }
     std::cout << "[System] 正在彻底关闭系统..." << std::endl;

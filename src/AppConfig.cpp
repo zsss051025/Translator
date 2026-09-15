@@ -96,6 +96,7 @@ AppConfig AppConfig::from(int argc, char** argv) {
         else if (arg == "--selftest")      cfg.selftest = true;
         else if (arg == "--demo-session")  cfg.demo_session = true;
         else if (arg == "--test-window")   cfg.test_window = true;
+        else if (arg == "--wav")           next(cfg.wav_path);
         else if (arg == "--mic")           cfg.enable_mic = true;
         else if (arg == "--lang")          next(cfg.source_lang);
         else if (arg == "--target")        next(cfg.target_lang);

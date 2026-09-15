@@ -211,6 +211,11 @@ void SpeechEngine::push_audio(const std::vector<float>& data) {
 
 }
 
+size_t SpeechEngine::get_queue_depth() const {
+	std::lock_guard<std::mutex> lock(queue_mutex_);
+	return audio_queue_.size();
+}
+
 std::string SpeechEngine::get_last_text() {
 		std::lock_guard<std::mutex> lock(text_mutex_);
 		return last_text_;

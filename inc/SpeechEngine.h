@@ -34,6 +34,13 @@ public:
 	int get_inference_count();
 	long long get_last_inference_ms();              // 获取上次推理耗时
 
+	// 当前待推理的音频段数（背压观察用）。
+	//
+	// 为什么需要它：`--wav` 回放测试音频时会尽可能快地喂数据，
+	// 而队列上限是 MAX_QUEUE_SIZE，满了会**丢弃最旧的音频段**——
+	// 也就是测试会静默丢掉内容。喂数据的一方必须能看到队列深度并等待。
+	size_t get_queue_depth() const;
+
 	// ---- 语言策略 ----
 	// source_lang = "auto" 时：首次推理自动检测并锁定，之后每 recheck_sec 秒重新检测一次
 	// （应对中途换了内容语言）。指定具体语言（"en"/"zh"/"ja"...）则完全跳过检测。
@@ -88,7 +95,7 @@ private:
 	std::atomic<bool> is_running_{ false };         // 原子变量，保证状态变更对所有线程可见
 
 	std::queue<std::vector<float>> audio_queue_;    // 音频数据队列
-	std::mutex  queue_mutex_;                       // 队列锁
+	mutable std::mutex queue_mutex_;                // 队列锁（mutable：get_queue_depth() 是 const）
 	std::condition_variable cv_;                    // 条件变量：有数据时通知消费者线程
 
 	const size_t MAX_QUEUE_SIZE = 10;

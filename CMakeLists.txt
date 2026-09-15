@@ -41,6 +41,7 @@ add_executable(Translator
 	src/CaBundle.cpp
 	src/SubtitleWindow.cpp
 	src/TermFixer.cpp
+	src/WavReader.cpp
 
 	inc/AppConfig.h
 	inc/DeepSeekTranslator.h
@@ -52,6 +53,7 @@ add_executable(Translator
 	inc/CaBundle.h
 	inc/SubtitleWindow.h
 	inc/TermFixer.h
+	inc/WavReader.h
 
 	external/sqlite3/sqlite3.c)
 
