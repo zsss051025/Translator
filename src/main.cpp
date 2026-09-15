@@ -284,6 +284,18 @@ static DeliverableOutcome generate_deliverables(const AppConfig& cfg, long long 
 
     if (!summarized) summary = DeliverableWriter::extract_by_rules(segs);
 
+    // 行动项可信度校验。
+    // 放在这里是刻意的：云端大模型、本地大模型、规则抽取三条路都汇到这一点，
+    // 校验一次就能全覆盖。校验规则见 DeliverableWriter::sanitize_actions。
+    {
+        std::vector<std::string> dropped;
+        const int n_drop = DeliverableWriter::sanitize_actions(summary.actions, &dropped);
+        if (n_drop > 0) {
+            std::cout << "[摘要] 已剔除 " << n_drop << " 条可疑行动项（宁缺勿滥）：" << std::endl;
+            for (const auto& d : dropped) std::cout << "        - " << d << std::endl;
+        }
+    }
+
     const auto res = DeliverableWriter::write(sid, segs, meta, summary, cfg.deliverable_dir);
     if (!res.ok) {
         out.error = res.error;
@@ -694,6 +706,76 @@ static int run_selftest(const AppConfig& cfg) {
                   << rep_pass << "/" << (sizeof(rep_cases) / sizeof(rep_cases[0]))
                   << " 通过" << std::endl;
         if (!rep_ok) return 1;
+    }
+
+    // ---- 5) 行动项可信度校验 ----
+    // 第 1 条用例是**实测会话 #11 里真实出现的假作业**，不是编的。
+    {
+        struct ActCase { bool keep; const char* task; const char* due; const char* source; };
+        const ActCase act_cases[] = {
+            // ① 实测假条目：过场语 + 无动作词（触发词表里的"应该"命中了它）
+            {false, u8"那么，您应该向我们介绍一下今天这堂课的内容。",
+                    "today", "So, you should tell us a little bit about this lesson for today."},
+            // ② 真待办：含"推迟"
+            {true,  u8"我们需要把交付推迟到 10 月 31 日。",
+                    "10 月 31 日", "We need to push the delivery to October 31st."},
+            // ③ 问句形式但确实是待办（含"发给"），不能因为是问句就杀
+            {true,  u8"你能在周五之前把最新的报价发给我吗？",
+                    "周五", "Could you send me the latest quotation before Friday?"},
+            // ④ 英文真待办
+            {true,  "Please send me the latest quotation before Friday.",
+                    "friday", "Please send me the latest quotation before Friday."},
+            // ⑤ 主观评价，不是待办
+            {false, u8"听起来有点复杂。",
+                    "", "That sounds a little bit complicated."},
+            // ⑥ 寒暄
+            {false, u8"感谢大家参加今天的评审。",
+                    "", "Thank you all for joining today's review."},
+            // ⑦ 太短
+            {false, u8"好的。", "", "Okay."},
+        };
+
+        bool act_ok = true;
+        int  act_pass = 0;
+        for (const auto& c : act_cases) {
+            std::vector<ActionItem> v;
+            ActionItem a;
+            a.task   = c.task;
+            a.due    = c.due;
+            a.source = c.source;
+            v.push_back(a);
+
+            DeliverableWriter::sanitize_actions(v);
+            const bool kept = !v.empty();
+            if (kept != c.keep) {
+                act_ok = false;
+                std::cerr << "[SelfTest] 行动项校验失败\n"
+                          << "    任务: " << c.task << "\n"
+                          << "    期望: " << (c.keep ? "保留" : "丢弃") << "\n"
+                          << "    实际: " << (kept ? "保留" : "丢弃") << std::endl;
+                continue;
+            }
+            ++act_pass;
+        }
+        std::cout << "[SelfTest] 行动项可信度校验: " << (act_ok ? "✅ " : "❌ ")
+                  << act_pass << "/" << (sizeof(act_cases) / sizeof(act_cases[0]))
+                  << " 通过" << std::endl;
+        if (!act_ok) return 1;
+
+        // 单独验"截止日期必须有依据"：给一个原文里查不到的日期，应被清空而不是丢条目
+        {
+            std::vector<ActionItem> v;
+            ActionItem a;
+            a.task   = u8"请在下周五前提交报价。";
+            a.due    = u8"下周三";                       // 原文里没有
+            a.source = "Please submit the quotation by next Friday.";
+            v.push_back(a);
+            DeliverableWriter::sanitize_actions(v);
+            const bool ok = (v.size() == 1) && v[0].due.empty();
+            std::cout << "[SelfTest] 截止日期无依据时清空: " << (ok ? "✅ 通过" : "❌ 失败")
+                      << std::endl;
+            if (!ok) return 1;
+        }
     }
 
     auto& store = SessionStore::instance();

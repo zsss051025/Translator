@@ -76,6 +76,19 @@ public:
     // 作为兜底路径，也保证"拔网线可用"这个卖点成立。
     static MeetingSummary extract_by_rules(const std::vector<Segment>& segs);
 
+    // 行动项可信度校验（纯函数，便于单测）。
+    //
+    // 【现象】实测会话 #11 的课堂笔记里出现一条假作业：
+    //         任务「那么，您应该向我们介绍一下今天这堂课的内容。」截止「today」
+    // 【原因】抽取用的触发词表刻意写得宽（含"应该/需要"这类情态词），
+    //         于是一句过场语也能命中；而 prompt 层面的"别乱抽"是靠不住的。
+    // 【判断】这段校验必须跑在**所有后端汇合之后**（云端/本地/规则都要过），
+    //         看到"作业与任务"里出现不像待办的句子，先查这里有没有被绕过。
+    //
+    // 返回被丢弃的条数；dropped 非空时写入每条的被丢原因（用于日志）。
+    static int sanitize_actions(std::vector<ActionItem>& actions,
+                                std::vector<std::string>* dropped = nullptr);
+
     // 由会话信息与段落组装元信息
     static SessionMeta make_meta(const SessionInfo& info,
                                  int count,

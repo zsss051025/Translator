@@ -123,6 +123,86 @@ std::string utf8_prefix(const std::string& s, size_t max_chars) {
     return s.substr(0, std::min(i, s.size()));
 }
 
+// UTF-8 码点数（中文一个字算一个，不是三个）
+size_t utf8_count(const std::string& s) {
+    size_t n = 0;
+    for (unsigned char c : s) if ((c & 0xC0) != 0x80) ++n;
+    return n;
+}
+
+// 归一化：去掉标点与空白，ASCII 转小写。
+// 目的：判断"以什么开头""有没有动作词"时只关心内容，
+// 不被"那么，……"里的逗号或句末句号干扰。
+std::string normalize_action_text(const std::string& s) {
+    static const std::vector<std::string> skip_cp = {
+        u8"。", u8"，", u8"、", u8"？", u8"！", u8"；", u8"：", u8"“", u8"”",
+        u8"‘", u8"’", u8"（", u8"）", u8"《", u8"》", u8"　", u8"—", u8"…", u8"·",
+    };
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 0x80) {
+            const bool punct = (c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+                                c == '.' || c == ',' || c == '!' || c == '?' ||
+                                c == ';' || c == ':' || c == '"' || c == '\'' ||
+                                c == '(' || c == ')' || c == '-' || c == '*' ||
+                                c == '/');
+            if (!punct) out.push_back(static_cast<char>(std::tolower(c)));
+            ++i;
+            continue;
+        }
+        const size_t len = (c & 0xF8) == 0xF0 ? 4 : (c & 0xF0) == 0xE0 ? 3 : 2;
+        if (i + len > s.size()) break;
+        const std::string cp = s.substr(i, len);
+        bool skip = false;
+        for (const auto& k : skip_cp) if (cp == k) { skip = true; break; }
+        if (!skip) out += cp;
+        i += len;
+    }
+    return out;
+}
+
+// 严格动作词：**判定**用的表，比 action_markers_*（**抽取**用的触发表）窄得多。
+//
+// 为什么必须分成两套：触发词表为了不漏，刻意收了"需要/应该/必须"这类情态词；
+// 而判定"是不是真的待办"要看有没有能落地执行的动作。
+// 会话 #11 那句"那么，您应该向我们介绍一下今天这堂课的内容。"就是被"应该"触发的，
+// 它一个严格动作词都没有 —— 这正是要拦的形态。
+const std::vector<std::string>& strict_verbs_zh() {
+    static const std::vector<std::string> v = {
+        u8"完成", u8"提交", u8"发送", u8"发给", u8"提供", u8"确认", u8"安排",
+        u8"准备", u8"跟进", u8"更新", u8"评审", u8"联系", u8"回复", u8"检查",
+        u8"整理", u8"汇总", u8"输出", u8"交付", u8"对接", u8"落实", u8"推动",
+        u8"部署", u8"上线", u8"测试", u8"推迟", u8"协调", u8"起草", u8"核对",
+        u8"统计", u8"归档", u8"预约", u8"修订", u8"补齐", u8"报价", u8"反馈",
+    };
+    return v;
+}
+
+const std::vector<std::string>& strict_verbs_en() {
+    static const std::vector<std::string> v = {
+        "send", "submit", "provide", "confirm", "schedule", "prepare", "follow up",
+        "update", "review", "contact", "reply", "check", "organize", "summarize",
+        "deliver", "deploy", "release", "test", "postpone", "coordinate", "draft",
+        "verify", "collect", "archive", "book ", "finalize", "complete", "share",
+        "fix", "revise", "circle back", "sync up",
+    };
+    return v;
+}
+
+// 过场语 / 寒暄 / 主观臆断开头：这样开头的句子几乎不可能是待办。
+// 刻意**不收** "让我们/咱们"——"让我们下周五前提交报告"是真待办，
+// 收了会把真条目误杀（宁可漏杀，不可误杀）。
+const std::vector<std::string>& preamble_prefixes() {
+    static const std::vector<std::string> v = {
+        u8"那么", u8"好了", u8"好吧", u8"嗯", u8"哦", u8"谢谢", u8"感谢",
+        u8"欢迎", u8"大家好", u8"你好", u8"我觉得", u8"我认为", u8"听起来",
+        u8"看起来", u8"应该说",
+    };
+    return v;
+}
+
 bool write_file(const fs::path& p, const std::string& content, bool with_bom) {
     std::ofstream f(p, std::ios::binary);
     if (!f) return false;
@@ -372,6 +452,79 @@ MeetingSummary DeliverableWriter::extract_by_rules(const std::vector<Segment>& s
 }
 
 // ===============================================================
+// 行动项可信度校验
+//
+// 为什么要有它：行动项来自两条路——大模型抽取（云端/本地）和规则抽取。
+// 大模型会犯两类错，而且**改 prompt 治不住**（prompt 是祈祷，不是保证）：
+//   ① 把过场语/寒暄/主观评价当成待办
+//   ② 给条目凭空填一个截止日期
+// 所以这里用纯规则兜底，跑在渲染之前、所有后端的汇合点上。
+//
+// 设计取向：**宁缺勿滥**。一条假作业比没有作业更糟——用户会当真。
+// 因此这里宁可漏杀也不错杀，白名单（严格动作词）只收能落地执行的动作。
+// ===============================================================
+
+int DeliverableWriter::sanitize_actions(std::vector<ActionItem>& actions,
+                                       std::vector<std::string>* dropped) {
+    std::vector<ActionItem> kept;
+    kept.reserve(actions.size());
+    int n_dropped = 0;
+
+    for (auto& a : actions) {
+        const std::string norm = normalize_action_text(a.task);
+        std::string reason;
+
+        // R1 内容过短：4 个字符以下不可能是一条待办
+        if (utf8_count(norm) < 4) {
+            reason = u8"内容过短";
+        }
+
+        // R2 以过场语/寒暄/主观评价开头
+        if (reason.empty()) {
+            for (const auto& p : preamble_prefixes()) {
+                if (norm.size() >= p.size() && norm.compare(0, p.size(), p) == 0) {
+                    reason = u8"以过场语开头（" + p + u8"）";
+                    break;
+                }
+            }
+        }
+
+        // R3 没有任何可落地执行的动作词 —— 这一条是主力
+        if (reason.empty()) {
+            const bool hit_zh = contains_any(a.task, strict_verbs_zh());
+            const bool hit_en = contains_any(lower_ascii(a.task), strict_verbs_en());
+            if (!hit_zh && !hit_en) reason = u8"没有可执行的动作词";
+        }
+
+        if (!reason.empty()) {
+            ++n_dropped;
+            if (dropped) {
+                dropped->push_back(reason + u8"：" + utf8_prefix(a.task, 40));
+            }
+            continue;   // 丢弃
+        }
+
+        // R4 截止日期必须有文本依据。
+        // 没有依据的日期比没有日期更糟——用户会照着一个编出来的 deadline 安排工作。
+        // 依据查两处：来源原文（英文）与任务文本（中文译文），覆盖跨语言的情况。
+        if (!a.due.empty()) {
+            const std::string due_l = lower_ascii(a.due);
+            const bool in_src  = lower_ascii(a.source).find(due_l) != std::string::npos;
+            const bool in_task = lower_ascii(a.task).find(due_l)   != std::string::npos;
+            if (!in_src && !in_task) {
+                if (dropped) dropped->push_back(u8"截止日期无依据，已清空：「" + a.due +
+                                                u8"」← " + utf8_prefix(a.task, 30));
+                a.due.clear();
+            }
+        }
+
+        kept.push_back(std::move(a));
+    }
+
+    actions = std::move(kept);
+    return n_dropped;
+}
+
 // 元信息
 // ===============================================================
 SessionMeta DeliverableWriter::make_meta(const SessionInfo& info,
