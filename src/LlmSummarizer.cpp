@@ -484,6 +484,37 @@ bool LlmSummarizer::call_model(const std::string& system, const std::string& use
     return true;
 }
 
+std::string LlmSummarizer::build_user_content(const std::vector<Segment>& segs) const {
+    const std::string transcript = build_transcript(segs);
+    if (background_.empty()) return transcript;
+
+    // 背景知识拼在转录**前面**，并明确标注它的性质。
+    //
+    // 【为什么要标注"已确认"】不标的话，小模型会把它当成"转录的一部分"去总结，
+    // 于是纪要里凭空多出几条没发生过的内容。标了之后它是"参考资料"，
+    // 模型只在遇到对应名字时用它对齐写法。
+    //
+    // 【为什么要说"不要与它矛盾"】实测同一个人名在转录里可能有两种写法
+    // （会话 #11 的 Erica / 埃里卡）。有 confirmed 值时应当以它为准 ——
+    // 这正是第二句承诺"用得越久越懂你"在摘要上的体现。
+    std::ostringstream o;
+    if (target_lang_ == "zh") {
+        o << u8"以下是用户已确认的背景知识，请直接采信，不要在输出里与它矛盾：\n";
+    } else {
+        o << "The following is user-confirmed background knowledge. Take it as given "
+             "and do not contradict it:\n";
+    }
+    for (const auto& l : background_) o << l << "\n";
+    if (target_lang_ == "zh") {
+        o << u8"\n以下是本次转录（背景知识**不是**转录内容，不要把它当成发生过的事）：\n";
+    } else {
+        o << "\nBelow is the transcript (the background above is NOT part of it; "
+             "do not treat it as something that happened):\n";
+    }
+    o << transcript;
+    return o.str();
+}
+
 bool LlmSummarizer::summarize(const std::vector<Segment>& segs, MeetingSummary& out,
                               std::string& err) {
     if (segs.empty()) {
@@ -492,7 +523,7 @@ bool LlmSummarizer::summarize(const std::vector<Segment>& segs, MeetingSummary& 
     }
 
     const std::string system = build_system_prompt();
-    const std::string user   = build_transcript(segs);
+    const std::string user   = build_user_content(segs);
 
     std::string raw;
     if (!call_model(system, user, raw, err)) return false;

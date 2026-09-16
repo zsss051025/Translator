@@ -184,6 +184,43 @@ static std::string terms_to_prompt(const std::vector<std::string>& terms) {
     return out;
 }
 
+// ---- 三条腿的输入：全部来自知识库里 **confirmed** 的条目（§7 步骤 2.5）----
+//
+// 三条腿指的是"同一份专名知识"的三个用法：
+//   ① Whisper 的 initial_prompt —— 让识别偏向这些词
+//   ② 翻译约束 —— 统一译文里的专名写法
+//   ③ 摘要背景 —— 让纪要不与用户确认过的事实矛盾
+//
+// 【为什么要在这里统一取一次】原来三条腿各拿各的：① 和 ② 吃 --glossary 文件，
+// ③ 什么都没有。于是"用得越久越懂你"完全没有落点 ——
+// 用户确认过的知识躺在库里，一个字都影响不到识别和翻译。
+//
+// ⚠️ **必须经 KnowledgeStore::constraint_items()**，那是 §6.5 红线的唯一出口。
+//    candidate（模型猜的）绝不能进来：它会污染整条链路，而用户看不出来。
+struct ConstraintInputs {
+    std::vector<std::string> terms;        // ①②③ 里的词条
+    std::vector<std::string> background;   // ③ 的背景行
+    size_t confirmed_total = 0;            // 库里 confirmed 的条目总数（用于日志说明）
+    bool   store_ready     = false;
+};
+
+static ConstraintInputs load_constraints_from_knowledge() {
+    ConstraintInputs ci;
+    auto& ks = KnowledgeStore::instance();
+    if (!SessionStore::instance().long_term_memory_ready()) {
+        // 库还没建好（或 FTS5 没编进来）。**不是错误**：
+        // 没有知识库时行为要跟以前完全一样，不能因此拒绝对话。
+        return ci;
+    }
+    ci.store_ready = true;
+
+    const auto usable = ks.constraint_items();
+    ci.confirmed_total = usable.size();
+    ci.terms      = knowledge::constraint_terms(usable);
+    ci.background = knowledge::background_lines(usable);
+    return ci;
+}
+
 
 // --export <session_id>：把指定会话导出为交付物
 // （纪要 markdown / 行动项 csv / 单文件网页 / 双语字幕）
@@ -320,6 +357,21 @@ static DeliverableOutcome generate_deliverables(const AppConfig& cfg, long long 
                                    : LlmSummarizer::Backend::Local);
         sm.set_api_key(cfg.deepseek_api_key);
         sm.set_target_language(cfg.target_lang);
+
+        // ---- 第三条腿：把 confirmed 知识作为摘要背景（§7 步骤 2.5）----
+        //
+        // 【为什么在这里现取而不是从调用方传进来】`--export` 也要用得到 ——
+        // 用户重出一场旧会话的纪要时，理应用**当前**的知识库，
+        // 而且这正是"越用越懂你"最直观的体现：同一段录音，现在重出会比当时更准。
+        // 传参的话两个入口都得记着传，迟早漏一个。
+        {
+            const auto kb = load_constraints_from_knowledge();
+            sm.set_background(kb.background);
+            if (!kb.background.empty()) {
+                std::cout << "[摘要] 已注入 " << kb.background.size()
+                          << " 条 confirmed 背景知识" << std::endl;
+            }
+        }
 
         // 本地后端需要一个 llama 实例；它只在本次导出期间存活
         std::unique_ptr<HunyuanTranslator> hy;
@@ -578,13 +630,33 @@ static int run_dump_prompt(const AppConfig& cfg) {
     hy.set_target_language(cfg.target_lang);
 
     // 【必须和真实路径一致】这个命令的**唯一价值**就是"让你看到实际送出的 prompt"。
-    // 实测踩过：加了术语约束之后 --dump-prompt 仍然不显示它，因为这条路径
-    // 自己创建翻译器、从没调 set_glossary() —— 于是诊断工具开始撒谎，
-    // 排查时看到的 prompt 和真实运行的不是同一个。
+    // 实测踩过两次：
+    //   ① 加了术语约束之后 --dump-prompt 仍然不显示它，因为这条路径
+    //      自己创建翻译器、从没调 set_glossary()；
+    //   ② 2.5 把术语来源改成"知识库为主"之后，这里如果还只读 --glossary 文件，
+    //      诊断工具会**第二次**开始撒谎，而且这次更难发现 ——
+    //      因为文件路径是空的，prompt 里干干净净，看起来完全正常。
     // 【判断】以后凡是往翻译 prompt 里加东西，都要回来确认这里也加上了。
-    const std::vector<std::string> glossary = load_glossary_terms(cfg.glossary_path);
+    //
+    // 现在直接复用主路径那个"三条腿"的取数函数，两边不可能再走散。
+    SessionStore::instance().init(cfg.db_path);   // 知识库要先打开
+    const auto kb = load_constraints_from_knowledge();
+    std::vector<std::string> glossary = kb.terms;
+    for (const auto& t : load_glossary_terms(cfg.glossary_path)) {
+        bool dup = false;
+        for (const auto& e : glossary) {
+            if (knowledge::normalize_key(e) == knowledge::normalize_key(t)) { dup = true; break; }
+        }
+        if (!dup) glossary.push_back(t);
+    }
     hy.set_glossary(glossary);
-    std::cout << "[Dump] 已载入术语 " << glossary.size() << " 条作为翻译约束" << std::endl;
+    std::cout << "[Dump] 翻译约束共 " << glossary.size() << " 条"
+              << "（知识库 confirmed " << kb.terms.size()
+              << " 条 + --glossary 文件）" << std::endl;
+    if (kb.store_ready) {
+        std::cout << "[Dump] 知识库 confirmed 条目 " << kb.confirmed_total
+                  << " 条，摘要背景 " << kb.background.size() << " 条" << std::endl;
+    }
 
     hy.debug_dump_prompt(cfg.dump_prompt);
 
@@ -1324,6 +1396,160 @@ static int run_selftest(const AppConfig& cfg) {
         std::cout << "[SelfTest] 检索词清洗（标点/操作符/中文）: " << (q_ok ? "✅ " : "❌ ")
                   << q_pass << "/" << (sizeof(qc) / sizeof(qc[0])) << " 通过" << std::endl;
         if (!q_ok) return 1;
+
+        // ---- 三条腿的输入（§7 步骤 2.5）：红线必须守在三处，不只守一处 ----
+        //
+        // 【为什么这一组比"断言 usable_as_constraint 返回 false"更重要】
+        // 只断言守卫函数本身，等于只验"锁是好的、门没关"。
+        // 真正会出的事故是：某条腿绕过了守卫自己按 status 过滤，
+        // 于是 candidate 摸进了识别提示 / 翻译约束 / 摘要背景。
+        // 所以这里**逐个腿断言它的实际输入里没有 candidate**。
+        {
+            using namespace knowledge;
+            bool leg_ok = true;
+            std::string why;
+
+            auto item = [](const char* kind, const char* value, const char* status,
+                           int hits) {
+                KnowledgeItem k;
+                k.kind   = kind;
+                k.key    = value;
+                k.value  = value;
+                k.status = status;
+                k.hits   = hits;
+                return k;
+            };
+
+            const std::vector<KnowledgeItem> items = {
+                item("person",  "Erika",     "confirmed", 9),
+                item("term",    "Phoenix",   "confirmed", 5),
+                item("project", "Apollo",    "confirmed", 3),
+                // ↓ 这三条是本组的全部意义：模型猜的、被否掉的、空的
+                item("person",  "Marko",     "candidate", 7),
+                item("term",    "GhostTerm", "archived",  7),
+                item("person",  "EmptyVal",  "confirmed", 7),
+                // ↓ fact 的值是句子，不该进"词条"，但**该**进摘要背景
+                item("fact",    "ASR 从 Whisper large-v3 换成了 Qwen ASR",
+                     "confirmed", 4),
+            };
+            // 空值那条要真的空
+            auto items2 = items;
+            items2[5].value.clear();
+
+            const auto terms = constraint_terms(items2);
+            const auto bg    = background_lines(items2);
+
+            auto contains = [](const std::vector<std::string>& hay, const std::string& needle) {
+                for (const auto& s : hay) if (s.find(needle) != std::string::npos) return true;
+                return false;
+            };
+
+            // 腿① 和腿② 共用 terms。
+            //
+            // 刻意写成 contains() 而不是 lacks() —— 第一版用了个"找不到才为真"的辅助函数，
+            // 于是"不该有"和"该有"两组断言混在一起时我把两处写反了，
+            // 自检报的是"candidate 摸进了识别提示"，而真相是断言自己错了。
+            // 双否定在断言里是纯负债。
+            if (contains(terms, "Marko"))      { leg_ok = false; why = "candidate 摸进了识别提示/翻译约束"; }
+            else if (contains(terms, "GhostTerm")) { leg_ok = false; why = "archived 摸进了识别提示/翻译约束"; }
+            else if (contains(terms, "EmptyVal"))  { leg_ok = false; why = "空值不该进词条"; }
+            else if (!contains(terms, "Erika"))    { leg_ok = false; why = "confirmed 的词条反而漏了"; }
+            else if (contains(terms, "Whisper"))   { leg_ok = false; why = "fact 的句子不该进词条（会诱发提示回显）"; }
+
+            // 腿③ 摘要背景
+            if (!leg_ok) {}
+            else if (contains(bg, "Marko"))    { leg_ok = false; why = "candidate 摸进了摘要背景"; }
+            else if (contains(bg, "GhostTerm")){ leg_ok = false; why = "archived 摸进了摘要背景"; }
+            // fact 必须**在**背景里 —— 它是"越用越懂你"在摘要上的落点
+            else if (!contains(bg, "Whisper large-v3")) {
+                leg_ok = false;
+                why = "fact/decision 类知识必须进摘要背景（它们只适合当背景）";
+            }
+
+            // 词条上限与长度保护
+            {
+                std::vector<KnowledgeItem> many;
+                for (int i = 0; i < 100; ++i)
+                    many.push_back(item("term", ("T" + std::to_string(i)).c_str(),
+                                        "confirmed", i));
+                if (constraint_terms(many, 40).size() != 40)
+                    { leg_ok = false; why = "词条数应被截断到上限"; }
+                // 超过 40 字的值不是词条（整句话塞进 initial_prompt 没有意义）
+                std::vector<KnowledgeItem> longv = {
+                    item("term",
+                         "this is a whole sentence that accidentally ended up in knowledge",
+                         "confirmed", 9)
+                };
+                if (!constraint_terms(longv).empty())
+                    { leg_ok = false; why = "超长值不该当词条"; }
+            }
+
+            // 大小写重复的词条要去掉：'Erika' 和 'erika' 是同一个
+            {
+                std::vector<KnowledgeItem> dup = {
+                    item("person", "Erika", "confirmed", 9),
+                    item("person", "erika", "confirmed", 5),
+                };
+                if (constraint_terms(dup).size() != 1)
+                    { leg_ok = false; why = "大小写不同的同一个词条应去重"; }
+            }
+
+            std::cout << "[SelfTest] 知识复用三腿（candidate/archived 绝不能进）: "
+                      << (leg_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+            if (!leg_ok) {
+                std::cerr << "    " << why << std::endl;
+                return 1;
+            }
+
+            // 腿③ 的真正落点：背景知识有没有**进到送给模型的 user 内容里**。
+            //
+            // 只断言 set_background() 被调用过是没有意义的 ——
+            // 那和"配置项设了"一样，证明不了模型看得到。
+            // 这里直接断言拼出来的 user 内容。
+            {
+                using knowledge::GapRule;
+                LlmSummarizer sm(LlmSummarizer::Backend::Local);
+                sm.set_target_language("zh");
+
+                std::vector<Segment> segs;
+                Segment s0;
+                s0.seq = 1;
+                s0.src_text = "Welcome to EnglishPod.";
+                s0.tgt_text = u8"欢迎来到 EnglishPod。";
+                segs.push_back(s0);
+
+                const std::string without = sm.build_user_content(segs);
+                if (without.find(u8"欢迎来到") == std::string::npos) {
+                    std::cerr << "[SelfTest] 摘要 user 内容里没有转录" << std::endl;
+                    return 1;
+                }
+                if (without.find(u8"背景知识") != std::string::npos) {
+                    std::cerr << "[SelfTest] 没有背景时不该出现背景段落" << std::endl;
+                    return 1;
+                }
+
+                sm.set_background({u8"- Erica（人名）", u8"- Marco（人名）"});
+                const std::string with = sm.build_user_content(segs);
+                bool ok = true;
+                std::string why2;
+                if (with.find("Erica") == std::string::npos) { ok = false; why2 = "背景知识没进 user 内容"; }
+                else if (with.find(u8"欢迎来到") == std::string::npos) { ok = false; why2 = "加了背景之后转录丢了"; }
+                // 背景必须出现在转录**之前**，并且明确标注"不是转录内容"——
+                // 否则小模型会把背景当成本场发生的事写进纪要
+                else if (with.find("Erica") > with.find(u8"欢迎来到")) {
+                    ok = false; why2 = "背景应排在转录之前";
+                }
+                else if (with.find(u8"不要把它当成发生过的事") == std::string::npos) {
+                    ok = false; why2 = "缺少'背景不是转录内容'的显式标注";
+                }
+                std::cout << "[SelfTest] 摘要背景注入（进 user 内容且标注清楚）: "
+                          << (ok ? "✅ 通过" : "❌ 失败") << std::endl;
+                if (!ok) {
+                    std::cerr << "    " << why2 << std::endl;
+                    return 1;
+                }
+            }
+        }
     }
 
     // ---- 11) 长期记忆：落库（upsert 三条语义 + 降级 + 历史）----
@@ -1883,11 +2109,48 @@ int main(int argc, char** argv) {
     // 实测日志显示 auto 在 3 秒碎片上经常只有 20% 把握，判错一次整段识别就废了。
     engine.set_language_policy(cfg.source_lang, cfg.lang_recheck_sec);
 
-    // 术语：一份列表，两个用途——
+    // 术语：一份列表，三个用途——
     //   ① 喂给 Whisper 作为 initial_prompt（识别时偏向专名）
     //   ② 交给 TermFixer 做识别后纠错（实测提示的约束力不够，名字仍会乱跳）
-    const std::vector<std::string> glossary = load_glossary_terms(cfg.glossary_path);
-    engine.set_initial_prompt(terms_to_prompt(glossary));
+    //   ③ 作为翻译约束下发给翻译器（统一译文里的专名写法）
+    //
+    // 【来源】**知识库里 confirmed 的条目为主，--glossary 文件为辅。**
+    // 2.5 之前这里只读文件 —— 也就是说用户确认过的知识一个字都影响不到识别和翻译，
+    // 第二句承诺（用得越久越懂你）没有落点。
+    // --glossary 保留：它是"我知道我要说什么、先手工喂给你"的显式入口，仍然有用。
+    const auto kb = load_constraints_from_knowledge();
+    std::vector<std::string> glossary = kb.terms;
+    {
+        const auto from_file = load_glossary_terms(cfg.glossary_path);
+        for (const auto& t : from_file) {
+            bool dup = false;
+            for (const auto& e : glossary) {
+                if (knowledge::normalize_key(e) == knowledge::normalize_key(t)) { dup = true; break; }
+            }
+            if (!dup) glossary.push_back(t);
+        }
+    }
+    if (kb.store_ready) {
+        std::cout << "[知识库] confirmed 条目 " << kb.confirmed_total << " 条，"
+                  << "其中可用作识别提示/翻译约束的词条 " << kb.terms.size() << " 条";
+        if (kb.terms.size() < kb.confirmed_total) {
+            std::cout << "（其余是事实/决定类，只作摘要背景）";
+        }
+        std::cout << std::endl;
+    }
+    // 把**实际送进引擎的那串 prompt** 打出来，而不是只报"取到了几条"。
+    // 区别很重要：报条数只能说明"我们打算喂什么"，打印字符串才说明"引擎真收到了什么"。
+    // （诊断工具撒谎的坑这个项目踩过两次，见 run_dump_prompt 的注释。）
+    {
+        const std::string prompt = terms_to_prompt(glossary);
+        if (!prompt.empty()) {
+            constexpr size_t kShow = 160;
+            std::cout << "[识别提示] initial_prompt = "
+                      << prompt.substr(0, kShow)
+                      << (prompt.size() > kShow ? " ...(截断)" : "") << std::endl;
+        }
+        engine.set_initial_prompt(prompt);
+    }
 
     TermFixer term_fixer;
     term_fixer.set_terms(glossary);

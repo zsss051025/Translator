@@ -80,6 +80,37 @@ bool can_promote(const std::string& from_status, const std::string& to_status);
 //         所以**不可能**拼出非法语法。
 std::string fts_query_from_user_text(const std::string& raw);
 
+// ---------------------------------------------------------------
+// §6.5 红线的**唯一出口**：把知识条目转成"可以影响识别/翻译/摘要"的东西
+// ---------------------------------------------------------------
+//
+// 三条腿（Whisper 识别提示 / 翻译约束 / 摘要背景）都必须经由这里，
+// 不许自己写过滤条件 —— 一旦有第二处判定，"只有 confirmed 能进约束"
+// 就变成了 N 处各自为政，迟早有一处写漏（§6.5 的整条红线就废了）。
+//
+// 这三个都是纯函数，能进 L1。
+
+// 哪些 kind 的值适合当"词条"（进识别提示和翻译约束）。
+//
+// 【为什么必须区分】term/person/project 的值是**短名字**（"Erika"、"Phoenix"），
+// 放进 Whisper 的 initial_prompt 和翻译术语约束都有用。
+// 而 fact/decision 的值是**句子**（"ASR 从 Whisper large-v3 换成了 Qwen ASR"）——
+// 塞进 initial_prompt 只会让 Whisper 去续写那句话（实测提示回显就是这样来的），
+// 塞进翻译约束更是毫无意义。它们只适合当摘要背景。
+bool is_name_like_kind(const std::string& kind);
+
+// kind 的中文标签，给摘要背景用
+std::string kind_label_zh(const std::string& kind);
+
+// 词条列表：usable_as_constraint() 为真 + name-like kind + 长度合理，去重后限量。
+// 排序按 hits 降序 —— 提得多的更可能是真专名。
+std::vector<std::string> constraint_terms(const std::vector<KnowledgeItem>& items,
+                                          size_t max_terms = 40);
+
+// 摘要背景行：形如 `- Erika（人名）`。**所有 kind 都收**（fact/decision 的价值正在这里）。
+std::vector<std::string> background_lines(const std::vector<KnowledgeItem>& items,
+                                          size_t max_lines = 15);
+
 }  // namespace knowledge
 
 // ---------------------------------------------------------------
@@ -130,6 +161,15 @@ public:
     // 2.6 的 `--ask` 会把它暴露成命令行。
     std::vector<KnowledgeItem> search(const std::string& query, int limit = 20,
                                       std::string* err = nullptr) const;
+
+    // 可以进"识别提示 / 翻译约束 / 摘要背景"的条目 —— §6.5 红线的唯一出口。
+    //
+    // 只返回 usable_as_constraint() 为真的条目。三条腿都必须调它，
+    // 不许自己按 status 过滤（原因见头文件里 knowledge::is_name_like_kind 上面的说明）。
+    //
+    // 实现上刻意**先取全部再过滤**，而不是 SQL 里写 `WHERE status='confirmed'`：
+    // 让 usable_as_constraint() 成为真正唯一的判定点，而不是"两处判定碰巧一致"。
+    std::vector<KnowledgeItem> constraint_items(int limit = 1000) const;
 
     // 改状态并记历史。reason 见 §6.8：user_confirmed | model_extracted | user_edited
     bool set_status(long long id, const std::string& status,

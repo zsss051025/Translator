@@ -7,7 +7,7 @@
 >
 > **给"上下文被清空后的自己"看。** 读的顺序：先读这份，再按需回 `PROJECT.md` 查细节。
 >
-> 最后更新：2026-09-16（2.4 确认交互 ✅，下一个动作 = 2.5 三腿复用接知识库）
+> 最后更新：2026-09-16（2.5 三腿复用 ✅，下一个动作 = 2.5b 交付物 UTF-8 净化）
 
 ---
 
@@ -37,7 +37,8 @@
 | | **2.2 `KnowledgeStore`**（归一化 / upsert / 状态提升 / 历史） | ✅ 完成 |
 | | **2.3 缺口检测四条规则** | ✅ 完成 |
 | | **2.4 结束时确认交互** | ✅ 完成 |
-| | **2.5 三腿复用接知识库** | ← **下一个动作** |
+| | **2.5 三腿复用接知识库** | ✅ 完成 |
+| | **2.5b 交付物 UTF-8 净化** | ← **下一个动作**（2.5 验证时发现的真缺陷，见 §四） |
 | | 2.6 `--ask` 检索 | 未开始 |
 | | 2.7 Action 跨会话追踪 | 未开始 |
 | **第 3 阶段** 遗留质量项 | 3.1 分句碎片化 / 3.2 场景判定 / 3.3 Evidence / 3.4 静音收尾裁尾 | 未开始 |
@@ -45,19 +46,22 @@
 
 ### 下一个动作（具体到文件）
 
-**2.5 三腿复用接知识库**（`PROJECT.md` §6.4②）：
+**2.5b 交付物 UTF-8 净化**（2.5 验证时发现的，**与 2.5 无关，单独一笔**）
 
-三条腿现在只接了术语表，要改成**从 `knowledge` 取 confirmed 条目**：
+- 【现象】用 `--summarizer local`（混元）生成的 `meeting-42.md` **整体不是合法 UTF-8**。
+  字节级证据：`### 询问你\xe7` —— `\xe7` 是一个没写完的三字节首字节；
+  要点下一行还有孤立的续字节 `\x84`。任何编辑器/浏览器打开都是乱码。
+- 【原因】混元是翻译模型，被逼着做结构化输出时会吐出**半个字符的 token**；
+  而 `DeliverableWriter` **不做任何校验就写盘了**。
+- 【修法】加一个纯函数 `utf8_sanitize()`：
+  - 非法字节序列替换成 U+FFFD（或用 `?`），保证输出文件**永远是合法 UTF-8**
+  - 位置放在 `DeliverableWriter::write()` 的**写出边界**上（一次覆盖 md/html/csv/srt 四条）
+  - 另外在 `LlmSummarizer::parse_reply` 里也过一遍，免得垃圾进到后续逻辑
+  - 同时按"绝不静默给错数据"的规矩：净化发生时 `std::cerr` 报一行，别悄悄改
+- 【为什么单独一笔】它不由 2.5 引入，也不属于 2.5 的验收范围；
+  混提交违反"一次改动一次提交"
 
-| 腿 | 位置 | 现状 | 要做的 |
-|---|---|---|---|
-| 识别提示 | `SpeechEngine` 的 `initial_prompt` | 读 `terms.sample.txt` | 改读 `knowledge` 里 kind=term 的 confirmed 条目 |
-| 翻译约束 | `ITranslator::glossary_constraint` | 调用方喂 `--glossary` 文件 | 调用方改成喂 `KnowledgeStore` 里的 confirmed |
-| 摘要背景 | `LlmSummarizer` 的 prompt | 无 | 把 confirmed 条目当背景知识塞进 prompt |
-
-**关键前提**：`usable_as_constraint()` 是唯一守门人（§6.5 红线），三腿都必须走它 ——
-**2.4 之前库里全是 candidate，所以这一步即使接上了也拿不到东西**。
-2.6/2.7 排在后面，因为它们不挡"越用越懂你"这条主线。
+之后才是 **2.6 `--ask` 检索**（`KnowledgeStore::search()` 已经就绪，只差暴露成命令行）。
 
 ### 其它状态
 
@@ -66,8 +70,8 @@
 | 分支 | `main`（本地主线）；远程备份在 `assistant-baseline` |
 | 远程 `main` | `da97d96` —— **有意不动**，详见 `PROJECT.md` §3.6 末「历史决策：不合并 da97d96」 |
 | tag | `translator-final` → `7717ace`（翻译版本封存） |
-| 自检 | **21 组**，秒级，不需要模型 |
-| 闭环八步完成度 | 八步**等权平均 66%**（听见 90 / 理解 90 / 提取 78 / 记忆 55 / 发现变化 55 / 询问 75 / 更新 55 / 再次利用 30）<br>⚠️ 之前写的"≈45%"和它自己那组数字（平均 57%）对不上，是我的笔误；现在改成就地可复算的等权平均 |
+| 自检 | **22 组**，秒级，不需要模型 |
+| 闭环八步完成度 | 八步**等权平均 78%**（听见 90 / 理解 90 / 提取 78 / 记忆 55 / 发现变化 55 / **询问 85** / **更新 85** / **再次利用 75**）<br>2.5 把"再次利用"从 30 拉到 75：知识现在真的会进识别提示、翻译约束、摘要背景，并已用真实失败句 A/B 证明译文被纠正 |
 
 **"越用越懂你"的可验证里程碑**（第二句承诺）：
 
@@ -76,8 +80,16 @@
 | 知识能落库、能区分 confirmed/candidate | ✅ 2.2 |
 | 能发现"该问什么" | ✅ 2.3 |
 | 用户答了能改进知识库 | ✅ 2.4 |
-| **答过的东西真的改变识别/翻译/摘要行为** | ❌ **2.5** ← 差这一步，第二句承诺才第一次成立 |
+| **答过的东西真的改变识别/翻译/摘要行为** | ✅ **2.5**（翻译腿已用真实失败句 A/B 证明；识别腿只验到"prompt 真的送进引擎"，摘要腿只验到"背景真的进 user 内容"——见下方 ⚠️） |
 | 会答的问题不重复问 | ✅ 2.4（`asked_count` + `kMaxAsks`） |
+
+⚠️ **2.5 三条腿各自的验证级别不一样，别混为一谈**：
+
+| 腿 | 验到了什么 | 没验到什么 |
+|---|---|---|
+| ① 识别提示 | prompt 字符串确实被构造并送进 `SpeechEngine`（日志 `[识别提示]`），且 candidate 不在里面 | **whisper 的识别结果是否真的因此变准** —— 需要"含会被识别错的专名的音频"，手上没有 |
+| ② 翻译约束 | **行为级 A/B 通过**（`tools/ab_translation_constraint.py`）：真实失败句被纠正 | 云端翻译路径（我的环境没有 API key） |
+| ③ 摘要背景 | 背景确实拼进送给模型的 user 内容（自检 + 日志 `[摘要] 已注入`） | **模型是否真的因此不与之矛盾** —— 本机没有 instruct 模型，混元做不了摘要 |
 
 ---
 
@@ -178,20 +190,20 @@
 
 | 时间 | 事 | 关键点 |
 |---|---|---|
-| 09-16 | 2.4 **是/否词表不能省** | 把 `n` 当成"用户输入的新值"会把字面量 `no` 写进库当专名，而且是 confirmed（会进翻译约束）。判定不能靠"看起来像不像值" |
-| 09-16 | 2.4 **首尾不可见字符要按集合去** | 实跑抓到：PowerShell 管道第一行带 UTF-8 BOM，`"\uFEFFy"` 既不是 `y` 也不是空 → 掉进"其余当新值"→ **把 `y` 存成了专名**。**自检 13 个用例全绿，真跑才露出来**。零宽空格、全角空格 U+3000 同理 |
-| 09-16 | 2.4 **"提问稀缺"要有个地方记"问过了"** | 加 `knowledge.asked_count` + `kMaxAsks = 2`。**跳过也计数** —— 连按 5 次回车就是"别再问了"。只在答了才计数的话，同一问题永远排在候选里。实测生命周期：第 1 场问 3 个全答完 → 第 2 场只剩 1 个（最后一次机会）跳过 → 第 3 场 0 个 |
-| 09-16 | 2.4 **confirmed 的条目不能因历史而复活** | 规则①只看 `value_changed_demoted` 不看状态，于是用户刚答完"以后都用 Qwen ASR"的那条，下一场**又是第 1 问**，直接违反"confirmed 且无变化一个字都不问"。加 `status != confirmed` |
-| 09-16 | 2.4 **自检断言撞真实数据** | FTS 往返用例断言 `search("phoenix")` 恰好 1 条 → 库里真有 `Phoenix` 时自检永远红。**用户知识库里只要有这么一条真知识，自检就失败**。改用本用例独有的 token |
-| 09-16 | 2.4 交互的接缝设计 | 把"读一行"抽成 `std::function<bool(std::string&)>`：main 注入读控制台，自检注入读 stringstream。于是问答循环能进 L1，且**落库走真实路径**（不是构造理想数据）。GUI 壳（4.3）将来也从这个接缝接进来 |
-| 09-16 | 2.4 **必须在 `write()` 之后问** | 交付物先落盘：用户中途 Ctrl+C 或直接走开，纪要一个字不少。反过来就是"问了半天没生成纪要"，最不可原谅的失败方式 |
-| 09-16 | 2.3 **外部内容 FTS5 表必须用触发器维护** | 我第一版在 C++ 里手写 `INSERT INTO knowledge_fts` —— **索引根本没建起来**：外部内容表的 `count(*)` 读的是内容表，所以"看着有 4 行、MATCH 一条也查不到"。而 `DELETE FROM knowledge_fts` 会让 SQLite 报 `database disk image is malformed`。正解：挂 `ai/ad/au` 三个触发器 + 打开库时 `'rebuild'` 一次自愈历史库 |
-| 09-16 | 2.3 弱断言 = 假绿灯 | 旧自检只验"四张表在不在"，所以上面那个 bug 藏了两轮。**修法不是修表，是把断言变强**：写进去 → 必须查回来 → 删掉 → 必须查不到。加断言后立刻抓出两个真 bug |
-| 09-16 | 2.2 KnowledgeStore | **值变了必须把 confirmed 降回 candidate** —— 原来那条确认是针对旧值的，值一变它就不成立了（§6.5 要防的正是这个） |
-| 09-16 | 2.2 自检抓到两个真 bug | ① `normalize_key` 只处理 ASCII 标点，`埃里卡。` 和 `埃里卡` 会变成两个键；② `_` 被当标点，`asr_engine` 变 `asr engine`、`__selftest_` 前缀被吃掉导致清理失效 |
-| 09-16 | 2.1 FTS5 + 三张表 | `CREATE TABLE IF NOT EXISTS` 顺带就是迁移，老库打开自动补表。但**它只补表、永远不补列** —— 加列必须另走 `ALTER TABLE`（2.4 加 `asked_count` 时踩到，用 `PRAGMA table_info` 做幂等判断） |
-| 09-16 | 截止日期依据改用整场转录 | **"无法判断" ≠ "无依据"**：云端路径 `ActionItem.source` 是空的（LCS 跨语言匹配不上），只看 source 会把所有日期清空 |
-| 09-14 | 平台边界定论 | 只做 Windows 桌面版。采集和字幕窗是平台专有。要 Linux 就做**无界面批处理版**（`--wav` 是它的地基） |
+| 09-16 | 2.5 **差点用一个不现实的探针得出错误结论** | 我先把术语值设成模型绝不可能产出的 `马可波罗`，看到模型没照做，就下了"约束进了 prompt 但模型不服从"的结论。**换成真实失败句立刻翻过来了**：基线逐字复现历史失败，confirmed 组把 `埃里卡/马可` 纠正成 `Erica/Marco`。**探针的输入不现实，结论就不成立** |
+| 09-16 | 2.5 **真实失败案例在另一个库里** | 我一直引用"会话 #11 的 Erica/埃里卡"，但在 `t.db` 里全库搜不到 —— 它其实在 `build\RelWithDebInfo\translations.db`（旧库，11 场 206 段）。仓库里有 **8 个 .db 文件**，`--db` 又是相对路径。**引用"真实案例"必须写清是哪个库**，否则下一个人（和下一个我）会以为记录是编的 |
+| 09-16 | 2.5 三条腿的来源统一了 | 原来①识别提示②翻译约束吃 `--glossary` 文件、③摘要背景什么都没有 → 用户确认的知识一个字都影响不到输出。现在三处都经 `KnowledgeStore::constraint_items()` 取，**红线只有一处**。`--glossary` 保留为"手工预喂"的补充入口 |
+| 09-16 | 2.5 name-like kind 必须和 fact/decision 分开 | `term`/`person`/`project` 的值是短名字，能进 initial_prompt；`fact`/`decision` 的值是**句子**，塞进去会诱发 whisper 提示回显（`looks_like_prompt_echo` 就是为这个写的），只适合当摘要背景 |
+| 09-16 | 2.5 `--dump-prompt` 第二次差点撒谎 | 它原来只读 `--glossary` 文件。2.5 把来源改成知识库之后，这条路会显示"干干净净"的 prompt —— 而真实运行里全有。**已改成复用同一个取数函数**，两边不可能再走散 |
+| 09-16 | 2.5 **交付物会被写成非法 UTF-8** | 混元做摘要时吐半个字符的 token（`\xe7` 未写完），`DeliverableWriter` 不校验就写盘 → 整个 .md 不是合法 UTF-8。**下一笔（2.5b）修** |
+| 09-16 | 2.4 **是/否词表不能省** | 把 `n` 当成"用户输入的新值"会把字面量 `no` 写进库当专名，而且是 confirmed（会进翻译约束） |
+| 09-16 | 2.4 **首尾不可见字符要按集合去** | 实跑抓到：PowerShell 管道第一行带 UTF-8 BOM，`"\uFEFFy"` 掉进"其余当新值"→ **把 `y` 存成了专名**。自检 13 个用例全绿，真跑才露出来 |
+| 09-16 | 2.4 **"提问稀缺"要有个地方记"问过了"** | 加 `asked_count` + `kMaxAsks = 2`，**跳过也计数**。实测生命周期：第 1 场问 3 个全答完 → 第 2 场 1 个（最后一次机会）→ 第 3 场 0 个 |
+| 09-16 | 2.4 **confirmed 的不能因历史而复活** | 规则①只看 `value_changed_demoted` 不看状态 → 用户刚答完的那条下一场又是第 1 问。加 `status != confirmed` |
+| 09-16 | 2.3 **外部内容 FTS5 表必须用触发器维护** | 手动 `INSERT INTO knowledge_fts` 等于白写（外部内容表的 `count(*)` 读内容表，看着有行、MATCH 查不到）；`DELETE FROM knowledge_fts` 直接报 `database disk image is malformed` |
+| 09-16 | 2.3 弱断言 = 假绿灯 | 旧自检只验"四张表在不在"，于是索引空的 bug 藏了两轮。改成"写进去→必须查回来→删掉→必须查不到"后**立刻抓出两个真 bug** |
+| 09-16 | 2.2 **值变了必须把 confirmed 降回 candidate** | 原来那条确认是针对旧值的，值一变它就不成立（§6.5 要防的正是这个） |
+| 09-16 | 2.1 迁移的边界 | `CREATE TABLE IF NOT EXISTS` 只补表、**永远不补列** —— 加列必须另走 `ALTER TABLE`（2.4 踩到） |
 
 ---
 
@@ -209,12 +221,15 @@
 | 改了 `CMakeLists.txt` 的编译定义后只 build | **必须重新 configure**，否则不生效（加 `SQLITE_ENABLE_FTS5` 时踩过） |
 | **`--db t.db` 是相对当前目录的**，而 `build\RelWithDebInfo\` 和仓库根**各有一个 `t.db`** | 两个不同的文件。验证/排查前先 `pwd`。`verify_memory.py` 现在会打**绝对路径**，一眼看出验的是哪个（这个坑真实发生过：验证报"缺少记忆表"，其实只是验错了文件） |
 
-此外四条最常撞到的：**`_` 在 SQL `LIKE` 里是单字符通配符**（`purge_key_prefix` 用的就是 `LIKE`，
+此外几条常撞到的：**仓库里有 8 个 `.db` 文件**（`build\RelWithDebInfo\` 下有 t.db / translations.db / sum.db /
+t6.db / test_s4.db / test_step1.db，根目录还有 t.db），而 `--db` 是相对路径 ——
+**真实会话历史在 `build\RelWithDebInfo\translations.db`，不在 `t.db`**（2.5 找"会话 #11 案例"时在这上面绕了一圈）。
+引用"真实案例"时务必写清是哪个库。**`_` 在 SQL `LIKE` 里是单字符通配符**（`purge_key_prefix` 用的就是 `LIKE`，
 所以 `__selftest_` 实际匹配 "任意两字符 + selftest + 任意一字符"，隔离性比看上去弱 ——
 目前够用，但别把前缀隔离当成安全边界）；**FTS5 外部内容表不能用普通 `DELETE`/`INSERT`**
 （报 `database disk image is malformed` 或静默不生效，只能用触发器或 `'rebuild'`）；
-**MATCH 左侧不认表别名**；**自检自带的 `t.db` 与用户库是同一个文件**，
-所以自检用例必须自己清理干净（`__selftest_` 前缀）。
+**MATCH 左侧不认表别名**；**PowerShell 5.1 把无 BOM 的 `.ps1` 当 GBK 读**（脚本里的中文串会被破坏，
+所以驱动脚本用 Python 写，不用 .ps1）。
 
 ---
 
@@ -229,7 +244,7 @@ cd C:\dev\projects\AudioTranslator
 # 1. 构建
 cmd /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"" >nul 2>&1 && set VCPKG_ROOT=C:\dev\vcpkg && cmake --build build --config RelWithDebInfo --target Translator"
 
-# 2. L1 自检：必须 21 组全过
+# 2. L1 自检：必须 22 组全过
 .\build\RelWithDebInfo\Translator.exe --selftest --db t.db
 
 # 2b. 知识库数据层（第 2 阶段每步都要跑）——独立实现验证，且不改动原库
@@ -252,6 +267,11 @@ python tools\verify_memory.py build\RelWithDebInfo\t.db --clear
 
 # 3. 端到端（可选，约 20 秒，零交互）
 .\build\RelWithDebInfo\Translator.exe --wav C:\dev\projects\whisper.cpp\samples\jfk.wav --summarizer rules --db v.db --out v_out
+
+# 3b. §6.5 红线的**行为级**回归（2.5 起）：真句子 + 真模型，约 40 秒
+#     断言：① 基线逐字复现历史失败 ② candidate 与基线逐字相同 ③ confirmed 纠正译文
+python tools\ab_translation_constraint.py
+#     跑完会自己清空 knowledge 表
 
 # 4. 提交
 git add -- <明确列出的文件>

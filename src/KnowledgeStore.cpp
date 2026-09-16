@@ -236,6 +236,90 @@ std::string fts_query_from_user_text(const std::string& raw) {
     return out;
 }
 
+// ===============================================================
+// §6.5 红线的唯一出口
+// ===============================================================
+
+// 只折 ASCII 大小写，CJK 原样 —— 只用于"是不是同一个词条"的比较
+std::string lower_copy(const std::string& s) {
+    std::string out = s;
+    for (char& c : out) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u < 0x80) c = static_cast<char>(std::tolower(u));
+    }
+    return out;
+}
+
+bool is_name_like_kind(const std::string& kind) {
+    // 值短、是"名字"的那些。
+    // fact / decision 的值是句子，进 initial_prompt 会诱发提示回显（见 SpeechEngine
+    // 的 looks_like_prompt_echo），进翻译术语约束毫无意义 —— 它们只当摘要背景。
+    return kind == "term" || kind == "person" || kind == "project";
+}
+
+std::string kind_label_zh(const std::string& kind) {
+    if (kind == "term")     return u8"术语";
+    if (kind == "person")   return u8"人名";
+    if (kind == "project")  return u8"项目";
+    if (kind == "fact")     return u8"事实";
+    if (kind == "decision") return u8"决定";
+    return kind;   // 未知 kind 原样带出，不要静默吞掉（能看出来才好排查）
+}
+
+std::vector<std::string> constraint_terms(const std::vector<KnowledgeItem>& items,
+                                          size_t max_terms) {
+    // 按 hits 降序：提得多的更可能是真专名，词条超限时先保它们
+    std::vector<const KnowledgeItem*> sorted;
+    sorted.reserve(items.size());
+    for (const auto& k : items) {
+        if (!usable_as_constraint(k)) continue;     // ← §6.5 红线本体
+        if (!is_name_like_kind(k.kind)) continue;
+        if (k.value.empty() || k.value.size() > 40) continue;   // 长句子不是词条
+        sorted.push_back(&k);
+    }
+    std::stable_sort(sorted.begin(), sorted.end(),
+                     [](const KnowledgeItem* a, const KnowledgeItem* b) {
+                         return a->hits > b->hits;
+                     });
+
+    std::vector<std::string> out;
+    for (const auto* k : sorted) {
+        if (out.size() >= max_terms) break;
+        // 去重（大小写不敏感）：'Erika' 和 'erika' 是同一个词条，
+        // 重复塞进 initial_prompt 只会浪费提示预算
+        const std::string low = lower_copy(k->value);
+        bool dup = false;
+        for (const auto& e : out) {
+            if (lower_copy(e) == low) { dup = true; break; }
+        }
+        if (dup) continue;
+        out.push_back(k->value);
+    }
+    return out;
+}
+
+std::vector<std::string> background_lines(const std::vector<KnowledgeItem>& items,
+                                          size_t max_lines) {
+    std::vector<const KnowledgeItem*> sorted;
+    sorted.reserve(items.size());
+    for (const auto& k : items) {
+        if (!usable_as_constraint(k)) continue;     // ← 同一条红线
+        if (k.value.empty()) continue;
+        sorted.push_back(&k);
+    }
+    std::stable_sort(sorted.begin(), sorted.end(),
+                     [](const KnowledgeItem* a, const KnowledgeItem* b) {
+                         return a->hits > b->hits;
+                     });
+
+    std::vector<std::string> out;
+    for (const auto* k : sorted) {
+        if (out.size() >= max_lines) break;
+        out.push_back("- " + k->value + u8"（" + kind_label_zh(k->kind) + u8"）");
+    }
+    return out;
+}
+
 }  // namespace knowledge
 
 // ===============================================================
@@ -566,6 +650,16 @@ std::vector<KnowledgeItem> KnowledgeStore::search(const std::string& query, int 
         out.push_back(std::move(k));
     }
     sqlite3_finalize(st);
+    return out;
+}
+
+std::vector<KnowledgeItem> KnowledgeStore::constraint_items(int limit) const {
+    std::vector<KnowledgeItem> out;
+    // 先取全部，再让 usable_as_constraint() 做唯一判定 ——
+    // 刻意**不**在 SQL 里写 status='confirmed'，否则判定就有两处了。
+    for (const auto& k : list("", limit)) {
+        if (knowledge::usable_as_constraint(k)) out.push_back(k);
+    }
     return out;
 }
 
