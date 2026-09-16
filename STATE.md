@@ -7,7 +7,7 @@
 >
 > **给"上下文被清空后的自己"看。** 读的顺序：先读这份，再按需回 `PROJECT.md` 查细节。
 >
-> 最后更新：2026-09-16
+> 最后更新：2026-09-16（2.3 缺口检测 ✅，下一个动作 = 2.4 结束时确认交互）
 
 ---
 
@@ -35,8 +35,8 @@
 | | 1.2 去掉启动选择题 | ✅ 完成 |
 | **第 2 阶段** 知识库骨架 | 2.1 FTS5 + 三张表 + 迁移 | ✅ 完成 |
 | | **2.2 `KnowledgeStore`**（归一化 / upsert / 状态提升 / 历史） | ✅ 完成 |
-| | **2.3 缺口检测四条规则** | ← **下一个动作** |
-| | 2.4 结束时确认交互 | 未开始 |
+| | **2.3 缺口检测四条规则** | ✅ 完成 |
+| | **2.4 结束时确认交互** | ← **下一个动作** |
 | | 2.5 三腿复用接知识库 | 未开始 |
 | | 2.6 `--ask` 检索 | 未开始 |
 | | 2.7 Action 跨会话追踪 | 未开始 |
@@ -45,13 +45,13 @@
 
 ### 下一个动作（具体到文件）
 
-**2.3 缺口检测四条规则**（`PROJECT.md` §6.6）：
+**2.4 结束时确认交互**（`PROJECT.md` §6.7）：
 
-- 新建 `inc/KnowledgeGap.h` + `src/KnowledgeGap.cpp`
-- 输入：`knowledge` 表里的条目 + 本场会话的段落；输出：候选问题列表
-- 四条规则：**译法不一致** / 高频未确认（`hits >= 3`）/ 低置信度专名 / 旧值 ≠ 新值
-- **完全不依赖模型**，必须能进 L1（§8.2：这是整个第 2 阶段里最该做成纯函数的一块）
-- 第一条规则已有真实案例：会话 #11 的 `Erica / 埃里卡`（见 `PROJECT.md` §6.6）
+- 会话收尾时把 `--gaps` 的候选问题（最多 5 个）依次问出来，用户回车可跳过
+- 用户答 → `KnowledgeStore::set_status(id, "confirmed", "user_confirmed")`，值不同则先 `upsert`
+- **绝不能阻塞交付物生成**：问答失败/超时/无输入都要照样把 md/html/csv/srt 写完
+- 顺序上必须在 `write()` **之后**问 —— 先落盘再问，用户中途 Ctrl+C 也不丢产出
+- 交互层要能复用：`--wav` / 未来 GUI 下都得有"不交互"的默认行为（非 tty 直接跳过）
 
 ### 其它状态
 
@@ -60,8 +60,8 @@
 | 分支 | `main`（本地主线）；远程备份在 `assistant-baseline` |
 | 远程 `main` | `da97d96` —— **有意不动**，详见 `PROJECT.md` §3.6 末「历史决策：不合并 da97d96」 |
 | tag | `translator-final` → `7717ace`（翻译版本封存） |
-| 自检 | **18 组**，秒级，不需要模型 |
-| 闭环八步完成度 | 约 **35%**（听见 90 / 理解 90 / 提取 78 / 记忆 10 / 后四步 0） |
+| 自检 | **19 组**，秒级，不需要模型 |
+| 闭环八步完成度 | 约 **45%**（听见 90 / 理解 90 / 提取 78 / 记忆 55 / 发现变化 50 / 询问 40 / 更新 20 / 再次利用 30） |
 
 ---
 
@@ -107,7 +107,13 @@
   已经这么做的：`strip_overlap`、`collapse_repeats`、`TermFixer`、
   `SpeechEngine::looks_like_prompt_echo` / `looks_repetitive`、
   `sanitize_actions`、`canonicalize_date`、`choose_translator_backend`、
-  `WavReader::parse`、`ITranslator::glossary_constraint`。
+  `WavReader::parse`、`ITranslator::glossary_constraint`、
+  `knowledge::normalize_key` / `usable_as_constraint` / `fts_query_from_user_text`、
+  `knowledge::detect_gaps`。
+  > 判据：**能不能不碰数据库、不碰模型就验完？** 能，就提成纯函数。
+- **断言要断言到机制，不能只断言"东西在"**。
+  「四张表在不在」这种断言让"FTS 索引其实一条没建起来"藏了两轮。
+  改成"写进去→必须查得回来→删掉→必须查不到"之后，**当场抓出两个真 bug**。
 - **触发表与判定表必须分开**：抽取宁宽勿漏，判定宁严勿滥。
   （`action_markers_*` vs `strict_verbs_*` —— 混用过一次，结果一句寒暄被当成作业。）
 - **接口上的共享逻辑放接口里**，别让多个后端各写一份。
@@ -125,6 +131,8 @@
 - 用例的输入**必须来自真实路径**，不能自己手搓一个"更干净的"版本。
   **这条栽过两次**：`--test-window` 自己编时序；截止日期用例配了真实管线不产生的配对。
 - 加自检时，**先确认这条用例在修复前会失败** —— 否则它是安慰用例。
+- **别用"表存在/文件存在"当验收**。第 2 阶段已栽过一次：FTS 索引空着也能过。
+  每加一层基础设施，就加一条**走真实写入路径的往返断言**。
 
 ### 提交
 
@@ -146,6 +154,10 @@
 
 | 时间 | 事 | 关键点 |
 |---|---|---|
+| 09-16 | 2.3 **外部内容 FTS5 表必须用触发器维护** | 我第一版在 C++ 里手写 `INSERT INTO knowledge_fts` —— **索引根本没建起来**：外部内容表的 `count(*)` 读的是内容表，所以"看着有 4 行、MATCH 一条也查不到"。而 `DELETE FROM knowledge_fts` 这种写法会让 SQLite 直接报 `database disk image is malformed`。正解：`knowledge` 上挂 `ai/ad/au` 三个触发器，另在打开库时 `'rebuild'` 一次自愈历史库 |
+| 09-16 | 2.3 **MATCH 左侧不认表别名** | `knowledge_fts f ... WHERE f MATCH ?` 报 `no such column: f`，只能用表原名。真正的伤害是"prepare 失败→静默返回空"，看起来像索引坏了。**已改成报错**：`search(..., err)` 不静默 |
+| 09-16 | 2.3 弱断言 = 假绿灯 | 旧自检只验"四张表在不在"，所以上面那个 bug 藏了两轮。**修法不是修表，是把断言变强**：`upsert` 写进去 → `search` 必须查回来 → 删掉必须查不到。加断言后立刻抓出两个真 bug |
+| 09-16 | 2.3 检索词要清洗 | 用户输入是自然文本不是 FTS5 表达式：`Q4, 2024` / `AND` / `-foo` / `(` 直接塞进 MATCH 就是语法错。更要命的是**按字节过滤**会把 `，`（U+FF0C）留下，`埃里卡，你好` 变成一个短语永远查不到 —— 按**码点**过滤才对 |
 | 09-16 | 2.2 KnowledgeStore | **值变了必须把 confirmed 降回 candidate** —— 原来那条确认是针对旧值的，值一变它就不成立了；不降级等于让模型的新猜测借着用户对旧值的信任进到约束里（§6.5 要防的正是这个） |
 | 09-16 | 2.2 自检抓到两个真 bug | ① `normalize_key` 只处理 ASCII 标点，`埃里卡。` 和 `埃里卡` 会变成两个键；② `_` 被当标点，`asr_engine` 变 `asr engine`、`__selftest_` 前缀被吃掉导致清理失效。**都是自检抓的，不是我看出来的** |
 | 09-16 | 2.2 隔离方式改了 | 第一版用 `kind="__selftest"` 做测试隔离 → 被 kind 校验拒；改成按 kind 删 → 会误删用户真数据。最终：合法 kind + `__selftest_` 前缀 key + `purge_key_prefix()` |
@@ -153,12 +165,8 @@
 | 09-16 | 截止日期依据改用整场转录 | **"无法判断" ≠ "无依据"**：云端路径 `ActionItem.source` 是空的（LCS 跨语言匹配不上），只看 source 会把所有日期清空。上一次的"修复"就是栽在这 |
 | 09-16 | 术语约束译文（2 腿 → 3 腿） | A/B 复现并修好会话 #11 的 `Erica / 埃里卡`。**但第三条腿依赖第二条腿**：拼写不一致时约束不命中 |
 | 09-16 | `--wav` 分块改 10ms → 100ms | 实时路径每轮睡 100ms，一次 `get_buffer_and_clear()` 实际拿到约 100ms 音频。按 10ms 喂会让"多少块连续静音"的语义差 10 倍，**A/B 前提不成立** |
-| 09-16 | `--wav` 跳过主循环尾部那句 sleep | 11 秒素材跑了 112 秒（0.1 倍速）。**改完 20 秒** |
-| 09-16 | `--wav` 文件放完要喂静音收尾 | `stop()` 是"先判 `is_running_` 再取队列"，直接 break 会丢掉队列里没推理的段 |
-| 09-14 | 假行动项校验器 | 走**纯函数校验器**而不是只改 prompt。放在三条摘要路径的汇合点，`write()` 内再兜一层 |
 | 09-14 | 仓库基线提交 | 之前 3.5 个月没提交，没有任何回退点。现已分 10 笔补上 + tag `translator-final` |
-| 09-14 | 远程与本地分叉 | 远程 `main` 有 `da97d96`（Linux/WAV），其中把 `ma_device_type_loopback` **无条件**改成 `capture` —— 合并会毁掉 Windows 的系统音频采集。**决定不合并** |
-| 09-14 | 平台边界定论 | 只做 Windows 桌面版。采集和字幕窗是平台专有，Wayland 下置顶字幕可能做不到。要 Linux 就做**无界面批处理版**（`--wav` 是它的地基） |
+| 09-14 | 平台边界定论 | 只做 Windows 桌面版。采集和字幕窗是平台专有，Wayland 下置顶字幕可能做不到 |
 
 ---
 
@@ -176,6 +184,13 @@
 | 改了 `CMakeLists.txt` 的编译定义后只 build | **必须重新 configure**，否则不生效（加 `SQLITE_ENABLE_FTS5` 时踩过） |
 | **`--db t.db` 是相对当前目录的**，而 `build\RelWithDebInfo\` 和仓库根**各有一个 `t.db`** | 两个不同的文件。验证/排查前先 `pwd`。`verify_memory.py` 现在会打**绝对路径**，一眼看出验的是哪个（这个坑真实发生过：验证报"缺少记忆表"，其实只是验错了文件） |
 
+此外四条最常撞到的：**`_` 在 SQL `LIKE` 里是单字符通配符**（`purge_key_prefix` 用的就是 `LIKE`，
+所以 `__selftest_` 实际匹配 "任意两字符 + selftest + 任意一字符"，隔离性比看上去弱 ——
+目前够用，但别把前缀隔离当成安全边界）；**FTS5 外部内容表不能用普通 `DELETE`/`INSERT`**
+（报 `database disk image is malformed` 或静默不生效，只能用触发器或 `'rebuild'`）；
+**MATCH 左侧不认表别名**；**自检自带的 `t.db` 与用户库是同一个文件**，
+所以自检用例必须自己清理干净（`__selftest_` 前缀）。
+
 ---
 
 ## 六、收工前自检
@@ -189,12 +204,18 @@ cd C:\dev\projects\AudioTranslator
 # 1. 构建
 cmd /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"" >nul 2>&1 && set VCPKG_ROOT=C:\dev\vcpkg && cmake --build build --config RelWithDebInfo --target Translator"
 
-# 2. L1 自检：必须 18 组全过
+# 2. L1 自检：必须 19 组全过
 .\build\RelWithDebInfo\Translator.exe --selftest --db t.db
 
 # 2b. 知识库数据层（第 2 阶段每步都要跑）——独立实现验证，且不改动原库
 #     ⚠️ 一定要用**程序真正在用的那个库**：--db 是相对当前目录的
 python tools\verify_memory.py build\RelWithDebInfo\t.db
+
+# 2c. 缺口检测端到端（2.3 起）：seed → 应问 3 个 → clear → 应问 0 个
+python tools\verify_memory.py build\RelWithDebInfo\t.db --seed-demo
+.\build\RelWithDebInfo\Translator.exe --gaps --db build\RelWithDebInfo\t.db
+python tools\verify_memory.py build\RelWithDebInfo\t.db --clear
+.\build\RelWithDebInfo\Translator.exe --gaps --db build\RelWithDebInfo\t.db
 
 # 3. 端到端（可选，约 20 秒，零交互）
 .\build\RelWithDebInfo\Translator.exe --wav C:\dev\projects\whisper.cpp\samples\jfk.wav --summarizer rules --db v.db --out v_out

@@ -190,6 +190,52 @@ bool can_promote(const std::string& from_status, const std::string& to_status) {
     return true;
 }
 
+std::string fts_query_from_user_text(const std::string& raw) {
+    std::string out, tok;
+    auto flush = [&]() {
+        if (tok.empty()) return;
+        if (!out.empty()) out += " AND ";
+        out += '"';
+        out += tok;
+        out += '"';
+        tok.clear();
+    };
+
+    for (size_t i = 0; i < raw.size();) {
+        size_t len = 0;
+        const unsigned cp = decode_cp(raw, i, &len);
+
+        if (cp < 0x80) {
+            const bool alnum = (cp >= '0' && cp <= '9') ||
+                               (cp >= 'a' && cp <= 'z') ||
+                               (cp >= 'A' && cp <= 'Z');
+            if (alnum) tok += static_cast<char>(cp);
+            else       flush();
+        } else if (cp >= 0xFF01 && cp <= 0xFF5E) {
+            // 全角 ASCII：折成半角再判断。这样 'Ｅｒｉｋａ' 能被当成一个词、
+            // '，'（U+FF0C）能被当成分隔符 —— 它落在全角 ASCII 区里。
+            const char h = static_cast<char>(cp - 0xFF01 + 0x21);
+            const bool alnum = (h >= '0' && h <= '9') ||
+                               (h >= 'a' && h <= 'z') ||
+                               (h >= 'A' && h <= 'Z');
+            if (alnum) tok += h;
+            else       flush();
+        } else if (cp == 0x3000 || is_cjk_punct(cp)) {
+            // 【为什么必须显式列中文标点】它们的字节全都 >= 0x80，
+            // "只保留非 ASCII 字节"这种按字节过滤的写法会把 `，` `。` 一起留下，
+            // 于是 `埃里卡，你好` 变成**一个**短语去匹配，永远查不到东西。
+            // 这个坑是自检用例逼出来的。
+            flush();
+        } else {
+            // CJK 汉字、假名、谚文等：整字保留
+            tok += raw.substr(i, len);
+        }
+        i += len;
+    }
+    flush();
+    return out;
+}
+
 }  // namespace knowledge
 
 // ===============================================================
@@ -287,19 +333,8 @@ long long KnowledgeStore::upsert(const KnowledgeItem& item, std::string* err) {
             return -1;
         }
         const long long id = sqlite3_last_insert_rowid(db);
-        // 同步全文索引（外部内容表不会自己跟着变）
-        {
-            sqlite3_stmt* fst = nullptr;
-            if (sqlite3_prepare_v2(db, "INSERT INTO knowledge_fts(rowid,key,value,source_text) "
-                                       "VALUES (?,?,?,?);", -1, &fst, nullptr) == SQLITE_OK) {
-                sqlite3_bind_int64(fst, 1, id);
-                sqlite3_bind_text (fst, 2, key.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text (fst, 3, item.value.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text (fst, 4, item.source_text.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_step(fst);
-                sqlite3_finalize(fst);
-            }
-        }
+        // 全文索引不用管：knowledge 上的 AFTER INSERT 触发器会自己维护。
+        // （早先这里手写 INSERT INTO knowledge_fts，结果索引压根没建起来——见 SessionStore.cpp 的说明）
         return id;
     }
 
@@ -371,26 +406,7 @@ long long KnowledgeStore::upsert(const KnowledgeItem& item, std::string* err) {
             sqlite3_finalize(st);
         }
     }
-    // 全文索引跟着改（先删后插，外部内容表没有触发器就得手动同步）
-    {
-        sqlite3_stmt* st = nullptr;
-        if (sqlite3_prepare_v2(db, "DELETE FROM knowledge_fts WHERE rowid = ?;",
-                               -1, &st, nullptr) == SQLITE_OK) {
-            sqlite3_bind_int64(st, 1, old.id);
-            sqlite3_step(st);
-            sqlite3_finalize(st);
-        }
-        st = nullptr;
-        if (sqlite3_prepare_v2(db, "INSERT INTO knowledge_fts(rowid,key,value,source_text) "
-                                   "VALUES (?,?,?,?);", -1, &st, nullptr) == SQLITE_OK) {
-            sqlite3_bind_int64(st, 1, old.id);
-            sqlite3_bind_text (st, 2, key.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text (st, 3, item.value.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text (st, 4, item.source_text.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_step(st);
-            sqlite3_finalize(st);
-        }
-    }
+    // 全文索引跟着改：由 knowledge 上的 AFTER UPDATE 触发器负责，这里不写任何 FTS 语句。
     return old.id;
 }
 
@@ -454,6 +470,67 @@ std::vector<KnowledgeItem> KnowledgeStore::list(const std::string& status, int l
     int idx = 1;
     if (!status.empty()) sqlite3_bind_text(st, idx++, status.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(st, idx, limit > 0 ? limit : 200);
+
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        auto text = [&](int i) -> std::string {
+            const unsigned char* p = sqlite3_column_text(st, i);
+            return p ? reinterpret_cast<const char*>(p) : "";
+        };
+        KnowledgeItem k;
+        k.id             = sqlite3_column_int64(st, 0);
+        k.kind           = text(1);
+        k.key            = text(2);
+        k.value          = text(3);
+        k.status         = text(4);
+        k.confidence     = sqlite3_column_double(st, 5);
+        k.hits           = sqlite3_column_int(st, 6);
+        k.first_seen_at  = text(7);
+        k.updated_at     = text(8);
+        k.source_session = sqlite3_column_int64(st, 9);
+        k.source_seq     = sqlite3_column_int64(st, 10);
+        k.source_text    = text(11);
+        out.push_back(std::move(k));
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
+std::vector<KnowledgeItem> KnowledgeStore::search(const std::string& query, int limit,
+                                                  std::string* err) const {
+    auto set_err = [&](const std::string& m) { if (err) *err = m; };
+    std::vector<KnowledgeItem> out;
+
+    const std::string match = knowledge::fts_query_from_user_text(query);
+    // 全是标点（比如用户只打了个 "??"）→ 没有可检索的词。
+    // 这里必须提前返回：空 MATCH 串会让 SQLite 报错，而"什么都没输入"不该是个错误。
+    if (match.empty()) return out;
+
+    SessionStore& ss = SessionStore::instance();
+    std::lock_guard<std::mutex> lock(ss.mutex_);
+    if (ss.db_ == nullptr) { set_err("数据库未初始化"); return out; }
+
+    // knowledge_fts 是**外部内容表**：MATCH 负责筛选，列值仍然从 knowledge 读。
+    //
+    // 【为什么 FTS 表不能起别名】实测：写成 `knowledge_fts f ... WHERE f MATCH ?`
+    // SQLite 直接报 `no such column: f` —— MATCH 左侧必须是**表的原名**，别名不认。
+    // 这个坑的代价被放大了，因为 prepare 失败时旧代码静默 return 空 vector，
+    // 自检只看到"查不到"，看起来像索引坏了，其实是 SQL 根本没编译过。
+    // 所以下面两件事一起做：用原名、失败时报错。
+    const char* sql =
+        "SELECT k.id,k.kind,k.key,k.value,k.status,k.confidence,k.hits,"
+        "       k.first_seen_at,k.updated_at,k.source_session,k.source_seq,k.source_text "
+        "FROM knowledge_fts JOIN knowledge k ON k.id = knowledge_fts.rowid "
+        "WHERE knowledge_fts MATCH ? "
+        "ORDER BY rank LIMIT ?;";
+
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(ss.db_, sql, -1, &st, nullptr) != SQLITE_OK) {
+        // 不静默：SQL 有问题必须让人看见，而不是当成"没搜到"
+        set_err(std::string("检索语句准备失败: ") + sqlite3_errmsg(ss.db_));
+        return out;
+    }
+    sqlite3_bind_text(st, 1, match.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int (st, 2, limit > 0 ? limit : 20);
 
     while (sqlite3_step(st) == SQLITE_ROW) {
         auto text = [&](int i) -> std::string {
@@ -585,11 +662,10 @@ int KnowledgeStore::purge_key_prefix(const std::string& prefix) {
 
     const std::string like = prefix + "%";
 
-    // 先删历史（按 knowledge_id 关联），再删 FTS 索引，最后删主表
+    // 先删历史（按 knowledge_id 关联），最后删主表。
+    // FTS 索引不在这里删：knowledge 上的 AFTER DELETE 触发器会负责。
     const char* pre[] = {
         "DELETE FROM knowledge_history WHERE knowledge_id IN "
-        "  (SELECT id FROM knowledge WHERE key LIKE ?);",
-        "DELETE FROM knowledge_fts WHERE rowid IN "
         "  (SELECT id FROM knowledge WHERE key LIKE ?);",
     };
     for (const char* sql : pre) {

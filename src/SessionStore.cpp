@@ -99,7 +99,33 @@ const char* kSchema =
     "  key, value, source_text,"
     "  content='knowledge', content_rowid='id',"
     "  tokenize='unicode61'"                       // unicode61 对中英混排都能用
-    ");";
+    ");"
+
+    // ---- FTS5 索引由触发器自己维护 ----
+    //
+    // 【为什么必须用触发器，而不是在 C++ 里手动同步】
+    // 我第一版就是在 upsert/purge 里手写 INSERT/DELETE knowledge_fts，
+    // 结果是**索引根本没建起来**：外部内容表的 count(*) 读的是内容表，
+    // 所以"看起来有 4 行"，但 MATCH 一条也查不到。
+    // 更糟的是 `DELETE FROM knowledge_fts` 这种写法会让 SQLite 直接报
+    // "database disk image is malformed"（外部内容表不支持普通 DELETE，
+    // 必须用特殊的 'delete' 命令并带上旧值）。
+    //
+    // 触发器是官方推荐的写法，而且把"不能忘、不能写错"变成了数据库自己的责任。
+    "CREATE TRIGGER IF NOT EXISTS knowledge_ai AFTER INSERT ON knowledge BEGIN"
+    "  INSERT INTO knowledge_fts(rowid,key,value,source_text)"
+    "  VALUES (new.id,new.key,new.value,new.source_text);"
+    "END;"
+    "CREATE TRIGGER IF NOT EXISTS knowledge_ad AFTER DELETE ON knowledge BEGIN"
+    "  INSERT INTO knowledge_fts(knowledge_fts,rowid,key,value,source_text)"
+    "  VALUES ('delete',old.id,old.key,old.value,old.source_text);"
+    "END;"
+    "CREATE TRIGGER IF NOT EXISTS knowledge_au AFTER UPDATE ON knowledge BEGIN"
+    "  INSERT INTO knowledge_fts(knowledge_fts,rowid,key,value,source_text)"
+    "  VALUES ('delete',old.id,old.key,old.value,old.source_text);"
+    "  INSERT INTO knowledge_fts(rowid,key,value,source_text)"
+    "  VALUES (new.id,new.key,new.value,new.source_text);"
+    "END;";
 
 }  // namespace
 
@@ -160,6 +186,24 @@ bool SessionStore::init(const std::string& db_path) {
 }
 
 bool SessionStore::ensure_schema() {
+    // 【现象】用 2.3 之前版本写过的库，knowledge 表有数据但全文检索一条也查不到。
+    // 【原因】那版在 C++ 里手动同步 FTS 索引，而外部内容表的索引必须靠触发器或
+    //         'rebuild' 重建，手动 INSERT 进的是影子表，MATCH 不认。
+    // 【判断】每次打开库时无条件 rebuild 一次。表规模是几十到几百条，代价可忽略，
+    //         而且能自愈所有历史库——比写版本号迁移更省事、更不容易漏。
+    {
+        char* rb_err = nullptr;
+        int rc = sqlite3_exec(db_,
+            "INSERT INTO knowledge_fts(knowledge_fts) VALUES('rebuild');",
+            nullptr, nullptr, &rb_err);
+        if (rc != SQLITE_OK) {
+            std::cerr << "[DB] knowledge_fts rebuild failed: "
+                      << (rb_err ? rb_err : "?") << std::endl;
+            if (rb_err) sqlite3_free(rb_err);
+            return false;
+        }
+    }
+
     struct Prepared {
         const char*   sql;
         sqlite3_stmt** out;

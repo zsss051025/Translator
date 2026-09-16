@@ -14,6 +14,7 @@
 #include "SpeechEngine.h"
 #include "SessionStore.h"
 #include "KnowledgeStore.h"
+#include "KnowledgeGap.h"
 #include "DeliverableWriter.h"
 #include "LlmSummarizer.h"
 #include "SubtitleWindow.h"
@@ -194,6 +195,42 @@ struct DeliverableOutcome {
     long long   duration_sec  = 0;
     std::string error;
 };
+
+// --gaps：只打印知识缺口检测的结果。不加载模型、不采集音频，秒级。
+//
+// 【为什么需要它】缺口检测本身是纯函数、有 9 个单测，但那些用例是我构造的。
+// 这个项目两次栽在"测试数据与真实数据形状不一致"上，所以留一条能对着**真库**跑的路——
+// 2.4 的确认交互将来也走同一个 detect_gaps_from_store()。
+static int run_show_gaps(const AppConfig& cfg) {
+    if (!SessionStore::instance().init(cfg.db_path)) {
+        std::cerr << "[Gaps] 打不开数据库: " << cfg.db_path << std::endl;
+        return 1;
+    }
+    const auto all = KnowledgeStore::instance().list("", 10000);
+    std::cout << "[Gaps] 库里共有 " << all.size() << " 条知识" << std::endl;
+    for (const auto& k : all) {
+        std::cout << "   #" << k.id << " [" << k.kind << "] " << k.key
+                  << " = " << k.value
+                  << "  status=" << k.status
+                  << "  hits=" << k.hits
+                  << "  conf=" << k.confidence << std::endl;
+    }
+
+    const auto qs = knowledge::detect_gaps_from_store();
+    std::cout << "\n[Gaps] 检测到 " << qs.size() << " 个待确认的问题（最多 5 个）"
+              << std::endl;
+    if (qs.empty()) {
+        std::cout << "   （没有需要问的 —— confirmed 且没变化的条目不会被问，这是有意的："
+                     "§1.3「提问是稀缺资源」）" << std::endl;
+    }
+    int n = 0;
+    for (const auto& q : qs) {
+        std::cout << "   " << ++n << ". [" << knowledge::to_string(q.rule) << "] "
+                  << q.question << std::endl;
+    }
+    SessionStore::instance().close();
+    return 0;
+}
 
 // 用系统默认程序打开文件（Windows 的 start 命令）
 static void open_with_default_app(const std::string& path) {
@@ -1179,6 +1216,37 @@ static int run_selftest(const AppConfig& cfg) {
                   << (cc_ok ? "✅ " : "❌ ") << cc_pass << "/"
                   << (sizeof(cc) / sizeof(cc[0])) << " 通过" << std::endl;
         if (!cc_ok) return 1;
+
+        // 检索词清洗：用户打的是自然文本，不是 FTS5 查询表达式。
+        // 这一组专门钉住"打标点不会让查询报错"—— 搜索框崩掉是最没面子的一类 bug。
+        struct QueryCase { const char* in; const char* want; };
+        const QueryCase qc[] = {
+            {"phoenix",            "\"phoenix\""},
+            {"Q4, 2024",           "\"Q4\" AND \"2024\""},
+            // 这三个是操作符，必须被中性化，否则 MATCH 直接语法错
+            {"AND",                "\"AND\""},
+            {"-foo",               "\"foo\""},
+            {"a\"b",               "\"a\" AND \"b\""},
+            {"(unclosed",          "\"unclosed\""},
+            // 纯标点 → 空串（调用方据此返回空结果，不发查询）
+            {"???",                ""},
+            {"   ",                ""},
+            // 中文必须整字保留，不能被当标点切碎
+            {u8"埃里卡",           u8"\"埃里卡\""},
+            {u8"埃里卡，你好",     u8"\"埃里卡\" AND \"你好\""},
+        };
+        bool q_ok = true;
+        int  q_pass = 0;
+        for (const auto& c : qc) {
+            const std::string got = knowledge::fts_query_from_user_text(c.in);
+            if (got == c.want) { ++q_pass; continue; }
+            q_ok = false;
+            std::cerr << "[SelfTest] 检索词清洗失败: '" << c.in << "' 期望 '"
+                      << c.want << "' 实际 '" << got << "'" << std::endl;
+        }
+        std::cout << "[SelfTest] 检索词清洗（标点/操作符/中文）: " << (q_ok ? "✅ " : "❌ ")
+                  << q_pass << "/" << (sizeof(qc) / sizeof(qc[0])) << " 通过" << std::endl;
+        if (!q_ok) return 1;
     }
 
     // ---- 11) 长期记忆：落库（upsert 三条语义 + 降级 + 历史）----
@@ -1264,13 +1332,184 @@ static int run_selftest(const AppConfig& cfg) {
             if (ks.upsert(bad, &last_err) > 0) fail("空 value 应被拒绝");
         }
 
+        // ---- 全文检索往返：走**真实写入路径**，索引必须自己跟上 ----
+        //
+        // 【为什么单列这一组】2.3 之前自检只验了"四张表在不在"，于是
+        // "knowledge_fts 的索引其实一条都没建起来、MATCH 啥也查不到"
+        // 这个 bug 藏了两轮。弱断言的代价就是假绿灯。
+        //
+        // 这里一句 FTS 语句都不写：upsert 插进去，就必须能被 search() 查回来。
+        // 全靠 knowledge 表上的触发器维护外部内容表的索引。
+        {
+            last_err.clear();
+            KnowledgeItem s;
+            s.kind        = TK;
+            s.key         = "__selftest_ftsroundtrip";
+            s.value       = "Phoenix";
+            s.status      = "candidate";
+            s.confidence  = 0.8;
+            s.source_text = "The Phoenix project ships in Q4.";
+            if (ks.upsert(s, &last_err) <= 0) fail("检索用例写入失败");
+
+            // 把 err 一并报出去：搜索的失败模式里最坑的是"SQL 没编译过"，
+            // 那种情况下返回的是空结果，看起来和"真的没搜到"一模一样。
+            last_err.clear();
+            const auto found = ks.search("phoenix", 20, &last_err);
+            if (found.size() != 1 || found[0].key != "__selftest_ftsroundtrip")
+                fail("触发器没把新写入的行放进 FTS 索引（search 查不到）");
+
+            // 中文也必须能查到（unicode61 分词器对 CJK 的行为要在这里钉住）
+            const auto cn = ks.search(u8"埃里卡");
+            if (cn.empty()) fail("中文全文检索查不到（分词器或索引有问题）");
+
+            // kind 大小写不同的词也要命中：FTS 检索**不该**被大小写绊住
+            if (ks.search("PHOENIX").size() != 1) fail("检索应忽略大小写");
+
+            // 全是标点 → 不该是错误，返回空即可
+            std::string punct_err;
+            if (!ks.search("???", 20, &punct_err).empty() || !punct_err.empty())
+                fail("无有效词的查询应安静返回空");
+
+            // 删掉之后必须查不到，否则检索会返回"幽灵记录"
+            ks.purge_key_prefix("__selftest_ftsroundtrip");
+            if (!ks.search("phoenix").empty()) fail("删除没有同步到 FTS 索引（幽灵记录）");
+        }
+
         last_err.clear();
         const int removed = ks.purge_key_prefix(TPRE);
         if (removed < 1) fail("清理应至少删掉 1 条");
 
-        std::cout << "[SelfTest] 知识落库（新建/累加/变更降级/确认/拒绝非法/清理）: "
+        std::cout << "[SelfTest] 知识落库（新建/累加/变更降级/确认/拒绝非法/FTS 往返/清理）: "
                   << (db_ok ? "✅ 通过" : "❌ 失败") << std::endl;
         if (!db_ok) return 1;
+    }
+
+    // ---- 12) 知识缺口检测四条规则（§6.6 / §6.7）----
+    // 全内存构造，不碰数据库、不碰模型。
+    {
+        using knowledge::GapRule;
+        using knowledge::KnowledgeWithHistory;
+
+        auto mk = [](long long id, const char* status, const char* value,
+                     int hits, double conf) {
+            KnowledgeWithHistory e;
+            e.item.id         = id;
+            e.item.kind       = "term";
+            e.item.key        = value;
+            e.item.value      = value;
+            e.item.status     = status;
+            e.item.hits       = hits;
+            e.item.confidence = conf;
+            return e;
+        };
+        auto add_hist = [](KnowledgeWithHistory& e, const char* oldv, const char* newv,
+                           const char* reason) {
+            KnowledgeStore::HistoryRow h;
+            h.old_value  = oldv;
+            h.new_value  = newv;
+            h.changed_at = "2026-09-16 00:00:00.000";
+            h.reason     = reason;
+            e.history.push_back(h);
+        };
+
+        bool gap_ok = true;
+        std::string why;
+
+        // ① confirmed 且没变化 → **一个字都不问**（§1.3 提问稀缺，这是最重要的一条）
+        {
+            std::vector<KnowledgeWithHistory> v = {mk(1, "confirmed", "Erika", 9, 0.9)};
+            const auto q = knowledge::detect_gaps(v);
+            if (!q.empty()) { gap_ok = false; why = "confirmed 且无变化的不该被问"; }
+        }
+
+        // ② archived → 不问（用户已经否掉过）
+        {
+            std::vector<KnowledgeWithHistory> v = {mk(2, "archived", "Phoenix", 9, 0.9)};
+            const auto q = knowledge::detect_gaps(v);
+            if (!q.empty()) { gap_ok = false; why = "archived 不该被问"; }
+        }
+
+        // ③ 高频未确认：hits >= 3 触发，=2 不触发
+        {
+            std::vector<KnowledgeWithHistory> v = {
+                mk(3, "candidate", "Phoenix", 3, 0.9),
+                mk(4, "candidate", "Q4",      2, 0.9),
+            };
+            const auto q = knowledge::detect_gaps(v);
+            if (q.size() != 1 || q[0].rule != GapRule::HighFreqUnconfirmed || q[0].value != "Phoenix") {
+                gap_ok = false; why = "高频未确认的阈值判定不对";
+            }
+        }
+
+        // ④ 低置信度专名：0.4 触发，0.6 不触发
+        {
+            std::vector<KnowledgeWithHistory> v = {
+                mk(5, "candidate", "Marko",  1, 0.40),
+                mk(6, "candidate", "EnglishPod", 1, 0.60),
+            };
+            const auto q = knowledge::detect_gaps(v);
+            if (q.size() != 1 || q[0].rule != GapRule::LowConfidenceName) {
+                gap_ok = false; why = "低置信度的阈值判定不对";
+            }
+        }
+
+        // ⑤ 旧值≠新值：优先级最高（库里可能已经是错的）
+        {
+            std::vector<KnowledgeWithHistory> v = {
+                mk(7, "candidate", u8"埃里卡", 1, 0.9),
+                mk(8, "candidate", "Phoenix",  5, 0.9),
+            };
+            add_hist(v[0], "Erika", u8"埃里卡", "value_changed_demoted");
+            const auto q = knowledge::detect_gaps(v);
+            // 两条都该出，但"值冲突"必须排在前面
+            if (q.size() != 2 || q[0].rule != GapRule::ValueChanged || q[0].old_value != "Erika") {
+                gap_ok = false; why = "值冲突的优先级或旧值没取对";
+            }
+        }
+
+        // ⑥ 同一个键命中多条规则 → **只出一条**（否则用户看到三条问同一件事的题）
+        {
+            std::vector<KnowledgeWithHistory> v = {
+                mk(9, "candidate", u8"埃里卡", 9, 0.30),   // 同时满足三条规则
+            };
+            add_hist(v[0], "Erika", u8"埃里卡", "value_changed_demoted");
+            const auto q = knowledge::detect_gaps(v);
+            if (q.size() != 1 || q[0].rule != GapRule::ValueChanged) {
+                gap_ok = false; why = "同键应只出一条且取优先级最高的规则";
+            }
+        }
+
+        // ⑦ 译法不一致：值变过但没被降级过
+        {
+            std::vector<KnowledgeWithHistory> v = {mk(10, "candidate", u8"埃里卡", 1, 0.9)};
+            add_hist(v[0], "Erika",   u8"埃里卡", "model_extracted");
+            add_hist(v[0], u8"埃里卡", u8"艾瑞卡", "model_extracted");
+            const auto q = knowledge::detect_gaps(v);
+            if (q.size() != 1 || q[0].rule != GapRule::InconsistentRendering) {
+                gap_ok = false; why = "译法不一致没被识别";
+            }
+        }
+
+        // ⑧ 上限：问不超过 max_questions 个（§1.3 红线）
+        {
+            std::vector<KnowledgeWithHistory> v;
+            for (int i = 0; i < 20; ++i) v.push_back(mk(100 + i, "candidate", "T", 9, 0.9));
+            const auto q = knowledge::detect_gaps(v, 5);
+            if (q.size() != 5) { gap_ok = false; why = "问问题数应被截断到 5"; }
+            if (!knowledge::detect_gaps(v, 0).empty()) { gap_ok = false; why = "max=0 时应一个问题都不出"; }
+        }
+
+        // ⑨ 空输入
+        {
+            if (!knowledge::detect_gaps({}).empty()) { gap_ok = false; why = "空输入不该出问题"; }
+        }
+
+        std::cout << "[SelfTest] 知识缺口检测（四规则/去重/优先级/上限）: "
+                  << (gap_ok ? "✅ 9 例通过" : "❌ 失败") << std::endl;
+        if (!gap_ok) {
+            std::cerr << "    " << why << std::endl;
+            return 1;
+        }
     }
 
     std::cout << "[SelfTest] 最近会话：" << std::endl;
@@ -1298,6 +1537,7 @@ int main(int argc, char** argv) {
     if (cfg.selftest)  return run_selftest(cfg);
     if (cfg.demo_session) return run_demo_session(cfg);
     if (cfg.test_window)  return run_test_window(cfg);
+    if (cfg.show_gaps)    return run_show_gaps(cfg);
     if (!cfg.dump_prompt.empty()) return run_dump_prompt(cfg);
     if (cfg.export_session >= 0) return run_export(cfg);
 

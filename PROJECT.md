@@ -243,7 +243,14 @@ CREATE INDEX idx_segments_session ON segments(session_id, seq);
 
 - 时间戳**毫秒精度**（`YYYY-MM-DD HH:MM:SS.mmm`）
 - `confidence` 是识别置信度，一路带到库里
-- ⚠️ **FTS5 源码在 `external/sqlite3` 里，但 `SQLITE_ENABLE_FTS5` 没有定义** → 现在用不了全文检索。做 `--ask` 之前必须在 `CMakeLists.txt` 加这一行
+- ⚠️ ~~**FTS5 源码在 `external/sqlite3` 里，但 `SQLITE_ENABLE_FTS5` 没有定义**~~
+  → **已解决（2.1）**：`SQLITE_ENABLE_FTS5` + `SQLITE_ENABLE_COLUMN_METADATA` 已在 `CMakeLists.txt` 打开。
+  ⚠️ 改这两个宏**必须重新 configure**（`cmake -S . -B build`），只 build 不会生效。
+- ⚠️ **`knowledge_fts` 是外部内容表（`content='knowledge'`），必须靠触发器维护，不能手写 DML**。
+  它的 `count(*)` 读的是内容表 —— 所以索引空着也可能"看起来有行"，是最阴的一类假绿灯。
+  正解：`knowledge` 上挂 `knowledge_ai` / `knowledge_ad` / `knowledge_au` 三个触发器，
+  另外每次打开库 `INSERT INTO knowledge_fts(knowledge_fts) VALUES('rebuild')` 一次，
+  自愈历史库。详见 §8.8 反模式⑩。
 
 ### 3.5 关键设计决定（**改代码前必读**）
 
@@ -410,16 +417,23 @@ cd C:\dev\projects\AudioTranslator\build\RelWithDebInfo
 
 | 命令 | 验什么 | 期望 |
 |---|---|---|
-| `--selftest --db t.db` | **纯逻辑**：清洗、去重、术语、行动项校验、WAV 解析 | 全部通过（不需要模型，秒级） |
+| `--selftest --db t.db` | **纯逻辑**：清洗、去重、术语、行动项校验、WAV 解析、知识落库+FTS 往返、缺口检测 | 全部通过（不需要模型，秒级） |
 | `--test-window` | 悬浮窗外观、滚动、滚轮回看、拉伸 | 6 句示例 + 40 秒停留 |
 | **`--wav <file>`** | **整条管线端到端**（不打开音频设备、零交互） | 识别→翻译→落库→交付物，退出码 0 |
+| **`--gaps --db t.db`** | 库里的待确认知识 → 该问用户什么（§6.7） | 按优先级列出问题，最多 5 个 |
 | `--demo-session --db t.db` | 往库里写一次假的 12 条会话 | 打印 `已写入演示会话 #1`，**不生成文件** |
 | `--export 1 --db t.db --out out_dir` | 由库里的会话重出交付物 | `out_dir\session-1\` 下 4 个文件 |
 | `--dump-prompt` | 看发给大模型的 prompt | 打印模板 |
 | `--list` | 模型路径探测 | 只打印配置，不启动 |
-| **`python tools/verify_memory.py <db>`** | **长期记忆数据层**（知识库的地基） | 四张表都在 + FTS5 能索引能检索 |
+| **`python tools/verify_memory.py <db>`** | **长期记忆数据层**（知识库的地基） | 四张表都在 + **触发器真能维护索引**（写→查得到→删→查不到） |
 
-**`verify_memory.py` 为什么用 Python 写**：它是**独立实现**的验证 —— Python 自带的 sqlite3 和项目里 vendored 的 `sqlite3.c` 是两套完全不同的构建。两套都能用 FTS5，才说明"能建表"不是靠某个侥幸的编译选项。它全程在一个事务里、最后回滚，**不改动原库**。
+**`verify_memory.py` 为什么用 Python 写**：它是**独立实现**的验证 —— Python 自带的 sqlite3 和项目里 vendored 的 `sqlite3.c` 是两套完全不同的构建。两套都能用 FTS5，才说明"能建表"不是靠某个侥幸的编译选项。默认全程在一个事务里、最后回滚，**不改动原库**（`--seed-demo` / `--clear` 例外，它们需要显式指定且只碰 `__demo_` 前缀的行）。
+
+> ⚠️ **它验的是"触发器"不是"表存在"。** 早先这一项只查四张表在不在，
+> 于是"`knowledge_fts` 的索引其实一条都没建起来、MATCH 啥也查不到"这个 bug
+> 藏了两轮。现在它**一句 FTS 语句都不写**：只往 `knowledge` 插，
+> 索引必须由触发器自己跟上，然后查回来、再删掉确认删也同步。
+> 教训记在 §8.8 反模式⑩：**拿"东西在不在"当验收，等于没验收。**
 
 > ⚠️ **必须用「程序真正在用的那个库」。** `--db t.db` 是**相对当前目录**的，而
 > `build\RelWithDebInfo\` 和仓库根**各有一个 `t.db`**，是两个不同的文件。
@@ -776,15 +790,20 @@ Erika 是谁？                 → 查 kind=person, key=erika
 
 #### 第 2 阶段 · 知识库骨架（大，7 步，每步独立可验证）
 
-| # | 做什么 | 验证级别 | 依赖 |
-|---|---|---|---|
-| 2.1 | `SQLITE_ENABLE_FTS5` + 建 `knowledge` / `knowledge_history` / `actions` 三表 + 迁移 | L1 | — |
-| 2.2 | `KnowledgeStore`：`normalize_key()` / upsert / Confirmed↔Candidate 提升。**纯函数优先** | L1 | 2.1 |
-| 2.3 | 缺口检测四条规则（§6.6）：输入 = 知识库 + 本场段落，输出 = 候选问题列表 | **L1（完全不依赖模型）** | 2.2 |
-| 2.4 | 结束时的确认交互（§6.7）：2–5 问、回车即跳过、不阻塞交付物 | L2 | 2.3 |
-| 2.5 | **三腿复用接知识库**：Whisper `initial_prompt` / 翻译约束 / 摘要背景，全部改从 `knowledge` 取，去掉对 `terms.sample.txt` 的依赖 | L1 + **L3** | 2.4 + 1.1 |
-| 2.6 | `--ask` 检索（§6.9）四类问法 | L1 + L2 | 2.2 |
-| 2.7 | Action 跨会话追踪 `Todo / Doing / Done`（§6.8） | L1 | 2.2 |
+| # | 做什么 | 验证级别 | 依赖 | 状态 |
+|---|---|---|---|---|
+| 2.1 | `SQLITE_ENABLE_FTS5` + 建 `knowledge` / `knowledge_history` / `actions` 三表 + 迁移 | L1 | — | ✅ |
+| 2.2 | `KnowledgeStore`：`normalize_key()` / upsert / Confirmed↔Candidate 提升。**纯函数优先** | L1 | 2.1 | ✅ |
+| 2.3 | 缺口检测四条规则（§6.6）：输入 = 知识库 + 本场段落，输出 = 候选问题列表 | **L1（完全不依赖模型）** | 2.2 | ✅ |
+| 2.4 | 结束时的确认交互（§6.7）：2–5 问、回车即跳过、不阻塞交付物 | L2 | 2.3 | ← **下一个** |
+| 2.5 | **三腿复用接知识库**：Whisper `initial_prompt` / 翻译约束 / 摘要背景，全部改从 `knowledge` 取，去掉对 `terms.sample.txt` 的依赖 | L1 + **L3** | 2.4 + 1.1 | |
+| 2.6 | `--ask` 检索（§6.9）四类问法 | L1 + L2 | 2.2 | |
+| 2.7 | Action 跨会话追踪 `Todo / Doing / Done`（§6.8） | L1 | 2.2 | |
+
+> **2.3 的实测产出**（供 2.4 直接用）：`--gaps` 已经能给出按优先级排好的问题列表，
+> 四条规则的优先级依次是 `value_changed` > `high_freq_unconfirmed` > `inconsistent_rendering` > `low_confidence_name`，
+> 默认上限 5 个。**confirmed 且无变化的条目一个字都不问** —— 那是「提问是稀缺资源」的对照组。
+> 2.4 只需要把这份列表变成交互，不需要重新做检测。
 
 **阶段产出**：第二句承诺 5% → **~60%**，闭环 30% → **~70%**
 
@@ -1086,6 +1105,8 @@ Linux/macOS 桌面版（§1.6 / §3.6）· 跨会话逐句字幕回看（§1.6�
 | ⑦ 长期不提交 | 3.5 个月无回退点，出问题只能整体回滚 | §8.0 |
 | ⑧ 为"技术洁癖"加功能 | 提过"把回看接到数据库做跨会话"——要求里根本没有，而且数量级不成立 | 先过 §8.1 的第 1 步判定 |
 | ⑨ **自检用例用自己手搓的"更干净"输入** | **栽过两次**。最近一次：截止日期依据的用例配了一个真实管线不产生的配对（中文 task + 有 source），于是**自检全绿、线上照错** —— 真实云端路径的 `source` 是空的 | **用例的输入必须来自真实路径**（真实产物、真实数据结构），不能自己配一个"理想的" |
+| ⑩ **拿"东西在不在"当验收** | 2.1~2.3 的自检只验"四张表在不在"，于是 `knowledge_fts` 的索引**其实一条都没建起来**（外部内容表的 `count(*)` 读的是内容表，看着有行、`MATCH` 啥也查不到），这个 bug 藏了两轮 | 每加一层基础设施就加一条**走真实写入路径的往返断言**：写进去 → 必须查得回来 → 删掉 → 必须查不到。改成这样之后**当场抓出两个真 bug** |
+| ⑪ **把失败悄悄变成"空结果"** | `search()` 的 SQL 用了 FTS 表别名（`f MATCH ?` 报 `no such column: f`），prepare 失败时静默 `return {}` —— 看起来和"真的没搜到"一模一样，白排查一轮 | 失败路径必须能区分于空结果：带 `err` 出参报错，或至少 `std::cerr` 一行 |
 
 ### 8.9 什么必须停下来问，什么不用问
 

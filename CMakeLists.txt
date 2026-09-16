@@ -38,6 +38,7 @@ add_executable(Translator
 	src/HunyuanTranslator.cpp
 	src/SessionStore.cpp
 	src/KnowledgeStore.cpp
+	src/KnowledgeGap.cpp
 	src/DeliverableWriter.cpp
 	src/LlmSummarizer.cpp
 	src/CaBundle.cpp
@@ -51,6 +52,7 @@ add_executable(Translator
 	inc/HunyuanTranslator.h
 	inc/SessionStore.h
 	inc/KnowledgeStore.h
+	inc/KnowledgeGap.h
 	inc/DeliverableWriter.h
 	inc/LlmSummarizer.h
 	inc/CaBundle.h

@@ -1,0 +1,152 @@
+#include "KnowledgeGap.h"
+
+#include <algorithm>
+#include <sstream>
+
+namespace knowledge {
+
+const char* to_string(GapRule r) {
+    switch (r) {
+    case GapRule::ValueChanged:          return "value_changed";
+    case GapRule::InconsistentRendering: return "inconsistent_rendering";
+    case GapRule::HighFreqUnconfirmed:   return "high_freq_unconfirmed";
+    case GapRule::LowConfidenceName:     return "low_confidence_name";
+    }
+    return "unknown";
+}
+
+int priority_of(GapRule r) {
+    // 越小越先问。排序依据是"不问的代价"：
+    //   值冲突最危险 —— 库里可能已经是错的，而且它会进约束影响后续翻译
+    //   译法不一致次之 —— 直接影响用户读到的译文质量
+    //   高频未确认再次 —— 提了很多次却一直没定性，问一次收益最大
+    //   低置信度最后 —— 大概率只是听错了，价值最低
+    switch (r) {
+    case GapRule::ValueChanged:          return 1;
+    case GapRule::InconsistentRendering: return 2;
+    case GapRule::HighFreqUnconfirmed:   return 3;
+    case GapRule::LowConfidenceName:     return 4;
+    }
+    return 99;
+}
+
+namespace {
+
+// 历史里出现过多少个**不同**的值（含当前值之外的历史值）
+size_t distinct_values(const std::vector<KnowledgeStore::HistoryRow>& hist) {
+    std::vector<std::string> vals;
+    for (const auto& h : hist) {
+        if (!h.new_value.empty() &&
+            std::find(vals.begin(), vals.end(), h.new_value) == vals.end()) {
+            vals.push_back(h.new_value);
+        }
+    }
+    return vals.size();
+}
+
+// 历史里有没有"确认过的值被改掉"的记录 —— 对应 §6.6 的"旧值 ≠ 新值"
+bool has_demote_record(const std::vector<KnowledgeStore::HistoryRow>& hist) {
+    for (const auto& h : hist) {
+        if (h.reason == "value_changed_demoted") return true;
+    }
+    return false;
+}
+
+// 找出被顶掉的旧值（最近一次 value_changed_demoted 的 old_value）
+std::string last_demoted_old(const std::vector<KnowledgeStore::HistoryRow>& hist) {
+    for (auto it = hist.rbegin(); it != hist.rend(); ++it) {
+        if (it->reason == "value_changed_demoted") return it->old_value;
+    }
+    return {};
+}
+
+std::string fmt_conf(double c) {
+    std::ostringstream oss;
+    oss.setf(std::ios::fixed);
+    oss.precision(2);
+    oss << c;
+    return oss.str();
+}
+
+}  // namespace
+
+std::vector<GapQuestion> detect_gaps(const std::vector<KnowledgeWithHistory>& entries,
+                                     size_t max_questions) {
+    std::vector<GapQuestion> out;
+
+    for (const auto& e : entries) {
+        const KnowledgeItem& k = e.item;
+
+        // archived 是用户明确否掉的，再问就是烦人（§1.3 提问稀缺）
+        if (k.status == "archived") continue;
+        if (k.value.empty()) continue;
+
+        // 按优先级从高到低试四条规则，命中第一条就出题 ——
+        // 同一个键最多出一条问题，否则用户会看到三条问同一件事的题。
+        GapQuestion q;
+        bool hit = false;
+
+        if (has_demote_record(e.history)) {
+            q.rule      = GapRule::ValueChanged;
+            q.old_value = last_demoted_old(e.history);
+            q.question  = u8"这个改过：「" + q.old_value + u8"」→「" + k.value +
+                          u8"」。以后都用「" + k.value + u8"」吗？";
+            hit = true;
+        } else if (k.status == "candidate" && distinct_values(e.history) >= 2) {
+            q.rule     = GapRule::InconsistentRendering;
+            q.question = u8"「" + k.value + u8"」的写法变过好几次。固定成哪一种？";
+            hit = true;
+        } else if (k.status == "candidate" && k.hits >= kHighFreqHits) {
+            q.rule     = GapRule::HighFreqUnconfirmed;
+            q.question = u8"已经听到 " + std::to_string(k.hits) + u8" 次「" + k.value +
+                         u8"」，一直没确认过。它是对的说法吗？";
+            hit = true;
+        } else if (k.status == "candidate" &&
+                   k.confidence >= 0.0 && k.confidence < kLowConfidenceBelow) {
+            q.rule     = GapRule::LowConfidenceName;
+            q.question = u8"「" + k.value + u8"」的识别置信度只有 " + fmt_conf(k.confidence) +
+                         u8"，可能是听错了。正确的写法是什么？";
+            hit = true;
+        }
+
+        if (!hit) continue;
+
+        q.knowledge_id = k.id;
+        q.kind         = k.kind;
+        q.key          = k.key;
+        q.value        = k.value;
+        q.hits         = k.hits;
+        q.confidence   = k.confidence;
+        out.push_back(std::move(q));
+    }
+
+    // 按优先级排；同优先级按 hits 多的在前（提得多的更值得问）
+    std::stable_sort(out.begin(), out.end(),
+                     [](const GapQuestion& a, const GapQuestion& b) {
+                         const int pa = priority_of(a.rule), pb = priority_of(b.rule);
+                         if (pa != pb) return pa < pb;
+                         return a.hits > b.hits;
+                     });
+
+    if (out.size() > max_questions) out.resize(max_questions);
+    return out;
+}
+
+std::vector<GapQuestion> detect_gaps_from_store(size_t max_questions) {
+    std::vector<KnowledgeWithHistory> entries;
+
+    // 取数口径：**全部条目**，不只 candidate。
+    // 因为"值冲突"要看历史，而历史可能挂在任意状态的行上（比如用户手动改过的）。
+    // 库规模是几百条量级，一次全取没有性能问题；判定逻辑全在 detect_gaps 里，
+    // 那里才是"该不该问"的唯一口径。
+    KnowledgeStore& ks = KnowledgeStore::instance();
+    for (const auto& item : ks.list("", 1000)) {
+        KnowledgeWithHistory e;
+        e.item    = item;
+        e.history = ks.history(item.id);
+        entries.push_back(std::move(e));
+    }
+    return detect_gaps(entries, max_questions);
+}
+
+}  // namespace knowledge

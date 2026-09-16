@@ -62,6 +62,18 @@ bool usable_as_constraint(const KnowledgeItem& item);
 // 因为用户可能改主意；confirmed -> candidate 不允许，那是降级，要显式走 archive）
 bool can_promote(const std::string& from_status, const std::string& to_status);
 
+// 把用户随手打的一句话变成**合法且安全**的 FTS5 MATCH 查询串。
+//
+// 【现象】用户输入 `Q4, 2024` / `-foo` / `AND` / `(` 时，原文直接塞进 MATCH 会报
+//         sqlite 语法错 —— 搜索框一打标点就崩。
+// 【原因】MATCH 有自己的一套查询语法：双引号是短语，AND/OR/NOT/-/^/* 都是操作符。
+//         用户输入的是**自然文本**，不是查询表达式。
+// 【判断】按码点过滤：ASCII 只留字母数字；全角 ASCII 折半角后同样处理；
+//         中文标点（。，、？！「」…）当分隔符；汉字/假名整字保留。
+//         每个词包成双引号短语，词之间 AND。双引号在第一步就被当分隔符丢掉了，
+//         所以**不可能**拼出非法语法。
+std::string fts_query_from_user_text(const std::string& raw);
+
 }  // namespace knowledge
 
 // ---------------------------------------------------------------
@@ -88,6 +100,17 @@ public:
 
     // 按状态列条目。status 为空表示不过滤。
     std::vector<KnowledgeItem> list(const std::string& status = "", int limit = 200) const;
+
+    // 全文检索（FTS5）。query 是**用户随手打的自然文本**，不是 FTS5 查询语法，
+    // 内部会走 knowledge::fts_query_from_user_text() 清洗后交给 MATCH。
+    // 命中 key / value / source_text 任一列，按相关性排序。
+    //
+    // 【为什么现在就加】2.3 之前整条链路里没有任何代码读 FTS 索引，
+    // 于是"索引其实一条都没建起来"这个 bug 藏了两轮都没人发现。
+    // 有 search() 之后，自检可以走真实写入路径（upsert）再真实检索，索引就再也藏不住了。
+    // 2.6 的 `--ask` 会把它暴露成命令行。
+    std::vector<KnowledgeItem> search(const std::string& query, int limit = 20,
+                                      std::string* err = nullptr) const;
 
     // 改状态并记历史。reason 见 §6.8：user_confirmed | model_extracted | user_edited
     bool set_status(long long id, const std::string& status,
