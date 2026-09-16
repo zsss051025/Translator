@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <vector>
 
 // 一条待翻译的请求。
 // confidence 是上游语音识别的置信度，会一路带到数据库，
@@ -40,4 +41,24 @@ public:
     // 「英文第 N 句 + 中文第 N-1 句」的错配。
     // 调用方拿到译文后要先比对来源，一致才更新，否则显示"翻译中…"。
     virtual std::string get_last_source() const = 0;
+
+    // ---- 术语约束（让译文里的专名保持同一写法）----
+    //
+    // 【为什么需要】实测会话 #11：同一个 `Erica`，第 1 句保留成 "Erica"、
+    // 第 2 句被音译成「埃里卡」——**同一场会话内自相矛盾**。
+    // 原因是术语表原来只有两条腿在工作：喂 Whisper 的 initial_prompt、
+    // 以及 TermFixer 的识别后纠错；**对译文输出零约束**。
+    //
+    // 【为什么放在接口上】三个地方各自构造翻译用的 system prompt
+    // （混元 translate_once、混元 debug_dump_prompt、云端 worker），
+    // 约束文案如果各写一份，漏改一处就会出现"本地一致、云端不一致"。
+    void set_glossary(const std::vector<std::string>& terms);
+
+    // 术语约束文本（纯函数，便于自检）。
+    // 没有术语时返回空串，调用方直接拼在后面即可。
+    static std::string glossary_constraint(const std::vector<std::string>& terms);
+
+protected:
+    // 由 set_glossary() 写入，在 start() 之前设置完成，因此不需要加锁
+    std::vector<std::string> glossary_;
 };

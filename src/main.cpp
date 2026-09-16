@@ -458,6 +458,16 @@ static int run_dump_prompt(const AppConfig& cfg) {
         return 1;
     }
     hy.set_target_language(cfg.target_lang);
+
+    // 【必须和真实路径一致】这个命令的**唯一价值**就是"让你看到实际送出的 prompt"。
+    // 实测踩过：加了术语约束之后 --dump-prompt 仍然不显示它，因为这条路径
+    // 自己创建翻译器、从没调 set_glossary() —— 于是诊断工具开始撒谎，
+    // 排查时看到的 prompt 和真实运行的不是同一个。
+    // 【判断】以后凡是往翻译 prompt 里加东西，都要回来确认这里也加上了。
+    const std::vector<std::string> glossary = load_glossary_terms(cfg.glossary_path);
+    hy.set_glossary(glossary);
+    std::cout << "[Dump] 已载入术语 " << glossary.size() << " 条作为翻译约束" << std::endl;
+
     hy.debug_dump_prompt(cfg.dump_prompt);
 
     // 顺便跑一次真实翻译，验证 prompt 修复后是否还有回显
@@ -991,6 +1001,48 @@ static int run_selftest(const AppConfig& cfg) {
         if (!t_ok) return 1;
     }
 
+    // ---- 8) 术语约束（让译文里的专名保持同一写法）----
+    {
+        // 空表：不产生约束文本（拼上去是空串，不能凭空多一个换行）
+        const std::string empty_c = ITranslator::glossary_constraint({});
+        const bool c1 = empty_c.empty();
+
+        // 正常：每个术语都要出现，并且明确写了"不要音译"
+        const std::vector<std::string> terms = {"Marco", "Erica", "EnglishPod"};
+        const std::string c = ITranslator::glossary_constraint(terms);
+        const bool c2 = c.find("Marco") != std::string::npos &&
+                        c.find("Erica") != std::string::npos &&
+                        c.find("EnglishPod") != std::string::npos &&
+                        c.find("transliterate") != std::string::npos;
+
+        // 超长条目要被跳过（那多半不是专名，而是误入的词组）
+        const std::vector<std::string> with_junk = {
+            "Marco",
+            "this is a whole sentence that accidentally ended up in the glossary list"
+        };
+        const std::string cj = ITranslator::glossary_constraint(with_junk);
+        const bool c3 = cj.find("Marco") != std::string::npos &&
+                        cj.find("accidentally") == std::string::npos;
+
+        // 条数上限：不能把提示词撑爆
+        std::vector<std::string> many;
+        for (int i = 0; i < 100; ++i) many.push_back("Term" + std::to_string(i));
+        const std::string cm = ITranslator::glossary_constraint(many);
+        const bool c4 = cm.find("Term0") != std::string::npos &&
+                        cm.find("Term50") == std::string::npos;
+
+        const bool c_ok = c1 && c2 && c3 && c4;
+        std::cout << "[SelfTest] 术语约束文本: " << (c_ok ? "✅ " : "❌ ")
+                  << "空表/正常/超长剔除/条数上限 4 例" << std::endl;
+        if (!c_ok) {
+            std::cerr << "    空表='" << empty_c << "'\n"
+                      << "    正常='" << c << "'\n"
+                      << "    含垃圾='" << cj << "'\n"
+                      << "    超量长度=" << cm.size() << std::endl;
+            return 1;
+        }
+    }
+
     auto& store = SessionStore::instance();
     if (!store.init(cfg.db_path)) {
         std::cerr << "[SelfTest] init 失败" << std::endl;
@@ -1133,8 +1185,24 @@ int main(int argc, char** argv) {
             translator = std::make_unique<DeepSeekTranslator>(cfg.deepseek_api_key);
         }
 
-        translator->start();   // 统一由接口启动工作线程，不再需要向下转型
+        // 术语约束：让译文里的专名保持同一写法。
+        //
+        // 【为什么必须加】术语表现在只喂 Whisper（识别时偏向这些词）
+        // 和 TermFixer（识别后纠错），**对译文输出零约束**。
+        // 实测会话 #11：同一个 Erica，第 1 句保留成 "Erica"、第 2 句被音译成「埃里卡」。
+        // 这两条腿只保护"听得对"，不保护"译得一致"。
+        //
+        // ⚠️ **必须在 start() 之前设置**：这两个字段是 worker 线程构造 prompt 时读的。
+        // 放到 start() 之后虽然实际也来得及（第一条文本更晚才 push），
+        // 但那是"靠时序侥幸"，一旦以后有人改成启动即预热就会变成数据竞争。
         translator->set_target_language(cfg.target_lang);   // 译文语言
+        translator->set_glossary(glossary);
+        if (!glossary.empty()) {
+            std::cout << "[术语] 已作为翻译约束下发（" << glossary.size()
+                      << " 条），用于统一译文里的专名写法" << std::endl;
+        }
+
+        translator->start();   // 统一由接口启动工作线程，不再需要向下转型
 
         // 开启一场会话：此后所有翻译记录都归入这场会话，
         // 作为纪要/行动项等交付物的数据基础。

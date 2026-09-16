@@ -52,6 +52,11 @@ private:
     std::string build_prompt(const std::string& system, const std::string& user) const;
     // 目标语言的人类可读名（用于写进 prompt）
     std::string target_name() const;
+    // 翻译任务的 system prompt。
+    // **必须只有一处**：它原来在 translate_once 和 debug_dump_prompt 里各写了一份，
+    // 于是加"术语约束"时两处就得同步——而 debug_dump_prompt 是给人看 prompt 用的，
+    // 不同步就会看到与实际运行不一致的 prompt，把排查带偏。
+    std::string translate_system_prompt() const;
     // 兜底清洗：剥掉可能被回显的 prompt 片段与首尾引号
     static std::string sanitize_output(std::string s);
 

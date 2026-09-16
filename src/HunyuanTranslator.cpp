@@ -46,12 +46,19 @@ std::string HunyuanTranslator::get_last_source() const {
     return last_source_;
 }
 
+std::string HunyuanTranslator::translate_system_prompt() const {
+    // 系统提示负责固定"只输出译文"。
+    // 不要写成"将以下文本翻译为中文："这种祈使句——
+    // 模型会把待译文本当成同一段话的续写，于是指令被原样吐出来。
+    return "You are a professional translator. Translate the user's message into " + target_name() +
+           ". Output only the translation itself, with no explanation, no prefix, "
+           "no quotation marks, and no repetition of these instructions." +
+           ITranslator::glossary_constraint(glossary_);
+}
+
 void HunyuanTranslator::debug_dump_prompt(const std::string& text) const {
     // 用翻译任务的 system prompt 来展示，与实际运行路径一致
-    const std::string sys =
-        "You are a professional translator. Translate the user's message into " + target_name() +
-        ". Output only the translation itself, with no explanation, no prefix, "
-        "no quotation marks, and no repetition of these instructions.";
+    const std::string sys = translate_system_prompt();
     const std::string prompt = build_prompt(sys, text);
 
     // 把全角竖线 + SentencePiece 空格符换成肉眼可读的形式
@@ -289,13 +296,7 @@ long long HunyuanTranslator::get_last_api_ms() {
 
 
 bool HunyuanTranslator::translate_once(const std::string& text, std::string& out) {
-    // 系统提示负责固定"只输出译文"。
-    // 不要写成"将以下文本翻译为中文："这种祈使句——
-    // 模型会把待译文本当成同一段话的续写，于是指令被原样吐出来。
-    const std::string sys =
-        "You are a professional translator. Translate the user's message into " + target_name() +
-        ". Output only the translation itself, with no explanation, no prefix, "
-        "no quotation marks, and no repetition of these instructions.";
+    const std::string sys = translate_system_prompt();
     std::string raw;
     if (!generate_once(sys, text, raw, /*max_new=*/128)) return false;
     out = sanitize_output(std::move(raw));   // 剥掉可能被回显的 prompt 片段

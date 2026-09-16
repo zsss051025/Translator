@@ -115,7 +115,8 @@ void DeepSeekTranslator::network_worker() {
 		const std::string sys_prompt =
 			"You are a professional translator. Translate the user's message into " +
 			target_name() +
-			". Output only the translation itself, with no explanation and no quotation marks.";
+			". Output only the translation itself, with no explanation and no quotation marks." +
+			ITranslator::glossary_constraint(glossary_);
 
 		json payload = {
 			{"model", "deepseek-chat"},
