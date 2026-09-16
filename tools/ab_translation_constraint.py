@@ -3,40 +3,26 @@
 §6.5 红线的行为级回归：确认过的知识能改变译文，模型猜的一个字都不能影响。
 
 用法:
-    python tools/ab_translation_constraint.py [--db build/RelWithDebInfo/t.db]
+    python tools/ab_translation_constraint.py
 
-为什么需要它（而不是只看自检）
+⚠️ **它绝不碰你的知识库。** 见下面的"事故记录"。
+
+事故记录（第一版，已修）
 --------------------------------------------------------------------
-自检那 22 组全是"数据层"验证：断言 constraint_terms() 不吐 candidate、
-断言 prompt 拼装对了。但**完全可能**出现这种情况：
+第一版为了让 A/B 干净，直接对 `--db` 指向的库执行 `DELETE FROM knowledge`。
+结果**把用户真实知识库里的 4 条 confirmed 全删了**（Erica / Marco / EnglishPod / TV，
+全都来自会话 #43 的自动抽取 + 用户逐个确认）。
 
-    · 过滤逻辑对了、prompt 也拼对了，可模型根本不听 → 用户看不到任何改善
-    · 或者反过来，某条腿绕过了守卫，candidate 混了进去 → 用户看到莫名其妙的译文
+后果不只是"少了 4 条数据"：
+  · 下次录音时识别提示、翻译约束、摘要背景**三条腿全部落空**
+  · 用户看不到任何变化，而且完全不知道为什么
 
-这两种都必须用**真句子 + 真模型**跑出来才算数。这个脚本就是干这个的。
+修法（两层，缺一不可）：
+  ① **默认在一次性 scratch 库上跑**（程序打开时自动建表），跟用户数据没有任何接触
+  ② 就算有人手工指定了别的库，**开工前先检查里面有没有知识条目，有就拒绝运行**
 
-用的是**真实失败案例**，不是我编的句子
---------------------------------------------------------------------
-出处：`build\\RelWithDebInfo\\translations.db`（旧库，11 场 206 段）会话 #11。
-同一场会话里模型自相矛盾：
-
-    #11 seq=1  src: Welcome to EnglishPod. My name is Marco. And I'm Erica.
-               tgt: 欢迎来到EnglishPod。我叫Marco。我是Erica。      ← 保留原文
-    #11 seq=2  src: How are you, Erica? Marco, I'm doing really well.
-               tgt: 埃里卡，你怎么样？马可，我过得很好。             ← 音译了
-
-（这个库不在仓库里（*.db 被 gitignore），所以句子硬编码在这里，并注明出处。）
-
-三条断言
---------------------------------------------------------------------
-  ① 基线必须**逐字复现**历史失败 —— 否则说明模型/提示变了，这个测试已经失效，
-     要重新找失败案例，而不是让它静悄悄地"通过"。
-  ② candidate 组必须与基线**逐字相同** —— 这就是 §6.5 红线在行为层面的证据。
-  ③ confirmed 组必须把 Erica / Marco 恢复过来 —— 第二句承诺在这一刻才成立。
-
-⚠️ 前提：本地混元模型必须存在，且该模型的输出是**确定的**。
-   确定性已验证（同输入重复 3 次逐字相同）；若换了采样参数，先重验这一点，
-   否则"逐字相同"这条断言会变成随机通过。
+这条写在这里而不是只写在提交信息里：下次有人（或下一个我）想"顺手加个 --db" 时，
+能先看到这段话。
 """
 
 import argparse
@@ -55,6 +41,9 @@ for _s in (sys.stdout, sys.stderr):
 SRC = "How are you, Erica? Marco, I'm doing really well."
 HISTORIC_TGT = "埃里卡，你怎么样？马可，我过得很好。"
 
+# 一次性 scratch 库：与用户数据无关，跑完删掉
+SCRATCH_DB = r"build\RelWithDebInfo\ab_scratch.db"
+
 
 def find_exe(root):
     for rel in (r"build\RelWithDebInfo\Translator.exe", "Translator.exe"):
@@ -62,6 +51,50 @@ def find_exe(root):
         if os.path.exists(p):
             return p
     return None
+
+
+def knowledge_count(db):
+    if not os.path.exists(db):
+        return 0
+    try:
+        c = sqlite3.connect(db)
+        n = c.execute("SELECT count(*) FROM knowledge").fetchone()[0]
+        c.close()
+        return n
+    except sqlite3.Error:
+        return 0
+
+
+def ensure_schema(exe, db):
+    """让**程序自己**建表，而不是在 Python 里抄一份 DDL。
+
+    抄一份的下场是两边迟早不一致（表结构是程序定义的，Python 只是旁观者）。
+    `--gaps` 是最轻的入口：它只读库、不加载模型、不采集音频，但会走完整的
+    SessionStore::init()（建表 + 补列 + rebuild 索引）。
+    """
+    if os.path.exists(db):
+        try:
+            c = sqlite3.connect(db)
+            has = c.execute("SELECT count(*) FROM sqlite_master "
+                            "WHERE type='table' AND name='knowledge'").fetchone()[0]
+            c.close()
+            if has:
+                return True
+        except sqlite3.Error:
+            pass
+    p = subprocess.run([exe, "--gaps", "--db", db],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    return p.returncode == 0
+
+
+def remove_db(db):
+    for suffix in ("", "-wal", "-shm"):
+        p = db + suffix
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
 
 def set_knowledge(db, rows):
@@ -95,24 +128,46 @@ def dump(exe, db, text):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    ap.add_argument("--db", default=None, help="默认 <root>/build/RelWithDebInfo/t.db")
+    ap.add_argument("--db", default=None,
+                    help="默认用一次性 scratch 库；**不要指向你的真实知识库**")
     args = ap.parse_args()
 
     root = args.root
-    db = args.db or os.path.join(root, r"build\RelWithDebInfo\t.db")
+    db = args.db or os.path.join(root, SCRATCH_DB)
     exe = find_exe(root)
     if not exe:
         print("[失败] 找不到 Translator.exe，先构建")
         return 1
-    if not os.path.exists(db):
-        print("[失败] 找不到数据库: " + os.path.abspath(db))
+
+    # ---- 护栏：绝不碰有数据的库 ----
+    n = knowledge_count(db)
+    if n > 0:
+        print(f"[拒绝运行] {os.path.abspath(db)} 里已经有 {n} 条知识条目。")
+        print("           这个脚本为了做对照实验会清空 knowledge 表，")
+        print("           跑在真实库上会**删掉用户确认过的知识**（第一版就这么干过）。")
+        print("           不要传 --db，让它用一次性 scratch 库。")
         return 1
 
-    print("数据库: " + os.path.abspath(db))
+    # scratch 库是空文件时要先让程序建表（程序是表结构的定义者）
+    if not ensure_schema(exe, db):
+        print("[失败] 建不出 scratch 库的表结构：" + os.path.abspath(db))
+        remove_db(db)
+        return 1
+
+    print("数据库: " + os.path.abspath(db) + "（一次性 scratch，与你的知识库无关）")
     print("输入  : " + SRC)
     print("历史失败译文: " + HISTORIC_TGT)
     print()
 
+    try:
+        return run_ab(exe, db)
+    finally:
+        # 无论成功失败都删掉这个一次性库（不动任何真实数据）
+        remove_db(db)
+        print("\n已删除一次性 scratch 库：" + os.path.abspath(db))
+
+
+def run_ab(exe, db):
     groups = [
         ("① 空库（基线）", []),
         ("② candidate（模型猜的）",
@@ -142,10 +197,6 @@ def main():
           + ("" if ok_redline else f"  (candidate 输出: {results[1][1]})"))
     print(("✅" if ok_fix else "❌") + " ③ confirmed 把译文纠正成 Erica / Marco"
           + ("" if ok_fix else f"  (实际: {results[2][1]})"))
-
-    # 收尾：把库清干净（这个脚本会写 knowledge 表，必须自己擦）
-    set_knowledge(db, [])
-    print("\n已清空 knowledge 表（脚本自己造的测试数据自己清）")
 
     if ok_repro and ok_redline and ok_fix:
         print("== 全部通过 ==")
