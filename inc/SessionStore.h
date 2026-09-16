@@ -46,6 +46,13 @@ public:
     bool init(const std::string& db_path);
     void close();
 
+    // 当前本地时间，格式 "YYYY-MM-DD HH:MM:SS.mmm"。
+    //
+    // 公开出来是给 KnowledgeStore 用的：知识库的 first_seen_at / updated_at /
+    // changed_at 必须和会话的时间戳**同一格式**，否则跨表按时间排序会错乱。
+    // 以前它是 .cpp 里的匿名函数——那样知识库就得自己再写一份，两份迟早漂移。
+    static std::string now_string();
+
     // 开启一场会话并设为"当前会话"，返回 session_id（失败返回 -1）
     long long begin_session(const std::string& engine, const std::string& note = "");
 
@@ -66,8 +73,7 @@ public:
     // 读取一场会话的所有段落，按 seq 升序
     std::vector<Segment> fetch_segments(long long session_id) const;
 
-    // 长期记忆的表与全文索引是否就绪（PROJECT.md §7 步骤 2.1 的验收接口）。
-    //
+    // 长期记忆的表与全文索引是否就绪（PROJECT.md §7 步骤 2.1 的验收接口）。    //
     // 检查三件事：
     //   ① sqlite3 编译时真的带了 FTS5（SQLITE_ENABLE_FTS5 宏生效）
     //   ② knowledge / knowledge_history / actions 三张表可查询
@@ -90,6 +96,12 @@ private:
     SessionStore() = default;
     SessionStore(const SessionStore&) = delete;
     SessionStore& operator=(const SessionStore&) = delete;
+
+    // 知识库与会话数据在**同一个 SQLite 文件**里（都在 db_ 指向的库）。
+    // 让 KnowledgeStore 直接复用这个连接，而不是自己再 open 一次：
+    // 同一文件开两个连接要自己处理锁竞争，而它们本来就是一体的数据。
+    // 用 friend 而不是暴露 raw handle —— 后者会让业务代码也能拿到连接去乱写。
+    friend class KnowledgeStore;
 
     bool ensure_schema();           // 建表 + 预编译语句
 

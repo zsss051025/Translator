@@ -13,6 +13,7 @@
 #include "audio_capture.h"
 #include "SpeechEngine.h"
 #include "SessionStore.h"
+#include "KnowledgeStore.h"
 #include "DeliverableWriter.h"
 #include "LlmSummarizer.h"
 #include "SubtitleWindow.h"
@@ -1121,6 +1122,155 @@ static int run_selftest(const AppConfig& cfg) {
                          "若刚改过该行，务必重新 configure（只 build 不会生效）" << std::endl;
             return 1;
         }
+    }
+
+    // ---- 10) 长期记忆：纯规则（归一化 + §6.5 红线）----
+    {
+        // 归一化：同一个专名的不同写法必须落到同一个键
+        struct NormCase { const char* in; const char* want; };
+        const NormCase norm_cases[] = {
+            {"Erika",              "erika"},
+            {"  ERIKA  ",          "erika"},
+            {"Erika.",             "erika"},
+            // 全角字母 → 半角：识别结果里偶尔出现全角
+            {u8"Ｅｒｉｋａ",       "erika"},
+            {"Q4, 2024",           "q4 2024"},
+            {"English   Pod",      "english pod"},
+            // 中文不该被插空格、不该被拆
+            {u8"埃里卡",           u8"埃里卡"},
+            {u8"埃里卡。",         u8"埃里卡"},
+        };
+
+        bool norm_ok = true;
+        int  norm_pass = 0;
+        for (const auto& c : norm_cases) {
+            const std::string got = knowledge::normalize_key(c.in);
+            if (got == c.want) { ++norm_pass; continue; }
+            norm_ok = false;
+            std::cerr << "[SelfTest] 键归一化失败: '" << c.in << "' 期望 '" << c.want
+                      << "' 实际 '" << got << "'" << std::endl;
+        }
+        std::cout << "[SelfTest] 知识键归一化: " << (norm_ok ? "✅ " : "❌ ")
+                  << norm_pass << "/" << (sizeof(norm_cases) / sizeof(norm_cases[0]))
+                  << " 通过" << std::endl;
+        if (!norm_ok) return 1;
+
+        // §6.5 红线：只有 confirmed 能进识别提示 / 翻译约束
+        struct ConstraintCase { const char* status; const char* value; bool want; };
+        const ConstraintCase cc[] = {
+            {"confirmed", "Erika",  true},
+            // 这三条是红线本体：模型猜的、归档的、空的，一律不能当约束
+            {"candidate", "Erika",  false},
+            {"archived",  "Erika",  false},
+            {"confirmed", "",       false},
+        };
+        bool cc_ok = true;
+        int  cc_pass = 0;
+        for (const auto& c : cc) {
+            KnowledgeItem k;
+            k.status = c.status;
+            k.value  = c.value;
+            if (knowledge::usable_as_constraint(k) == c.want) { ++cc_pass; continue; }
+            cc_ok = false;
+            std::cerr << "[SelfTest] 约束资格判定失败: status=" << c.status
+                      << " value='" << c.value << "' 期望 " << c.want << std::endl;
+        }
+        std::cout << "[SelfTest] 约束资格（§6.5 红线：Candidate 不能进提示/约束）: "
+                  << (cc_ok ? "✅ " : "❌ ") << cc_pass << "/"
+                  << (sizeof(cc) / sizeof(cc[0])) << " 通过" << std::endl;
+        if (!cc_ok) return 1;
+    }
+
+    // ---- 11) 长期记忆：落库（upsert 三条语义 + 降级 + 历史）----
+    //
+    // 隔离方式：用**合法的 kind**（term）+ `__selftest_` 前缀的 key，跑完按前缀清理。
+    // 第一版用例拿 kind="__selftest" 做隔离，被 kind 校验直接拒了 ——
+    // 这反过来说明校验是有效的；而隔离只能靠 key 前缀（按 kind 删会误删用户真数据）。
+    {
+        const std::string TK   = "term";
+        const std::string TKEY = "__selftest_erika";
+        const std::string TPRE = "__selftest_";
+
+        auto& ks = KnowledgeStore::instance();
+        ks.purge_key_prefix(TPRE);   // 清掉上次跑的残留
+
+        bool db_ok = true;
+        std::string last_err;
+        auto fail = [&](const char* what) {
+            db_ok = false;
+            std::cerr << "[SelfTest] 知识落库失败: " << what
+                      << (last_err.empty() ? "" : ("  <- " + last_err)) << std::endl;
+            last_err.clear();
+        };
+
+        KnowledgeItem k;
+        k.kind           = TK;
+        k.key            = TKEY;
+        k.value          = "Erika";
+        k.status         = "confirmed";
+        k.confidence     = 0.9;
+        k.source_session = 999;
+        k.source_seq     = 7;
+        k.source_text    = "Hello, I'm Erika.";
+
+        const long long id1 = ks.upsert(k, &last_err);
+        if (id1 <= 0) fail("新建应返回正数 id");
+
+        KnowledgeItem got;
+        last_err.clear();
+        if (!ks.get(TK, TKEY, &got)) fail("按归一化后的键应能查到");
+        else {
+            if (got.value  != "Erika")     fail("value 不对");
+            if (got.status != "confirmed") fail("status 不对");
+            if (got.hits   != 1)           fail("新建 hits 应为 1");
+            if (got.source_seq != 7)       fail("证据段落号丢了");
+        }
+
+        // 语义一：值相同 → 只累加 hits，不写历史
+        last_err.clear();
+        const long long id2 = ks.upsert(k, &last_err);
+        if (id2 != id1) fail("同键应更新同一行，不能新建");
+        if (ks.get(TK, TKEY, &got) && got.hits != 2) fail("hits 应累加到 2");
+        if (!ks.history(id1).empty()) fail("值没变时不该写历史");
+
+        // 语义二：值变了 → 更新 + 写历史 + **confirmed 降回 candidate**
+        k.value = u8"埃里卡";
+        last_err.clear();
+        ks.upsert(k, &last_err);
+        if (ks.get(TK, TKEY, &got)) {
+            if (got.value  != u8"埃里卡")   fail("value 应更新");
+            if (got.status != "candidate") fail("值变了必须降回 candidate（§6.5）");
+        }
+        const auto hist = ks.history(id1);
+        if (hist.size() != 1) fail("值变化应写 1 条历史");
+        else if (hist[0].old_value != "Erika" || hist[0].new_value != u8"埃里卡")
+            fail("历史里应记下旧值与新值");
+
+        // 语义三：用户确认 → 写历史且状态变 confirmed
+        last_err.clear();
+        if (!ks.set_status(id1, "confirmed", "user_confirmed", &last_err)) fail("确认应成功");
+        if (ks.get(TK, TKEY, &got) && got.status != "confirmed") fail("状态应变为 confirmed");
+        if (ks.history(id1).size() != 2) fail("状态变化也应进历史");
+
+        // 非法输入必须被拒绝，而不是悄悄写进去
+        {
+            KnowledgeItem bad = k;
+            bad.kind = "not_a_kind";
+            last_err.clear();
+            if (ks.upsert(bad, &last_err) > 0) fail("非法 kind 应被拒绝");
+            bad = k;
+            bad.value.clear();
+            last_err.clear();
+            if (ks.upsert(bad, &last_err) > 0) fail("空 value 应被拒绝");
+        }
+
+        last_err.clear();
+        const int removed = ks.purge_key_prefix(TPRE);
+        if (removed < 1) fail("清理应至少删掉 1 条");
+
+        std::cout << "[SelfTest] 知识落库（新建/累加/变更降级/确认/拒绝非法/清理）: "
+                  << (db_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+        if (!db_ok) return 1;
     }
 
     std::cout << "[SelfTest] 最近会话：" << std::endl;

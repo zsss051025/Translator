@@ -34,8 +34,8 @@
 | **第 1 阶段** 让全链路可自动化 | 1.1 `--wav` 文件输入 | ✅ 完成 |
 | | 1.2 去掉启动选择题 | ✅ 完成 |
 | **第 2 阶段** 知识库骨架 | 2.1 FTS5 + 三张表 + 迁移 | ✅ 完成 |
-| | **2.2 `KnowledgeStore`** | ← **下一个动作** |
-| | 2.3 缺口检测四条规则 | 未开始 |
+| | **2.2 `KnowledgeStore`**（归一化 / upsert / 状态提升 / 历史） | ✅ 完成 |
+| | **2.3 缺口检测四条规则** | ← **下一个动作** |
 | | 2.4 结束时确认交互 | 未开始 |
 | | 2.5 三腿复用接知识库 | 未开始 |
 | | 2.6 `--ask` 检索 | 未开始 |
@@ -45,13 +45,13 @@
 
 ### 下一个动作（具体到文件）
 
-**2.2 `KnowledgeStore`**：
+**2.3 缺口检测四条规则**（`PROJECT.md` §6.6）：
 
-- 新建 `inc/KnowledgeStore.h` + `src/KnowledgeStore.cpp`
-- `normalize_key()`：把专名归一成查询键（大小写、空格、标点、全半角）
-- upsert：同 `(kind, key)` 只保留一个当前值，旧值写进 `knowledge_history`
-- Confirmed ↔ Candidate 提升（红线：**Candidate 绝不进识别提示和翻译约束**，见 `PROJECT.md` §6.5）
-- **纯函数优先** —— 归一化和提升规则都要能进 L1 自检（§8.2：否则验证要从秒级变分钟级，人就会跳过验证）
+- 新建 `inc/KnowledgeGap.h` + `src/KnowledgeGap.cpp`
+- 输入：`knowledge` 表里的条目 + 本场会话的段落；输出：候选问题列表
+- 四条规则：**译法不一致** / 高频未确认（`hits >= 3`）/ 低置信度专名 / 旧值 ≠ 新值
+- **完全不依赖模型**，必须能进 L1（§8.2：这是整个第 2 阶段里最该做成纯函数的一块）
+- 第一条规则已有真实案例：会话 #11 的 `Erica / 埃里卡`（见 `PROJECT.md` §6.6）
 
 ### 其它状态
 
@@ -60,7 +60,7 @@
 | 分支 | `main`（本地主线）；远程备份在 `assistant-baseline` |
 | 远程 `main` | `da97d96` —— **有意不动**，详见 `PROJECT.md` §3.6 末「历史决策：不合并 da97d96」 |
 | tag | `translator-final` → `7717ace`（翻译版本封存） |
-| 自检 | **15 组 54 例**，秒级，不需要模型 |
+| 自检 | **18 组**，秒级，不需要模型 |
 | 闭环八步完成度 | 约 **35%**（听见 90 / 理解 90 / 提取 78 / 记忆 10 / 后四步 0） |
 
 ---
@@ -146,6 +146,9 @@
 
 | 时间 | 事 | 关键点 |
 |---|---|---|
+| 09-16 | 2.2 KnowledgeStore | **值变了必须把 confirmed 降回 candidate** —— 原来那条确认是针对旧值的，值一变它就不成立了；不降级等于让模型的新猜测借着用户对旧值的信任进到约束里（§6.5 要防的正是这个） |
+| 09-16 | 2.2 自检抓到两个真 bug | ① `normalize_key` 只处理 ASCII 标点，`埃里卡。` 和 `埃里卡` 会变成两个键；② `_` 被当标点，`asr_engine` 变 `asr engine`、`__selftest_` 前缀被吃掉导致清理失效。**都是自检抓的，不是我看出来的** |
+| 09-16 | 2.2 隔离方式改了 | 第一版用 `kind="__selftest"` 做测试隔离 → 被 kind 校验拒；改成按 kind 删 → 会误删用户真数据。最终：合法 kind + `__selftest_` 前缀 key + `purge_key_prefix()` |
 | 09-16 | 2.1 FTS5 + 三张表 | `CREATE TABLE IF NOT EXISTS` 顺带就是迁移，老库打开自动补表。FTS5 宏没定义时**建表会直接失败**，所以"能建表"本身就是宏生效的实证 |
 | 09-16 | 截止日期依据改用整场转录 | **"无法判断" ≠ "无依据"**：云端路径 `ActionItem.source` 是空的（LCS 跨语言匹配不上），只看 source 会把所有日期清空。上一次的"修复"就是栽在这 |
 | 09-16 | 术语约束译文（2 腿 → 3 腿） | A/B 复现并修好会话 #11 的 `Erica / 埃里卡`。**但第三条腿依赖第二条腿**：拼写不一致时约束不命中 |
@@ -186,7 +189,7 @@ cd C:\dev\projects\AudioTranslator
 # 1. 构建
 cmd /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"" >nul 2>&1 && set VCPKG_ROOT=C:\dev\vcpkg && cmake --build build --config RelWithDebInfo --target Translator"
 
-# 2. L1 自检：必须 15 组全过
+# 2. L1 自检：必须 18 组全过
 .\build\RelWithDebInfo\Translator.exe --selftest --db t.db
 
 # 2b. 知识库数据层（第 2 阶段每步都要跑）——独立实现验证，且不改动原库

@@ -9,24 +9,6 @@
 
 namespace {
 
-// 当前本地时间，格式 "YYYY-MM-DD HH:MM:SS.mmm"
-// 带毫秒是为了让导出层能算出字幕（SRT）所需的相对时间轴。
-std::string now_string() {
-    auto now = std::chrono::system_clock::now();
-    auto ms_part = std::chrono::duration_cast<std::chrono::milliseconds>(
-                       now.time_since_epoch()).count() % 1000;
-    std::time_t t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm_buf{};
-#if defined(_WIN32)
-    localtime_s(&tm_buf, &t);
-#else
-    localtime_r(&t, &tm_buf);
-#endif
-    std::ostringstream oss;
-    oss << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S")
-        << '.' << std::setfill('0') << std::setw(3) << ms_part;
-    return oss.str();
-}
 
 const char* kSchema =
     "CREATE TABLE IF NOT EXISTS sessions ("
@@ -124,6 +106,30 @@ const char* kSchema =
 SessionStore& SessionStore::instance() {
     static SessionStore store;   // C++11 保证多线程安全，只构造一次
     return store;
+}
+
+// 当前本地时间，格式 "YYYY-MM-DD HH:MM:SS.mmm"
+// 带毫秒是为了让导出层能算出字幕（SRT）所需的相对时间轴。
+//
+// 从 .cpp 的匿名函数提成公开 static：KnowledgeStore 也要用它写
+// first_seen_at / updated_at / changed_at，**必须是同一格式**，
+// 否则跨表按时间排序会错乱。放这里之后，SessionStore.cpp 内部原有的
+// 5 处 now_string() 调用不需要改（成员函数里非限定名直接解析到它）。
+std::string SessionStore::now_string() {
+    auto now = std::chrono::system_clock::now();
+    auto ms_part = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       now.time_since_epoch()).count() % 1000;
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_buf{};
+#if defined(_WIN32)
+    localtime_s(&tm_buf, &t);
+#else
+    localtime_r(&t, &tm_buf);
+#endif
+    std::ostringstream oss;
+    oss << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S")
+        << '.' << std::setfill('0') << std::setw(3) << ms_part;
+    return oss.str();
 }
 
 bool SessionStore::init(const std::string& db_path) {
