@@ -417,6 +417,14 @@ cd C:\dev\projects\AudioTranslator\build\RelWithDebInfo
 | `--export 1 --db t.db --out out_dir` | 由库里的会话重出交付物 | `out_dir\session-1\` 下 4 个文件 |
 | `--dump-prompt` | 看发给大模型的 prompt | 打印模板 |
 | `--list` | 模型路径探测 | 只打印配置，不启动 |
+| **`python tools/verify_memory.py <db>`** | **长期记忆数据层**（知识库的地基） | 四张表都在 + FTS5 能索引能检索 |
+
+**`verify_memory.py` 为什么用 Python 写**：它是**独立实现**的验证 —— Python 自带的 sqlite3 和项目里 vendored 的 `sqlite3.c` 是两套完全不同的构建。两套都能用 FTS5，才说明"能建表"不是靠某个侥幸的编译选项。它全程在一个事务里、最后回滚，**不改动原库**。
+
+也可以用来看**迁移**是否生效：拿一个改动前建的旧库跑一遍
+`Translator.exe --selftest --db <旧库>`，四张表应自动出现（建表语句全是 `IF NOT EXISTS`）。
+判断依据：库里会多出 `knowledge_fts_config` / `_data` / `_docsize` / `_idx`
+—— **那是 SQLite 给 FTS5 虚表自己建的影子表，出现它们就说明是真 FTS5**。
 
 **`--wav` 怎么用**（配 `--summarizer rules` 可完全离线，不需要 API key）：
 

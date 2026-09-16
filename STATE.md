@@ -188,6 +188,9 @@ cmd /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxili
 # 2. L1 自检：必须 15 组全过
 .\build\RelWithDebInfo\Translator.exe --selftest --db t.db
 
+# 2b. 知识库数据层（第 2 阶段每步都要跑）——独立实现验证，且不改动原库
+python tools\verify_memory.py t.db
+
 # 3. 端到端（可选，约 20 秒，零交互）
 .\build\RelWithDebInfo\Translator.exe --wav C:\dev\projects\whisper.cpp\samples\jfk.wav --summarizer rules --db v.db --out v_out
 
