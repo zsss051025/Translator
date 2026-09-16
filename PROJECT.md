@@ -421,6 +421,11 @@ cd C:\dev\projects\AudioTranslator\build\RelWithDebInfo
 
 **`verify_memory.py` 为什么用 Python 写**：它是**独立实现**的验证 —— Python 自带的 sqlite3 和项目里 vendored 的 `sqlite3.c` 是两套完全不同的构建。两套都能用 FTS5，才说明"能建表"不是靠某个侥幸的编译选项。它全程在一个事务里、最后回滚，**不改动原库**。
 
+> ⚠️ **必须用「程序真正在用的那个库」。** `--db t.db` 是**相对当前目录**的，而
+> `build\RelWithDebInfo\` 和仓库根**各有一个 `t.db`**，是两个不同的文件。
+> 这个坑真实发生过：验证报"缺少四张记忆表"，其实只是验错了文件。
+> 工具现在会打印**绝对路径**，并且在这种情况下直接给出下一步该怎么做。
+
 也可以用来看**迁移**是否生效：拿一个改动前建的旧库跑一遍
 `Translator.exe --selftest --db <旧库>`，四张表应自动出现（建表语句全是 `IF NOT EXISTS`）。
 判断依据：库里会多出 `knowledge_fts_config` / `_data` / `_docsize` / `_idx`

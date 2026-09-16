@@ -171,6 +171,7 @@
 | PowerShell 读中文文件显示乱码（`绾跨▼瀹夊叏`） | **误报**：文件是合法 UTF-8，是 `Get-Content` 用 GBK 解码显示。**别据此改编码**，用字节级校验 |
 | `Select-String` 默认**不区分大小写** | 扫平台 API 时 `WPARAM` 会撞上 `wparams`，产生假命中（被骗过一次） |
 | 改了 `CMakeLists.txt` 的编译定义后只 build | **必须重新 configure**，否则不生效（加 `SQLITE_ENABLE_FTS5` 时踩过） |
+| **`--db t.db` 是相对当前目录的**，而 `build\RelWithDebInfo\` 和仓库根**各有一个 `t.db`** | 两个不同的文件。验证/排查前先 `pwd`。`verify_memory.py` 现在会打**绝对路径**，一眼看出验的是哪个（这个坑真实发生过：验证报"缺少记忆表"，其实只是验错了文件） |
 
 ---
 
@@ -189,7 +190,8 @@ cmd /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxili
 .\build\RelWithDebInfo\Translator.exe --selftest --db t.db
 
 # 2b. 知识库数据层（第 2 阶段每步都要跑）——独立实现验证，且不改动原库
-python tools\verify_memory.py t.db
+#     ⚠️ 一定要用**程序真正在用的那个库**：--db 是相对当前目录的
+python tools\verify_memory.py build\RelWithDebInfo\t.db
 
 # 3. 端到端（可选，约 20 秒，零交互）
 .\build\RelWithDebInfo\Translator.exe --wav C:\dev\projects\whisper.cpp\samples\jfk.wav --summarizer rules --db v.db --out v_out

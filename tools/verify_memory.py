@@ -53,13 +53,38 @@ def check_tables(conn):
         print("   " + t + mark)
 
     missing = [t for t in MEMORY_TABLES if t not in tables]
-    if missing:
-        print("\n[缺少] " + ", ".join(missing))
-        print("提示: 若刚改过 CMakeLists.txt 的 SQLITE_ENABLE_FTS5，")
-        print("      只 build 不生效，必须重新 configure。")
-        return False
-    print("\n四张长期记忆表都在")
-    return True
+    if not missing:
+        print("\n四张长期记忆表都在")
+        return True
+
+    print("\n[缺少] " + ", ".join(missing))
+    print(hint_for(missing, tables))
+    return False
+
+
+def hint_for(missing, tables):
+    """
+    给**具体的**下一步，不是笼统的"请检查配置"。
+
+    实测踩过：用户按文档跑验证，报"缺少四张表"，而真相只是
+    **跑在了另一个同名文件上** —— 程序在 build\\RelWithDebInfo\\ 下用的 t.db
+    和仓库根目录那个 t.db 是两个不同的文件。
+    所以下面第一条提示永远是"确认你验的是程序真正在用的那个库"。
+    """
+    lines = []
+    if "sessions" in tables and "segments" in tables:
+        # 典型的老形状库：有会话表、没有记忆表 —— 说明它还没被新版程序打开过
+        lines.append("         这个库有 sessions/segments 但没有记忆表，是**改动前建的旧库**。")
+        lines.append("         让新版程序打开它一次就会自动补表（建表语句都是 IF NOT EXISTS）：")
+        lines.append("             Translator.exe --selftest --db <这个库的完整路径>")
+    else:
+        lines.append("         这个库既没有记忆表也没有会话表，可能不是本项目建的库。")
+    lines.append("")
+    lines.append("      也可能是路径不对。**注意 `--db t.db` 是相对当前目录的**：")
+    lines.append("         build\\RelWithDebInfo\\t.db  ← 从 build 目录跑程序时用的")
+    lines.append("         t.db                        ← 从仓库根跑程序时用的")
+    lines.append("      程序真正在用哪个，就用哪个去验。")
+    return "\n".join(lines)
 
 
 def functional_fts5_check(conn):
@@ -120,7 +145,10 @@ def main():
         return 1
 
     try:
-        print("数据库: " + args.db)
+        # 打**绝对路径**。同名文件散在不同目录是这个项目踩过的坑：
+        # --db t.db 是相对当前目录的，从 build 目录跑和从仓库根跑是两个不同的库。
+        import os
+        print("数据库: " + os.path.abspath(args.db))
         print("python sqlite3 版本: " + sqlite3.sqlite_version)
         print()
         ok_tables = check_tables(conn)
