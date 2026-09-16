@@ -73,12 +73,17 @@ public:
     // 读取一场会话的所有段落，按 seq 升序
     std::vector<Segment> fetch_segments(long long session_id) const;
 
-    // 长期记忆的表与全文索引是否就绪（PROJECT.md §7 步骤 2.1 的验收接口）。    //
+    // 长期记忆的表与全文索引是否**存在**（PROJECT.md §7 步骤 2.1 的验收接口）。
     // 检查三件事：
     //   ① sqlite3 编译时真的带了 FTS5（SQLITE_ENABLE_FTS5 宏生效）
     //   ② knowledge / knowledge_history / actions 三张表可查询
     //   ③ FTS5 虚表 knowledge_fts 可查询 —— 宏没定义时建表那一步就会失败，
-    //      所以这一条是"FTS5 真的能用"的实证，比只看编译选项可靠
+    //      所以这一条能证明 FTS5 真的编进来了，比只看编译选项可靠
+    //
+    // ⚠️ **它只证明"在"，不证明"能用"。** 外部内容表的 count(*) 读的是内容表，
+    //    索引空着也照样返回行数 —— 2.3 之前自检就只看这个，于是
+    //    "索引一条都没建起来"藏了两轮（见 PROJECT.md §8.8 反模式⑩）。
+    //    **要验能不能用，看 KnowledgeStore::search() 的往返用例，不要看这个函数。**
     bool long_term_memory_ready() const;
 
     // 列出最近的会话（供跨会话检索/历史界面使用）
