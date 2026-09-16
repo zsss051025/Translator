@@ -86,8 +86,16 @@ public:
     //         看到"作业与任务"里出现不像待办的句子，先查这里有没有被绕过。
     //
     // 返回被丢弃的条数；dropped 非空时写入每条的被丢原因（用于日志）。
+    //
+    // transcript 是**整场转录**，用于给"截止日期"找依据。
+    // 【为什么必须传整场而不是只看单条 source】云端摘要走的是**中文任务文本 + 英文转录**，
+    // 此时 link_actions_to_segments() 的 LCS 跨语言匹配不上，ActionItem.source 是空的
+    // —— 只看 source 就会把**所有**日期都判成"无依据"清空。
+    // 实测踩过：加了跨语言归一化之后真实运行仍然清空「下周五」，根因就在这里，
+    // 而自检当时是用手工配好 source 的假数据，测不出来。
     static int sanitize_actions(std::vector<ActionItem>& actions,
-                                std::vector<std::string>* dropped = nullptr);
+                                std::vector<std::string>* dropped = nullptr,
+                                const std::vector<Segment>* transcript = nullptr);
 
     // 由会话信息与段落组装元信息
     static SessionMeta make_meta(const SessionInfo& info,

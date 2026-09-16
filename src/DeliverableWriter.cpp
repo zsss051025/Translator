@@ -569,10 +569,23 @@ MeetingSummary DeliverableWriter::extract_by_rules(const std::vector<Segment>& s
 // ===============================================================
 
 int DeliverableWriter::sanitize_actions(std::vector<ActionItem>& actions,
-                                       std::vector<std::string>* dropped) {
+                                       std::vector<std::string>* dropped,
+                                       const std::vector<Segment>* transcript) {
     std::vector<ActionItem> kept;
     kept.reserve(actions.size());
     int n_dropped = 0;
+
+    // 整场转录的归一化文本，只算一次。
+    // 几百段、每条行动项都重算一遍是浪费，而这段代码跑在导出路径上，用户正等着结果。
+    std::string transcript_canon;
+    if (transcript != nullptr) {
+        for (const auto& s : *transcript) {
+            transcript_canon += canonicalize_date(s.src_text);
+            transcript_canon += ' ';
+            transcript_canon += canonicalize_date(s.tgt_text);
+            transcript_canon += ' ';
+        }
+    }
 
     for (auto& a : actions) {
         const std::string norm = normalize_action_text(a.task);
@@ -616,15 +629,29 @@ int DeliverableWriter::sanitize_actions(std::vector<ActionItem>& actions,
         // 这里只拦「今天 / 下周 / 月底」这类相对时间被凭空造出来的情况。
         //
         // 比对前必须 canonicalize_date() 归一化 —— 否则中文 due 对英文 source
-        // 永远对不上，会把正确日期全清空（实测踩过，见该函数的注释）。
+        // 永远对不上，会把正确日期全清空。
+        //
+        // 【依据从哪来】三处都算依据：
+        //   ① 行动项自己的 task 文本（模型可能把日期写进了任务描述）
+        //   ② ActionItem.source（规则路径一定有；云端路径**很可能为空**）
+        //   ③ **整场转录**（云端走中文任务文本 + 英文转录时，source 回填不上，只有这条能用）
+        //
+        // 【"无法判断" ≠ "无依据"】三处依据文本全都没有时，**保留**日期。
+        // 实测踩过：只查 source，而云端路径 source 为空 → 所有日期被判无依据清空；
+        // 正确做法是"没有依据可查时不下判断"，而不是默认判负。
         if (!a.due.empty() &&
             a.due.find_first_of("0123456789") == std::string::npos) {
             const std::string due_c  = canonicalize_date(a.due);
-            const std::string src_c  = canonicalize_date(a.source);
             const std::string task_c = canonicalize_date(a.task);
-            const bool in_src  = !due_c.empty() && src_c.find(due_c)  != std::string::npos;
+
             const bool in_task = !due_c.empty() && task_c.find(due_c) != std::string::npos;
-            if (!in_src && !in_task) {
+            const bool in_src  = !due_c.empty() && !a.source.empty() &&
+                                 canonicalize_date(a.source).find(due_c) != std::string::npos;
+            const bool in_tr   = !due_c.empty() && !transcript_canon.empty() &&
+                                 transcript_canon.find(due_c) != std::string::npos;
+
+            const bool have_evidence_text = !a.source.empty() || !transcript_canon.empty();
+            if (have_evidence_text && !in_task && !in_src && !in_tr) {
                 if (dropped) dropped->push_back(u8"截止日期无依据，已清空：「" + a.due +
                                                 u8"」← " + utf8_prefix(a.task, 30));
                 a.due.clear();
@@ -927,7 +954,7 @@ DeliverableWriter::Result DeliverableWriter::write(long long session_id,
     // ActionItem 归本类所有，所以这个不变量就该由本类自己保证。
     // sanitize_actions 幂等（第二遍没有可改的），重复调用无副作用。
     MeetingSummary safe = summary;
-    sanitize_actions(safe.actions, nullptr);
+    sanitize_actions(safe.actions, nullptr, &segs);
     const MeetingSummary& sum = safe;
 
     const fs::path dir = fs::path(out_root) / ("session-" + std::to_string(session_id));

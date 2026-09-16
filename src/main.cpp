@@ -317,7 +317,10 @@ static DeliverableOutcome generate_deliverables(const AppConfig& cfg, long long 
     // 校验一次就能全覆盖。校验规则见 DeliverableWriter::sanitize_actions。
     {
         std::vector<std::string> notes;
-        const int n_drop = DeliverableWriter::sanitize_actions(summary.actions, &notes);
+        // 传整场转录进去：云端摘要走中文任务文本 + 英文转录时，
+        // ActionItem.source 回填不上（LCS 跨语言匹配不了），
+        // 只有拿整场转录当依据才能正确判断"这个日期是不是编的"。
+        const int n_drop = DeliverableWriter::sanitize_actions(summary.actions, &notes, &segs);
         if (!notes.empty()) {
             // 措辞注意：n_drop 只数"被丢弃的条目"，而 notes 里还包含
             // "截止日期无依据已清空"这类**保留但被修正**的条目，两者数量不等。
@@ -809,20 +812,37 @@ static int run_selftest(const AppConfig& cfg) {
         if (!act_ok) return 1;
 
         // 单独验"截止日期必须有依据"这一段。
-        // 三个用例全部来自真实运行，不是编的。
+        //
+        // ⚠️ 用例必须反映**真实数据形状**。上一版的用例是我手工配好 source 的，
+        // 而云端路径的 ActionItem.source 实际是**空的**（中文任务文本 vs 英文转录，
+        // link_actions_to_segments 的 LCS 匹配不上），于是真实运行仍然清空正确日期，
+        // 自检却全绿 —— 这就是"测试数据和真实路径分叉"，和 §8.8② 是同一类错误。
         {
-            struct DueCase { const char* task; const char* due; const char* source; bool keep_due; };
+            struct DueCase {
+                const char* name;
+                const char* task;
+                const char* due;
+                const char* source;          // 云端路径这里会是空串
+                bool        has_transcript;  // 是否传整场转录
+                bool        keep_due;
+            };
             const DueCase due_cases[] = {
-                // ① 实测**误杀**：云端大模型把 "next Friday" 翻成「下周五」，
-                //    只比字面必然对不上。归一化之后必须保留。
-                {u8"准备更新后的路线图", u8"下周五",
-                 "Alice will prepare the updated roadmap by next Friday.", true},
-                // ② 具体数字日期不判定：跨语言（10 月 vs October、31 日 vs 31st）没法比
-                {u8"我们需要把交付推迟到 10 月 31 日。", u8"10 月 31 日",
-                 "We need to push the delivery to October 31st.", true},
-                // ③ 真的没依据：原文只说 next Friday，没提下周三
-                {u8"请在下周五前提交报价。", u8"下周三",
-                 "Please submit the quotation by next Friday.", false},
+                // ① 【真实形状】云端路径：task 中文、source 空、日期在转录里
+                //    → 必须保留（修的就是这条）
+                {"云端形状/日期在转录里", u8"准备更新后的路线图", u8"下周五",
+                 "", true, true},
+                // ② 【真实形状】source 空、转录里也没有这个日期 → 真无依据，清空
+                {"云端形状/转录里也没有", u8"准备更新后的路线图", u8"下周三",
+                 "", true, false},
+                // ③ 规则路径形状：source 有，日期在里面 → 保留
+                {"规则形状/日期在 source", u8"准备更新后的路线图", u8"下周五",
+                 "Alice will prepare the updated roadmap by next Friday.", false, true},
+                // ④ 无 source、无转录 = **无法判断**，不能默认判负
+                {"无依据可查时不判负", u8"准备更新后的路线图", u8"下周五",
+                 "", false, true},
+                // ⑤ 具体数字日期不判定
+                {"数字日期不判定", u8"我们需要把交付推迟到 10 月 31 日。", u8"10 月 31 日",
+                 "We need to push the delivery to October 31st.", false, true},
             };
 
             bool due_ok = true;
@@ -834,19 +854,30 @@ static int run_selftest(const AppConfig& cfg) {
                 a.due    = c.due;
                 a.source = c.source;
                 v.push_back(a);
-                DeliverableWriter::sanitize_actions(v);
+
+                // 造一场转录，里面含 "by next Friday"
+                std::vector<Segment> tr;
+                if (c.has_transcript) {
+                    Segment s1;
+                    s1.src_text = "Alice will prepare the updated roadmap by next Friday.";
+                    s1.tgt_text = u8"Alice 将在下周五前准备更新后的路线图。";
+                    tr.push_back(s1);
+                    Segment s2;
+                    s2.src_text = "Thanks everyone, let's wrap up.";
+                    s2.tgt_text = u8"谢谢大家，今天就到这里。";
+                    tr.push_back(s2);
+                }
+
+                DeliverableWriter::sanitize_actions(v, nullptr, c.has_transcript ? &tr : nullptr);
 
                 const bool kept_due = (v.size() == 1) && !v[0].due.empty();
                 if (kept_due == c.keep_due) { ++due_pass; continue; }
                 due_ok = false;
-                std::cerr << "[SelfTest] 截止日期依据判定失败\n"
-                          << "    任务: " << c.task << "\n"
-                          << "    截止: " << c.due << "\n"
-                          << "    来源: " << c.source << "\n"
-                          << "    期望: " << (c.keep_due ? "保留截止" : "清空截止") << "\n"
-                          << "    实际: " << (kept_due ? "保留截止" : "清空截止") << std::endl;
+                std::cerr << "[SelfTest] 截止日期依据判定失败: " << c.name
+                          << "（期望 " << (c.keep_due ? "保留" : "清空") << "，实际 "
+                          << (kept_due ? "保留" : "清空") << "）" << std::endl;
             }
-            std::cout << "[SelfTest] 截止日期依据（含跨语言）: " << (due_ok ? "✅ " : "❌ ")
+            std::cout << "[SelfTest] 截止日期依据（真实数据形状）: " << (due_ok ? "✅ " : "❌ ")
                       << due_pass << "/" << (sizeof(due_cases) / sizeof(due_cases[0]))
                       << " 通过" << std::endl;
             if (!due_ok) return 1;
