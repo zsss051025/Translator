@@ -56,7 +56,13 @@ private:
     // **必须只有一处**：它原来在 translate_once 和 debug_dump_prompt 里各写了一份，
     // 于是加"术语约束"时两处就得同步——而 debug_dump_prompt 是给人看 prompt 用的，
     // 不同步就会看到与实际运行不一致的 prompt，把排查带偏。
-    std::string translate_system_prompt() const;
+    // 构造翻译用的 system prompt。
+    //
+    // 【为什么必须把待译文本传进来】术语约束要**按段过滤**：只带上这段里真出现过的术语。
+    // 不过滤的话，模型会在没提到该词的片段里凭空把它补出来
+    // （实测 `and wife get ready to go` → 「埃丽卡和马可准备出发了」）。
+    // 所以这个函数不可能"不带文本"地构造出来 —— 签名上就堵住了。
+    std::string translate_system_prompt(const std::string& text) const;
     // 兜底清洗：剥掉可能被回显的 prompt 片段与首尾引号
     static std::string sanitize_output(std::string s);
 

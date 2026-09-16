@@ -58,6 +58,32 @@ public:
     // 没有术语时返回空串，调用方直接拼在后面即可。
     static std::string glossary_constraint(const std::vector<std::string>& terms);
 
+    // **只保留这段原文里真的出现过的术语**（纯函数，便于自检）。
+    //
+    // 【为什么必须有这一步 —— 实测事故】
+    // 约束原来对**每一段**都生效，包括那些根本没提到该术语的片段。
+    // 对照实验（同一段原文，只改知识库）：
+    //
+    //   原文 `and wife get ready to go`（真值里没有任何专名）
+    //     无约束 → 「妻子也准备出发了」                    ✅ 忠实
+    //     有约束 → 「埃丽卡和马可准备出发了」              ❌ 凭空编了两个名字
+    //   原文 `Marco, I'm doing really well. How about you?`
+    //     无约束 → 「Marco，我过得很好。你呢？」            ✅
+    //     有约束 → 「Erica, I'm doing really well. …」      ❌ 整句没翻译，名字还被换掉
+    //
+    // 【原因】约束的话是"这几个词必须原样出现"。弱翻译模型（HY-MT 1.8B）
+    // 看到这句话、又发现本段里没有那些词，就会**给它补上**；
+    // 或者干脆退化成"照抄原文 + 换个名字"。
+    //
+    // 【判断】只在该术语真的出现在本段时才约束它。这既保住了约束的用途
+    // （那段里确实有 Erica，就该让它别音译），又不会让它去无中生有。
+    //
+    // 匹配是**大小写不敏感的子串匹配**，故意放宽：
+    // 把本段里其实有的术语漏掉，会丢掉整条修复；而多带上一个无关术语，
+    // 只要它在段里出现过就不算"无中生有"。
+    static std::vector<std::string> glossary_for_text(const std::vector<std::string>& terms,
+                                                      const std::string& text);
+
 protected:
     // 由 set_glossary() 写入，在 start() 之前设置完成，因此不需要加锁
     std::vector<std::string> glossary_;

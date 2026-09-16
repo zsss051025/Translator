@@ -46,19 +46,24 @@ std::string HunyuanTranslator::get_last_source() const {
     return last_source_;
 }
 
-std::string HunyuanTranslator::translate_system_prompt() const {
+std::string HunyuanTranslator::translate_system_prompt(const std::string& text) const {
     // 系统提示负责固定"只输出译文"。
     // 不要写成"将以下文本翻译为中文："这种祈使句——
     // 模型会把待译文本当成同一段话的续写，于是指令被原样吐出来。
+    //
+    // 【术语约束必须按段过滤】只带上**这段原文里真的出现**的术语。
+    // 不过滤的话，模型会在没提到该词的片段里凭空把它补出来 ——
+    // 实测 `and wife get ready to go` 被译成「埃丽卡和马可准备出发了」，
+    // 原文里一个名字都没有。详见 ITranslator::glossary_for_text 的说明。
     return "You are a professional translator. Translate the user's message into " + target_name() +
            ". Output only the translation itself, with no explanation, no prefix, "
            "no quotation marks, and no repetition of these instructions." +
-           ITranslator::glossary_constraint(glossary_);
+           ITranslator::glossary_constraint(ITranslator::glossary_for_text(glossary_, text));
 }
 
 void HunyuanTranslator::debug_dump_prompt(const std::string& text) const {
     // 用翻译任务的 system prompt 来展示，与实际运行路径一致
-    const std::string sys = translate_system_prompt();
+    const std::string sys = translate_system_prompt(text);
     const std::string prompt = build_prompt(sys, text);
 
     // 把全角竖线 + SentencePiece 空格符换成肉眼可读的形式
@@ -296,7 +301,7 @@ long long HunyuanTranslator::get_last_api_ms() {
 
 
 bool HunyuanTranslator::translate_once(const std::string& text, std::string& out) {
-    const std::string sys = translate_system_prompt();
+    const std::string sys = translate_system_prompt(text);
     std::string raw;
     if (!generate_once(sys, text, raw, /*max_new=*/128)) return false;
     out = sanitize_output(std::move(raw));   // 剥掉可能被回显的 prompt 片段

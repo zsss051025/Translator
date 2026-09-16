@@ -112,11 +112,15 @@ void DeepSeekTranslator::network_worker() {
 
 		// 构建请求体
 		// system prompt 由目标语言决定，不再硬编码"翻译成中文"
+		//
+		// 术语约束按段过滤：只带这段里真出现过的术语，否则云端模型也会
+		// 在没提到该词的片段里把它补出来（本地混元实测已复现，见 ITranslator::glossary_for_text）
 		const std::string sys_prompt =
 			"You are a professional translator. Translate the user's message into " +
 			target_name() +
 			". Output only the translation itself, with no explanation and no quotation marks." +
-			ITranslator::glossary_constraint(glossary_);
+			ITranslator::glossary_constraint(
+				ITranslator::glossary_for_text(glossary_, text_to_translate));
 
 		json payload = {
 			{"model", "deepseek-chat"},

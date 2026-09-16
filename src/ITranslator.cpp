@@ -12,10 +12,35 @@ constexpr size_t kMaxGlossaryTerms = 40;
 // 塞进提示词只会干扰模型。
 constexpr size_t kMaxTermLen = 40;
 
+// 只折 ASCII 大小写，CJK 原样（术语里中文没有大小写）
+std::string lower_ascii(const std::string& s) {
+    std::string out = s;
+    for (char& c : out) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u < 0x80 && u >= 'A' && u <= 'Z') c = static_cast<char>(u - 'A' + 'a');
+    }
+    return out;
+}
+
 }  // namespace
 
 void ITranslator::set_glossary(const std::vector<std::string>& terms) {
     glossary_ = terms;
+}
+
+std::vector<std::string> ITranslator::glossary_for_text(const std::vector<std::string>& terms,
+                                                        const std::string& text) {
+    std::vector<std::string> out;
+    if (terms.empty() || text.empty()) return out;
+
+    const std::string hay = lower_ascii(text);
+    for (const auto& t : terms) {
+        if (t.empty()) continue;
+        if (lower_ascii(t).empty()) continue;
+        // 子串匹配，大小写不敏感。故意放宽 —— 见头文件里的说明。
+        if (hay.find(lower_ascii(t)) != std::string::npos) out.push_back(t);
+    }
+    return out;
 }
 
 std::string ITranslator::glossary_constraint(const std::vector<std::string>& terms) {

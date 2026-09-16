@@ -492,14 +492,14 @@ static void confirm_gaps_at_session_end(const AppConfig& cfg, long long session_
     // 传 session_id：NewlySeen 规则靠它判断"这条是不是本场新听到的"。
     const auto questions = detect_gaps_from_store(kMaxQuestionsDefault, session_id);
     if (questions.empty()) {
-        // §1.3：没有问题就一个字都不说，用户不需要为此看一行输出。
-        //
-        // 例外：**显式 --ask 时要说一句**。因为"一个都没问出来"有两种完全不同的原因 ——
-        // ① 确实没有问题（正常）② 根本没走到这一步（bug）。
-        // 静默会让这两种长得一模一样。这个项目已经栽过两次"诊断工具撒谎"。
-        if (cfg.ask_mode == AppConfig::AskMode::Always) {
-            std::cout << "[确认] 库里没有需要确认的知识（问了，但没有候选）" << std::endl;
-        }
+        // 【为什么这里要说话，而不是按 §1.3 保持静默】
+        // 真跑会话 #44 实测：结束日志里**一行 [确认] 都没有**，因为抽出的 3 个名字
+        // 全都已在上一场确认过 → 没有可问的 → 静默返回。
+        // 这行为**是对的**，但它和"抽取器坏了 / 库读不到"长得一模一样，
+        // 排查时只能靠读代码。§1.3 说的是"别问没意义的问题"，
+        // 不是"别告诉用户发生了什么" —— 打一行状态不算打扰。
+        std::cout << "[确认] 没有需要确认的知识（本场抽出的条目都已在库里确认过）"
+                  << std::endl;
         return;
     }
 
@@ -1379,6 +1379,46 @@ static int run_selftest(const AppConfig& cfg) {
                       << "    含垃圾='" << cj << "'\n"
                       << "    超量长度=" << cm.size() << std::endl;
             return 1;
+        }
+
+        // 术语约束必须**按段过滤**（只带这段里真出现过的术语）。
+        //
+        // 【为什么这条是硬需求，不是优化】实测对照实验（同一段原文，只改知识库）：
+        //   `and wife get ready to go`  真值里没有任何专名
+        //     无约束 → 「妻子也准备出发了」        ✅
+        //     有约束 → 「埃丽卡和马可准备出发了」  ❌ 凭空编了两个名字
+        //   `Marco, I'm doing really well. How about you?`
+        //     无约束 → 「Marco，我过得很好。你呢？」 ✅
+        //     有约束 → 「Erica, I'm doing really well. …」 ❌ 整句没翻译
+        // 弱翻译模型看到"这几个词必须原样出现"、又发现本段没有，就会给它补上。
+        {
+            const std::vector<std::string> gterms = {"Erica", "Marco", "EnglishPod", "TV"};
+            struct Fc { const char* text; size_t want; };
+            const Fc fc[] = {
+                {"How are you, Erica? Marco, I'm doing really well.", 2},  // Erica + Marco
+                {"and wife get ready to go",                          0},  // 一个都不该带
+                {"welcome to EnglishPod",                             1},
+                {"watch it on tv",                                    1},  // 大小写不敏感
+                {"erica and marco",                                   2},  // 全小写也要命中
+                {"",                                                  0},
+            };
+            bool fc_ok = true;
+            std::string why4;
+            int fc_pass = 0;
+            for (const auto& c : fc) {
+                const auto got = ITranslator::glossary_for_text(gterms, c.text);
+                if (got.size() == c.want) { ++fc_pass; continue; }
+                fc_ok = false;
+                why4 = std::string("按段过滤不对: '") + c.text + "' 期望 " +
+                       std::to_string(c.want) + " 个，实际 " + std::to_string(got.size());
+            }
+            std::cout << "[SelfTest] 术语约束按段过滤（防凭空编造专名）: "
+                      << (fc_ok ? "✅ " : "❌ ") << fc_pass << "/"
+                      << (sizeof(fc) / sizeof(fc[0])) << " 通过" << std::endl;
+            if (!fc_ok) {
+                std::cerr << "    " << why4 << std::endl;
+                return 1;
+            }
         }
     }
 
