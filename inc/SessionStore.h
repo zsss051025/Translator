@@ -66,6 +66,15 @@ public:
     // 读取一场会话的所有段落，按 seq 升序
     std::vector<Segment> fetch_segments(long long session_id) const;
 
+    // 长期记忆的表与全文索引是否就绪（PROJECT.md §7 步骤 2.1 的验收接口）。
+    //
+    // 检查三件事：
+    //   ① sqlite3 编译时真的带了 FTS5（SQLITE_ENABLE_FTS5 宏生效）
+    //   ② knowledge / knowledge_history / actions 三张表可查询
+    //   ③ FTS5 虚表 knowledge_fts 可查询 —— 宏没定义时建表那一步就会失败，
+    //      所以这一条是"FTS5 真的能用"的实证，比只看编译选项可靠
+    bool long_term_memory_ready() const;
+
     // 列出最近的会话（供跨会话检索/历史界面使用）
     std::vector<SessionInfo> list_sessions(int limit = 20) const;
 

@@ -99,3 +99,11 @@ if(MSVC)
     target_compile_options(Translator PRIVATE /utf-8)
 	add_compile_options(/Zc:char8_t-)
 endif()
+
+# 全文检索（--ask 要用）。
+#
+# sqlite3.c 里本来就带 FTS5 源码（44 处符号，被 #ifdef SQLITE_ENABLE_FTS5 保护着），
+# 只是宏没定义，所以一直是关的 —— 直接用 FTS5 语法会报 "no such module: fts5"。
+target_compile_definitions(Translator PRIVATE
+	SQLITE_ENABLE_FTS5
+	SQLITE_ENABLE_COLUMN_METADATA)

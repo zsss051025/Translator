@@ -47,7 +47,77 @@ const char* kSchema =
     "  ms         INTEGER NOT NULL,"
     "  confidence REAL    NOT NULL DEFAULT -1.0"
     ");"
-    "CREATE INDEX IF NOT EXISTS idx_segments_session ON segments(session_id, seq);";
+    "CREATE INDEX IF NOT EXISTS idx_segments_session ON segments(session_id, seq);"
+
+    // ============================================================
+    // 长期记忆（跨会话知识库）—— 见 PROJECT.md §6.8
+    //
+    // 全部用 IF NOT EXISTS，所以对**已存在的旧库**就是一次自动迁移：
+    // 老库打开后会把这三张表补上，不需要单独的版本号/迁移脚本。
+    // ============================================================
+
+    // 知识条目（当前值）。
+    // kind/key 唯一：同一个键只保留一个当前值，历史值进 knowledge_history。
+    "CREATE TABLE IF NOT EXISTS knowledge ("
+    "  id             INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  kind           TEXT NOT NULL,"              // term | fact | decision | person | project
+    "  key            TEXT NOT NULL,"              // 归一化键：'erika' / 'asr_engine'
+    "  value          TEXT NOT NULL,"              // 当前值：'Erika' / 'Qwen ASR'
+    "  status         TEXT NOT NULL,"              // confirmed | candidate | archived
+    "  confidence     REAL NOT NULL DEFAULT 0.0,"
+    "  hits           INTEGER NOT NULL DEFAULT 0," // 被听到过多少次（决定"该问什么"的排序）
+    "  first_seen_at  TEXT NOT NULL,"
+    "  updated_at     TEXT NOT NULL,"
+    // 证据：哪次会话、哪一段、原话。不可省——每条知识都要能回答"你凭什么这么说"
+    "  source_session INTEGER,"
+    "  source_seq     INTEGER,"
+    "  source_text    TEXT"
+    ");"
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_kind_key ON knowledge(kind, key);"
+    "CREATE INDEX IF NOT EXISTS idx_knowledge_status ON knowledge(status);"
+
+    // 变化历史（Event / Decision 的落地）。**只追加不修改** —— 历史不删。
+    "CREATE TABLE IF NOT EXISTS knowledge_history ("
+    "  id             INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  knowledge_id   INTEGER NOT NULL,"
+    "  old_value      TEXT,"
+    "  new_value      TEXT NOT NULL,"
+    "  changed_at     TEXT NOT NULL,"
+    "  source_session INTEGER,"
+    "  source_seq     INTEGER,"
+    "  source_text    TEXT,"
+    "  reason         TEXT NOT NULL"               // user_confirmed | model_extracted | user_edited
+    ");"
+    "CREATE INDEX IF NOT EXISTS idx_khistory_kid ON knowledge_history(knowledge_id);"
+
+    // 行动项（跨会话追踪）
+    "CREATE TABLE IF NOT EXISTS actions ("
+    "  id             INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  title          TEXT NOT NULL,"
+    "  owner          TEXT NOT NULL DEFAULT '',"
+    "  due            TEXT NOT NULL DEFAULT '',"
+    "  status         TEXT NOT NULL DEFAULT 'todo',"   // todo | doing | done
+    "  source_session INTEGER,"
+    "  source_seq     INTEGER,"
+    "  confidence     REAL NOT NULL DEFAULT -1.0,"
+    "  created_at     TEXT NOT NULL,"
+    "  updated_at     TEXT NOT NULL"
+    ");"
+    "CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status);"
+
+    // FTS5 全文索引（--ask 用）。
+    //
+    // 【为什么必须有这一条】它同时验证了 SQLITE_ENABLE_FTS5 宏真的生效了 ——
+    // 宏没定义时这句会直接报 "no such module: fts5"，schema 执行失败、整个程序起不来，
+    // 而不是等用到 --ask 时才发现。
+    //
+    // 用 content='' 的外部内容表（contentless）不合适，因为知识条目会被改写；
+    // 这里就用普通 FTS5 表，写入时由 KnowledgeStore 同步。
+    "CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5("
+    "  key, value, source_text,"
+    "  content='knowledge', content_rowid='id',"
+    "  tokenize='unicode61'"                       // unicode61 对中英混排都能用
+    ");";
 
 }  // namespace
 
@@ -195,11 +265,34 @@ bool SessionStore::log_segment(const std::string& src_text,
     return ok;
 }
 
+bool SessionStore::long_term_memory_ready() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!db_) return false;
+
+    // ① 编译期真的带了 FTS5
+    if (!sqlite3_compileoption_used("ENABLE_FTS5")) return false;
+
+    // ② 三张长期记忆表可查询；③ FTS5 虚表可查询
+    static const char* kProbes[] = {
+        "SELECT count(*) FROM knowledge;",
+        "SELECT count(*) FROM knowledge_history;",
+        "SELECT count(*) FROM actions;",
+        "SELECT count(*) FROM knowledge_fts;",
+    };
+    for (const char* sql : kProbes) {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
+        const int rc = sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        if (rc != SQLITE_ROW && rc != SQLITE_DONE) return false;
+    }
+    return true;
+}
+
 std::vector<Segment> SessionStore::fetch_segments(long long session_id) const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<Segment> out;
     if (!db_) return out;
-
     const char* sql =
         "SELECT id, session_id, seq, ts, src_text, tgt_text, engine, ms, confidence "
         "FROM segments WHERE session_id = ? ORDER BY seq ASC;";

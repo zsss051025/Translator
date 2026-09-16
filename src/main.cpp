@@ -1111,6 +1111,18 @@ static int run_selftest(const AppConfig& cfg) {
 
     store.end_session();
 
+    // ---- 9) 长期记忆：三张表 + FTS5（§7 步骤 2.1 的验收）----
+    {
+        const bool mem_ok = SessionStore::instance().long_term_memory_ready();
+        std::cout << "[SelfTest] 长期记忆表 + FTS5: " << (mem_ok ? "✅ 通过" : "❌ 失败")
+                  << "（knowledge / knowledge_history / actions / knowledge_fts）" << std::endl;
+        if (!mem_ok) {
+            std::cerr << "    提示：FTS5 需要 CMakeLists.txt 里的 SQLITE_ENABLE_FTS5；"
+                         "若刚改过该行，务必重新 configure（只 build 不会生效）" << std::endl;
+            return 1;
+        }
+    }
+
     std::cout << "[SelfTest] 最近会话：" << std::endl;
     for (const auto& s : store.list_sessions(5)) {
         std::cout << "   #" << s.id << "  " << s.started_at << " ~ "
