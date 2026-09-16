@@ -123,12 +123,16 @@ public:
     // 写入或更新一条知识，返回它的 id（失败返回 -1）。
     //
     // 语义：
-    //   · 库里没有 (kind, key) → 新建，hits = 1
-    //   · 已有且 value 相同     → 只累加 hits（**不写历史**：值没变，不是一次"变化"）
+    //   · 库里没有 (kind, key) → 新建，hits = max(1, item.hits)
+    //   · 已有且 value 相同     → hits += max(1, item.hits)（**不写历史**：值没变，不是一次"变化"）
     //   · 已有且 value 不同     → 更新 value，把旧值写进 knowledge_history，
     //                             并且**把 status 降回 candidate** ——
     //                             值变了就意味着原来那条 confirmed 不再成立，
     //                             必须让用户重新确认一次（§6.5）
+    //
+    // `item.hits` **会被采信**（不是固定 +1）：抽取器知道"这个名字这场听到了几次"。
+    // 第一版把它写死成 1，导致问题里"已经听到 N 次"是错数字，
+    // 而且 `hits >= 3` 那条规则在一场会话内永远不可能为真。
     //
     // `reason_override`：历史里记的原因。空 = 按上下文自动判定
     //   （值变了 → `value_changed_demoted`，否则 → `model_extracted`）。

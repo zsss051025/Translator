@@ -98,6 +98,15 @@ AppConfig AppConfig::from(int argc, char** argv) {
         else if (arg == "--test-window")   cfg.test_window = true;
         else if (arg == "--wav")           next(cfg.wav_path);
         else if (arg == "--gaps")          cfg.show_gaps = true;
+        else if (arg == "--extract") {
+            // 数值参数：不合法就保持 -1（不静默当成 0 —— 0 号会话不存在，
+            // 会变成"跑完了什么都没抽到"，看起来像抽取器坏了）
+            std::string num_buf;
+            next(num_buf);
+            try { cfg.extract_session = std::stoll(num_buf); }
+            catch (...) { cfg.extract_session = -1; }
+        }
+        else if (arg == "--apply")         cfg.extract_apply = true;
         else if (arg == "--ask")           cfg.ask_mode = AppConfig::AskMode::Always;
         else if (arg == "--no-ask")        cfg.ask_mode = AppConfig::AskMode::Never;
         else if (arg == "--translator")    next(cfg.translator);

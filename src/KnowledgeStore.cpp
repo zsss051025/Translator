@@ -389,13 +389,23 @@ long long KnowledgeStore::upsert(const KnowledgeItem& item, std::string* err,
         sqlite3_finalize(st);
     }
 
+    // 会话内的出现次数由调用方给（抽取器知道"这个名字这场听到了几次"）。
+    //
+    // 【为什么不能像第一版那样写死 1】写死会让两个东西失准：
+    //   ① 问题里"已经听到 N 次「Erica」"变成错数字 —— 用户看到的证据是假的
+    //   ② `hits >= kHighFreqHits(3)` 那条规则**永远不可能为真**：
+    //      一场会话内听到 5 次的名字只记 1 次，要跑 3 场才够 ——
+    //      而 NewlySeen 问过一次、值没变的话，它再也不会被问了
+    // 所以取 max(1, item.hits)：调用方没给（0）时仍然是 1，老行为不变。
+    const int initial_hits = item.hits > 0 ? item.hits : 1;
+
     if (!exists) {
         sqlite3_stmt* st = nullptr;
         const char* sql =
             "INSERT INTO knowledge"
             "(kind,key,value,status,confidence,hits,first_seen_at,updated_at,"
             " source_session,source_seq,source_text) "
-            "VALUES (?,?,?,?,?,1,?,?,?,?,?);";
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?);";
         if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) {
             set_err(std::string("插入失败: ") + sqlite3_errmsg(db));
             return -1;
@@ -405,11 +415,12 @@ long long KnowledgeStore::upsert(const KnowledgeItem& item, std::string* err,
         sqlite3_bind_text  (st, 3, item.value.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text  (st, 4, status.c_str(),     -1, SQLITE_TRANSIENT);
         sqlite3_bind_double(st, 5, item.confidence);
-        sqlite3_bind_text  (st, 6, ts.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int   (st, 6, initial_hits);
         sqlite3_bind_text  (st, 7, ts.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64 (st, 8, item.source_session);
-        sqlite3_bind_int64 (st, 9, item.source_seq);
-        sqlite3_bind_text  (st, 10, item.source_text.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text  (st, 8, ts.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64 (st, 9, item.source_session);
+        sqlite3_bind_int64 (st, 10, item.source_seq);
+        sqlite3_bind_text  (st, 11, item.source_text.c_str(), -1, SQLITE_TRANSIENT);
 
         const int rc = sqlite3_step(st);
         sqlite3_finalize(st);
@@ -424,14 +435,16 @@ long long KnowledgeStore::upsert(const KnowledgeItem& item, std::string* err,
     }
 
     // 已存在：值相同只累加 hits，**不写历史** —— 值没变，不是一次"变化"。
+    // 累加的是**本次听到的次数**（不是固定 +1）：抽取器说这场听到 3 次就该加 3。
     if (old.value == item.value) {
         sqlite3_stmt* st = nullptr;
-        if (sqlite3_prepare_v2(db, "UPDATE knowledge SET hits = hits + 1, "
+        if (sqlite3_prepare_v2(db, "UPDATE knowledge SET hits = hits + ?, "
                                    "updated_at = ?, confidence = ? WHERE id = ?;",
                                -1, &st, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text  (st, 1, ts.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_double(st, 2, item.confidence);
-            sqlite3_bind_int64 (st, 3, old.id);
+            sqlite3_bind_int   (st, 1, initial_hits);
+            sqlite3_bind_text  (st, 2, ts.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_double(st, 3, item.confidence);
+            sqlite3_bind_int64 (st, 4, old.id);
             sqlite3_step(st);
             sqlite3_finalize(st);
         }

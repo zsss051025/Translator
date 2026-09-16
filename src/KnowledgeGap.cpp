@@ -10,6 +10,7 @@ const char* to_string(GapRule r) {
     case GapRule::ValueChanged:          return "value_changed";
     case GapRule::InconsistentRendering: return "inconsistent_rendering";
     case GapRule::HighFreqUnconfirmed:   return "high_freq_unconfirmed";
+    case GapRule::NewlySeen:             return "newly_seen";
     case GapRule::LowConfidenceName:     return "low_confidence_name";
     }
     return "unknown";
@@ -20,12 +21,16 @@ int priority_of(GapRule r) {
     //   值冲突最危险 —— 库里可能已经是错的，而且它会进约束影响后续翻译
     //   译法不一致次之 —— 直接影响用户读到的译文质量
     //   高频未确认再次 —— 提了很多次却一直没定性，问一次收益最大
+    //   本场新见再次 —— 自动抽取的出口，用户第一次用就是靠它把名字确定下来
+    //                     （优先级低于上面三条：那三条是"已有知识出了问题"，
+    //                      这条只是"还没有知识"，不问不会让现状变坏）
     //   低置信度最后 —— 大概率只是听错了，价值最低
     switch (r) {
     case GapRule::ValueChanged:          return 1;
     case GapRule::InconsistentRendering: return 2;
     case GapRule::HighFreqUnconfirmed:   return 3;
-    case GapRule::LowConfidenceName:     return 4;
+    case GapRule::NewlySeen:             return 4;
+    case GapRule::LowConfidenceName:     return 5;
     }
     return 99;
 }
@@ -71,7 +76,7 @@ std::string fmt_conf(double c) {
 }  // namespace
 
 std::vector<GapQuestion> detect_gaps(const std::vector<KnowledgeWithHistory>& entries,
-                                     size_t max_questions) {
+                                     size_t max_questions, long long current_session) {
     std::vector<GapQuestion> out;
 
     for (const auto& e : entries) {
@@ -118,6 +123,22 @@ std::vector<GapQuestion> detect_gaps(const std::vector<KnowledgeWithHistory>& en
             q.question = u8"已经听到 " + std::to_string(k.hits) + u8" 次「" + k.value +
                          u8"」，一直没确认过。它是对的说法吗？";
             hit = true;
+        } else if (current_session > 0 && k.status == "candidate" &&
+                   k.source_session == current_session && is_name_like_kind(k.kind)) {
+            // 本场第一次见到的专名 → 问一次。
+            //
+            // 【为什么必须有这条规则】自动抽取（2.6）把专名落成候选之后，
+            // 现有三条规则**一条都不会触发**：hits 只有 1~2（不到 kHighFreqHits）、
+            // 置信度 0.7~0.9（不低）、没有历史（没变化）。
+            // 于是抽出来的东西永远没人问，闭环在"抽取 → 询问"之间还是断的。
+            //
+            // 这条直接对应需求原话：「执行完后如果有陌生的知识就向用户提问然后更新知识库」。
+            //
+            // 只问专名形状的 kind（term/person/project）—— fact/decision 是句子，
+            // 让用户去确认一整句话的措辞没有意义。
+            q.rule     = GapRule::NewlySeen;
+            q.question = u8"第一次听到「" + k.value + u8"」。这个词的写法对吗？";
+            hit = true;
         } else if (k.status == "candidate" &&
                    k.confidence >= 0.0 && k.confidence < kLowConfidenceBelow) {
             q.rule     = GapRule::LowConfidenceName;
@@ -149,7 +170,7 @@ std::vector<GapQuestion> detect_gaps(const std::vector<KnowledgeWithHistory>& en
     return out;
 }
 
-std::vector<GapQuestion> detect_gaps_from_store(size_t max_questions) {
+std::vector<GapQuestion> detect_gaps_from_store(size_t max_questions, long long current_session) {
     std::vector<KnowledgeWithHistory> entries;
 
     // 取数口径：**全部条目**，不只 candidate。
@@ -163,7 +184,7 @@ std::vector<GapQuestion> detect_gaps_from_store(size_t max_questions) {
         e.history = ks.history(item.id);
         entries.push_back(std::move(e));
     }
-    return detect_gaps(entries, max_questions);
+    return detect_gaps(entries, max_questions, current_session);
 }
 
 }  // namespace knowledge

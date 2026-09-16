@@ -7,7 +7,7 @@
 >
 > **给"上下文被清空后的自己"看。** 读的顺序：先读这份，再按需回 `PROJECT.md` 查细节。
 >
-> 最后更新：2026-09-16（2.5 三腿复用 ✅，下一个动作 = 2.5b 交付物 UTF-8 净化）
+> 最后更新：2026-09-16（2.6 自动抽取 ✅ 闭环闭上，下一个动作 = 2.5b 交付物 UTF-8 净化）
 
 ---
 
@@ -38,30 +38,27 @@
 | | **2.3 缺口检测四条规则** | ✅ 完成 |
 | | **2.4 结束时确认交互** | ✅ 完成 |
 | | **2.5 三腿复用接知识库** | ✅ 完成 |
+| | **2.6 自动抽取 + `newly_seen` 规则** | ✅ 完成 |
 | | **2.5b 交付物 UTF-8 净化** | ← **下一个动作**（2.5 验证时发现的真缺陷，见 §四） |
-| | 2.6 `--ask` 检索 | 未开始 |
-| | 2.7 Action 跨会话追踪 | 未开始 |
+| | 2.7 `--ask` 检索 | 未开始 |
+| | 2.8 Action 跨会话追踪 | 未开始 |
 | **第 3 阶段** 遗留质量项 | 3.1 分句碎片化 / 3.2 场景判定 / 3.3 Evidence / 3.4 静音收尾裁尾 | 未开始 |
 | **第 4 阶段** 桌面产品化 | 4.1 默认路径 / 4.2 key 存储 / 4.3 GUI 壳 | 未开始 |
 
 ### 下一个动作（具体到文件）
 
-**2.5b 交付物 UTF-8 净化**（2.5 验证时发现的，**与 2.5 无关，单独一笔**）
+**2.5b 交付物 UTF-8 净化**（2.5 验证时发现的，**与业务无关，单独一笔**）
 
 - 【现象】用 `--summarizer local`（混元）生成的 `meeting-42.md` **整体不是合法 UTF-8**。
   字节级证据：`### 询问你\xe7` —— `\xe7` 是一个没写完的三字节首字节；
   要点下一行还有孤立的续字节 `\x84`。任何编辑器/浏览器打开都是乱码。
 - 【原因】混元是翻译模型，被逼着做结构化输出时会吐出**半个字符的 token**；
   而 `DeliverableWriter` **不做任何校验就写盘了**。
-- 【修法】加一个纯函数 `utf8_sanitize()`：
-  - 非法字节序列替换成 U+FFFD（或用 `?`），保证输出文件**永远是合法 UTF-8**
-  - 位置放在 `DeliverableWriter::write()` 的**写出边界**上（一次覆盖 md/html/csv/srt 四条）
-  - 另外在 `LlmSummarizer::parse_reply` 里也过一遍，免得垃圾进到后续逻辑
-  - 同时按"绝不静默给错数据"的规矩：净化发生时 `std::cerr` 报一行，别悄悄改
-- 【为什么单独一笔】它不由 2.5 引入，也不属于 2.5 的验收范围；
-  混提交违反"一次改动一次提交"
+- 【修法】加纯函数 `utf8_sanitize()`，放在 `DeliverableWriter::write()` 的**写出边界**上
+  （一次覆盖 md/html/csv/srt 四条）；`LlmSummarizer::parse_reply` 里也过一遍。
+  净化发生时 `std::cerr` 报一行 —— 按"绝不静默给错数据"的规矩，别悄悄改。
 
-之后才是 **2.6 `--ask` 检索**（`KnowledgeStore::search()` 已经就绪，只差暴露成命令行）。
+之后是 **2.7 `--ask` 检索**（`KnowledgeStore::search()` 已就绪且被自检钉住，只差暴露成命令行）。
 
 ### 其它状态
 
@@ -70,8 +67,8 @@
 | 分支 | `main`（本地主线）；远程备份在 `assistant-baseline` |
 | 远程 `main` | `da97d96` —— **有意不动**，详见 `PROJECT.md` §3.6 末「历史决策：不合并 da97d96」 |
 | tag | `translator-final` → `7717ace`（翻译版本封存） |
-| 自检 | **22 组**，秒级，不需要模型 |
-| 闭环八步完成度 | 八步**等权平均 78%**（听见 90 / 理解 90 / 提取 78 / 记忆 55 / 发现变化 55 / **询问 85** / **更新 85** / **再次利用 75**）<br>2.5 把"再次利用"从 30 拉到 75：知识现在真的会进识别提示、翻译约束、摘要背景，并已用真实失败句 A/B 证明译文被纠正 |
+| 自检 | **26 组**，秒级，不需要模型 |
+| 闭环八步完成度 | 八步**等权平均 88%**（听见 90 / 理解 90 / 提取 78 / **记忆 90** / **发现变化 85** / **询问 90** / **更新 90** / **再次利用 90**）<br>2.6 补上了"自动抽取"这个**原本不存在的环节**，闭环第一次真正闭上 |
 
 **"越用越懂你"的可验证里程碑**（第二句承诺）：
 
@@ -80,16 +77,35 @@
 | 知识能落库、能区分 confirmed/candidate | ✅ 2.2 |
 | 能发现"该问什么" | ✅ 2.3 |
 | 用户答了能改进知识库 | ✅ 2.4 |
-| **答过的东西真的改变识别/翻译/摘要行为** | ✅ **2.5**（翻译腿已用真实失败句 A/B 证明；识别腿只验到"prompt 真的送进引擎"，摘要腿只验到"背景真的进 user 内容"——见下方 ⚠️） |
+| 答过的东西真的改变识别/翻译/摘要行为 | ✅ 2.5（翻译腿已用真实失败句 A/B 证明） |
 | 会答的问题不重复问 | ✅ 2.4（`asked_count` + `kMaxAsks`） |
+| **能从会话里自己长出候选知识** | ✅ **2.6** ← 缺了这一步，上面五条全部拿不到输入 |
+| **整条闭环在真实音频上跑通**（不靠手工插数据） | ✅ **2.6**：真实会话 #43 → 自动抽出 4 个 → 用户确认 → 译文被纠正 |
 
-⚠️ **2.5 三条腿各自的验证级别不一样，别混为一谈**：
+### 2.6 的端到端证据（真数据，不是编的）
+
+```
+[Extract] 会话 #43 共 16 段，开始抽取
+[Extract] 抽出 4 个候选： Marco(person,2) Erica(term,2) EnglishPod(term,1) TV(term,1)
+[Extract] 已写入 4 条候选（全部 status=candidate，未被用作任何约束）
+[确认] 这场会话里有 4 条知识想跟你核对：
+  1. 第一次听到「Marco」。这个词的写法对吗？      已确认：Marco
+  2. 第一次听到「Erica」。这个词的写法对吗？      已确认：Erica
+  ...
+[确认] 记下 4 条，跳过 0 条
+
+然后同一句真实失败句：
+  会话 #43 当时的译文:  埃里卡，你怎么样？马可，我过得很好。
+  现在:                Erica，你怎么样？Marco，我过得很好。
+```
+
+⚠️ **三条腿各自的验证级别仍然不一样**（别混为一谈）：
 
 | 腿 | 验到了什么 | 没验到什么 |
 |---|---|---|
-| ① 识别提示 | prompt 字符串确实被构造并送进 `SpeechEngine`（日志 `[识别提示]`），且 candidate 不在里面 | **whisper 的识别结果是否真的因此变准** —— 需要"含会被识别错的专名的音频"，手上没有 |
-| ② 翻译约束 | **行为级 A/B 通过**（`tools/ab_translation_constraint.py`）：真实失败句被纠正 | 云端翻译路径（我的环境没有 API key） |
-| ③ 摘要背景 | 背景确实拼进送给模型的 user 内容（自检 + 日志 `[摘要] 已注入`） | **模型是否真的因此不与之矛盾** —— 本机没有 instruct 模型，混元做不了摘要 |
+| ① 识别提示 | prompt 字符串确实被构造并送进 `SpeechEngine`（日志 `[识别提示]`），candidate 不在里面 | **whisper 的识别结果是否真的因此变准** —— 需要"含会被识别错的专名的音频" |
+| ② 翻译约束 | **行为级 A/B 通过**（`tools/ab_translation_constraint.py`） | 云端翻译路径（本机没有 API key） |
+| ③ 摘要背景 | 背景确实拼进送给模型的 user 内容（自检 + 日志 `[摘要] 已注入`） | **模型是否真的不与之矛盾** —— 本机没有 instruct 模型 |
 
 ---
 
@@ -190,20 +206,20 @@
 
 | 时间 | 事 | 关键点 |
 |---|---|---|
-| 09-16 | 2.5 **差点用一个不现实的探针得出错误结论** | 我先把术语值设成模型绝不可能产出的 `马可波罗`，看到模型没照做，就下了"约束进了 prompt 但模型不服从"的结论。**换成真实失败句立刻翻过来了**：基线逐字复现历史失败，confirmed 组把 `埃里卡/马可` 纠正成 `Erica/Marco`。**探针的输入不现实，结论就不成立** |
-| 09-16 | 2.5 **真实失败案例在另一个库里** | 我一直引用"会话 #11 的 Erica/埃里卡"，但在 `t.db` 里全库搜不到 —— 它其实在 `build\RelWithDebInfo\translations.db`（旧库，11 场 206 段）。仓库里有 **8 个 .db 文件**，`--db` 又是相对路径。**引用"真实案例"必须写清是哪个库**，否则下一个人（和下一个我）会以为记录是编的 |
-| 09-16 | 2.5 三条腿的来源统一了 | 原来①识别提示②翻译约束吃 `--glossary` 文件、③摘要背景什么都没有 → 用户确认的知识一个字都影响不到输出。现在三处都经 `KnowledgeStore::constraint_items()` 取，**红线只有一处**。`--glossary` 保留为"手工预喂"的补充入口 |
-| 09-16 | 2.5 name-like kind 必须和 fact/decision 分开 | `term`/`person`/`project` 的值是短名字，能进 initial_prompt；`fact`/`decision` 的值是**句子**，塞进去会诱发 whisper 提示回显（`looks_like_prompt_echo` 就是为这个写的），只适合当摘要背景 |
-| 09-16 | 2.5 `--dump-prompt` 第二次差点撒谎 | 它原来只读 `--glossary` 文件。2.5 把来源改成知识库之后，这条路会显示"干干净净"的 prompt —— 而真实运行里全有。**已改成复用同一个取数函数**，两边不可能再走散 |
-| 09-16 | 2.5 **交付物会被写成非法 UTF-8** | 混元做摘要时吐半个字符的 token（`\xe7` 未写完），`DeliverableWriter` 不校验就写盘 → 整个 .md 不是合法 UTF-8。**下一笔（2.5b）修** |
-| 09-16 | 2.4 **是/否词表不能省** | 把 `n` 当成"用户输入的新值"会把字面量 `no` 写进库当专名，而且是 confirmed（会进翻译约束） |
-| 09-16 | 2.4 **首尾不可见字符要按集合去** | 实跑抓到：PowerShell 管道第一行带 UTF-8 BOM，`"\uFEFFy"` 掉进"其余当新值"→ **把 `y` 存成了专名**。自检 13 个用例全绿，真跑才露出来 |
-| 09-16 | 2.4 **"提问稀缺"要有个地方记"问过了"** | 加 `asked_count` + `kMaxAsks = 2`，**跳过也计数**。实测生命周期：第 1 场问 3 个全答完 → 第 2 场 1 个（最后一次机会）→ 第 3 场 0 个 |
-| 09-16 | 2.4 **confirmed 的不能因历史而复活** | 规则①只看 `value_changed_demoted` 不看状态 → 用户刚答完的那条下一场又是第 1 问。加 `status != confirmed` |
-| 09-16 | 2.3 **外部内容 FTS5 表必须用触发器维护** | 手动 `INSERT INTO knowledge_fts` 等于白写（外部内容表的 `count(*)` 读内容表，看着有行、MATCH 查不到）；`DELETE FROM knowledge_fts` 直接报 `database disk image is malformed` |
-| 09-16 | 2.3 弱断言 = 假绿灯 | 旧自检只验"四张表在不在"，于是索引空的 bug 藏了两轮。改成"写进去→必须查回来→删掉→必须查不到"后**立刻抓出两个真 bug** |
+| 09-16 | 2.6 **闭环缺了一整个环节，是用户真跑才暴露的** | 2.1~2.5 全建立在"库里已经有知识"上，而**没有任何代码把会话写进去**。真跑一场 16 段、DeepSeek 摘要成功的会话之后 `knowledge` 表仍是 0 行 → 一声不问、三条腿拿不到东西。**`PROJECT.md §6.4① 自动抽取` 写了设计，但 §7 执行步骤表里没有对应的一步 —— 没进步骤表就等于不存在** |
+| 09-16 | 2.6 **句首大写不是专名证据** | 英文句首必然大写，那是语法。不排除的话每句话的第一个词都会被抽成专名。实测 jfk.wav 会话抽出 0 个 —— `Ask`/`What`/`And` 一个都没误抽 |
+| 09-16 | 2.6 **"是不是专名"和"听到几次"必须分开算** | 第一版混在一起：句首那次被漏掉、同一处的两条路径又各算一次 → `Erica` 显示"已经听到 3 次"而实际 2 次。**给用户看的数字错了，比不显示更糟** |
+| 09-16 | 2.6 **`I'm X` 这个句式不能用来抽人名** | 英文里 "I'm doing / I'm really excited" 远比 "I'm Marco" 常见。真数据上一次抽出 `doing`、`really` 两个人名。已从模式表删掉，只留专门用来介绍的句式 |
+| 09-16 | 2.6 **只修数据流一环 ≠ 修好** | 真数据发现"抽取器说 2 次、库里 1 次"。改了 `upsert` 采信 `item.hits`，**重跑还是 1** —— 真相是 `save_candidates` 压根没传 `c.hits`，值从来没到过 `upsert`。**修完必须用暴露问题的那条路径重跑** |
+| 09-16 | 2.6 **顺序错了会静默变成"空结果"** | `--extract --apply` 里先 `store.close()` 再调确认交互 → 读到空库 → 交互一行输出都没有，看起来完全像"没有问题要问"。已改为：库要开着；显式 `--ask` 时零问题也打一行 |
+| 09-16 | 2.5 **差点用一个不现实的探针得出错误结论** | 把术语值设成模型不可能产出的 `马可波罗`，看到没照做就下结论"约束没权威"。换成真实失败句立刻翻过来 |
+| 09-16 | 2.5 **真实失败案例在另一个库里** | "会话 #11 的 Erica/埃里卡"不在 `t.db`，在 `build\RelWithDebInfo\translations.db`。仓库里有 **8 个 .db 文件**而 `--db` 是相对路径 → 引用真实案例必须写清库名 |
+| 09-16 | 2.4 **是/否词表不能省 + 首尾不可见字符要按集合去** | 把 `n` 当新值会把字面量 `no` 写进库当专名；PowerShell 管道的 UTF-8 BOM 让 `"\uFEFFy"` 掉进"其余当新值"→ **把 `y` 存成了专名**。自检全绿、真跑才露出来 |
+| 09-16 | 2.4 **"提问稀缺"要有个地方记"问过了"** | `asked_count` + `kMaxAsks = 2`，**跳过也计数**。实测：第 1 场问 3 个 → 第 2 场 1 个（最后一次机会）→ 第 3 场 0 个 |
+| 09-16 | 2.3 **外部内容 FTS5 表必须用触发器维护** | 手动 `INSERT INTO knowledge_fts` 等于白写；`DELETE FROM knowledge_fts` 直接报 `database disk image is malformed` |
+| 09-16 | 2.3 弱断言 = 假绿灯 | 旧自检只验"四张表在不在"，索引空的 bug 藏了两轮。改成"写进去→必须查回来→删掉→必须查不到"后**立刻抓出两个真 bug** |
 | 09-16 | 2.2 **值变了必须把 confirmed 降回 candidate** | 原来那条确认是针对旧值的，值一变它就不成立（§6.5 要防的正是这个） |
-| 09-16 | 2.1 迁移的边界 | `CREATE TABLE IF NOT EXISTS` 只补表、**永远不补列** —— 加列必须另走 `ALTER TABLE`（2.4 踩到） |
+| 09-16 | 2.1 迁移的边界 | `CREATE TABLE IF NOT EXISTS` 只补表、**永远不补列** —— 加列必须另走 `ALTER TABLE` |
 
 ---
 
@@ -244,7 +260,7 @@ cd C:\dev\projects\AudioTranslator
 # 1. 构建
 cmd /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"" >nul 2>&1 && set VCPKG_ROOT=C:\dev\vcpkg && cmake --build build --config RelWithDebInfo --target Translator"
 
-# 2. L1 自检：必须 22 组全过
+# 2. L1 自检：必须 26 组全过
 .\build\RelWithDebInfo\Translator.exe --selftest --db t.db
 
 # 2b. 知识库数据层（第 2 阶段每步都要跑）——独立实现验证，且不改动原库
@@ -264,6 +280,19 @@ python tools\verify_memory.py build\RelWithDebInfo\t.db --seed-demo
 .\build\RelWithDebInfo\Translator.exe --gaps --db build\RelWithDebInfo\t.db
 #    期望：只剩 1 个（Phoenix，最后一次机会）—— confirmed 的不再问
 python tools\verify_memory.py build\RelWithDebInfo\t.db --clear
+
+# 2e. 自动抽取 + 整条闭环（2.6 起）—— **拿真实会话补学，不用重录音频**
+#     先用只读模式看抽取器认出了什么（不会改库）
+.\build\RelWithDebInfo\Translator.exe --extract 43 --db build\RelWithDebInfo\t.db
+#     期望：EnglishPod 播客那种素材应抽出 Marco / Erica / EnglishPod；
+#           jfk.wav 那种"每句首词大写但没专名"的应抽出 **0 个**
+#     再真的走一遍闭环（抽取 → 落候选 → 问 → 确认）
+"y`ny`ny`ny" | .\build\RelWithDebInfo\Translator.exe --extract 43 --apply --ask --db build\RelWithDebInfo\t.db
+#     期望：[Extract] 已写入 4 条候选（全部 status=candidate）
+#           [确认] 第一次听到「Marco」… → 已确认
+#     然后拿原来那句失败译文验约束生效：
+.\build\RelWithDebInfo\Translator.exe --dump-prompt "How are you, Erica? Marco, I'm doing really well." --db build\RelWithDebInfo\t.db
+#     期望：输出 Erica，你怎么样？Marco，我过得很好。（原来会被音译成 埃里卡/马可）
 
 # 3. 端到端（可选，约 20 秒，零交互）
 .\build\RelWithDebInfo\Translator.exe --wav C:\dev\projects\whisper.cpp\samples\jfk.wav --summarizer rules --db v.db --out v_out

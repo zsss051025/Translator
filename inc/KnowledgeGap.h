@@ -22,11 +22,12 @@
 
 namespace knowledge {
 
-// 四条规则
+// 五条规则
 enum class GapRule {
     ValueChanged,            // 旧值 ≠ 新值：与已有 Confirmed 值冲突（§6.6 第四条）
     InconsistentRendering,   // 译法不一致：同一个键的值变过多次（§6.6 第一条）
     HighFreqUnconfirmed,     // 高频未确认：hits >= 3 却还是 candidate（§6.6 第二条）
+    NewlySeen,               // 本场第一次见到的专名（§6.4① 自动抽取的出口）
     LowConfidenceName,       // 低置信度专名：confidence < 0.5（§6.6 第三条）
 };
 
@@ -72,13 +73,20 @@ constexpr int    kMaxAsks             = 2;
 // **核心纯函数**：输入知识+历史，输出候选问题。
 // 不碰数据库、不碰模型、不依赖时间 —— 所以能进 L1 自检。
 //
+// `current_session`：本场会话 id，用于 `NewlySeen` 规则（判断"这条是不是本场新听到的"）。
+// **必须 > 0 该规则才生效** —— 默认 -1 时它一律不触发，
+// 因为 KnowledgeItem::source_session 的默认值也是 -1，不挡住的话
+// "两者都是 -1 所以相等"会让所有测试数据都变成"本场新见"。
+//
 // 同一个键最多出一条问题（取优先级最高的那条规则），
 // 结果按优先级排序后截断到 max_questions。
 std::vector<GapQuestion> detect_gaps(const std::vector<KnowledgeWithHistory>& entries,
-                                     size_t max_questions = kMaxQuestionsDefault);
+                                     size_t max_questions = kMaxQuestionsDefault,
+                                     long long current_session = -1);
 
 // 薄封装：从库里取候选条目（candidate + 最近变化的），套用上面的规则。
 // 真正的判定逻辑全在 detect_gaps 里，这里只负责取数。
-std::vector<GapQuestion> detect_gaps_from_store(size_t max_questions = kMaxQuestionsDefault);
+std::vector<GapQuestion> detect_gaps_from_store(size_t max_questions = kMaxQuestionsDefault,
+                                                long long current_session = -1);
 
 }  // namespace knowledge

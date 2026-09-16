@@ -17,6 +17,7 @@
 #include "KnowledgeStore.h"
 #include "KnowledgeGap.h"
 #include "ConfirmGaps.h"
+#include "KnowledgeExtract.h"
 #include "DeliverableWriter.h"
 #include "LlmSummarizer.h"
 #include "SubtitleWindow.h"
@@ -453,11 +454,13 @@ static bool stdin_is_tty() {
 
 // 会话结束时的确认交互（§7 步骤 2.4）。**必须在交付物写完之后调用。**
 //
-// had_content：本场有没有记录到内容。空会话没什么可核对的，直接跳过。
-static void confirm_gaps_at_session_end(const AppConfig& cfg, bool had_content) {
+// session_id：本场会话 id。它有两个用途：
+//   ① <=0 表示这场没有内容，没什么可核对的，直接跳过
+//   ② 传给 detect_gaps_from_store()，让 `NewlySeen` 规则能判断"这条是不是本场新听到的"
+static void confirm_gaps_at_session_end(const AppConfig& cfg, long long session_id) {
     using namespace knowledge;
 
-    if (!had_content) return;
+    if (session_id < 0) return;
 
     // 决定这次到底问不问，并把**原因**打出来。
     // 不打原因的话，"为什么这次没问"会变成一个只能靠读代码回答的问题。
@@ -486,14 +489,20 @@ static void confirm_gaps_at_session_end(const AppConfig& cfg, bool had_content) 
         return;
     }
 
-    const auto questions = detect_gaps_from_store(kMaxQuestionsDefault);
+    // 传 session_id：NewlySeen 规则靠它判断"这条是不是本场新听到的"。
+    const auto questions = detect_gaps_from_store(kMaxQuestionsDefault, session_id);
     if (questions.empty()) {
-        // §1.3：没有问题就一个字都不说。这里刻意静默 ——
-        // "这次没有问题"本身也是噪音，用户不需要为此看一行输出。
+        // §1.3：没有问题就一个字都不说，用户不需要为此看一行输出。
+        //
+        // 例外：**显式 --ask 时要说一句**。因为"一个都没问出来"有两种完全不同的原因 ——
+        // ① 确实没有问题（正常）② 根本没走到这一步（bug）。
+        // 静默会让这两种长得一模一样。这个项目已经栽过两次"诊断工具撒谎"。
+        if (cfg.ask_mode == AppConfig::AskMode::Always) {
+            std::cout << "[确认] 库里没有需要确认的知识（问了，但没有候选）" << std::endl;
+        }
         return;
     }
 
-    auto& store = SessionStore::instance();
     const auto stats = run_confirmation(
         questions,
         // 读一行。返回 false = 输入结束。
@@ -512,7 +521,56 @@ static void confirm_gaps_at_session_end(const AppConfig& cfg, bool had_content) 
         std::cerr << "[确认] 有 " << stats.failed
                   << " 条没能写进知识库 —— 上面的 [失败] 行里有原因" << std::endl;
     }
-    (void)store;
+}
+
+// 会话结束时的知识处理：**先抽取，再问用户**（§6.4① + §6.7）。
+//
+// 【顺序不能反】抽取把本场听到的专名落成候选，确认交互才有东西可问。
+// 反过来的话，第一场永远问不出任何问题 —— 这正是 2.6 之前的状态：
+// knowledge 表跑完一场真实会话仍然是 0 行，一声都不问，三条腿也拿不到东西。
+//
+// 【必须在 write() 之后】交付物先落盘，用户在这里 Ctrl+C 或走开都不丢产出。
+static void learn_from_session(const AppConfig& cfg, long long session_id, bool had_content) {
+    using namespace knowledge;
+
+    if (!had_content || session_id < 0) return;
+    if (cfg.ask_mode == AppConfig::AskMode::Never) {
+        // --no-ask 的意思是"别打扰我"。但它不该顺带关掉抽取 ——
+        // 抽取是静默的、不打扰任何人的，而且关掉它等于知识库永远不增长。
+        // 所以这里只记一笔、继续抽取。
+    }
+
+    // ---- 1) 自动抽取：全部落成 candidate（§6.4①）----
+    {
+        const auto segs = SessionStore::instance().fetch_segments(session_id);
+        const auto cands = extract_candidates(segs, session_id);
+        if (!cands.empty()) {
+            std::string err;
+            const int n = save_candidates(cands, &err);
+            std::cout << "[知识] 本场抽出 " << n << " 个候选专名（未确认，不会被用作约束）"
+                      << std::endl;
+            // 只打印前几个，别刷屏
+            constexpr size_t kShow = 6;
+            for (size_t i = 0; i < cands.size() && i < kShow; ++i) {
+                std::cout << "        " << cands[i].value
+                          << "（" << cands[i].kind << "，出现 " << cands[i].hits
+                          << " 次，依据：" << cands[i].why << "）" << std::endl;
+            }
+            if (cands.size() > kShow) {
+                std::cout << "        ...（共 " << cands.size() << " 个）" << std::endl;
+            }
+            if (!err.empty()) std::cerr << "[知识] 部分条目写入失败：" << err << std::endl;
+        } else {
+            // 【为什么"0 个"也要打一行】不打的话，"抽取有没有跑"这件事
+            // 在日志里完全看不出来 —— 而"诊断工具撒谎"这个项目已经栽过两次。
+            // 一行字换一个可观测点，很值。
+            std::cout << "[知识] 本场未抽到候选专名（没听到首字母大写的名字或缩写）"
+                      << std::endl;
+        }
+    }
+
+    // ---- 2) 确认交互 ----
+    confirm_gaps_at_session_end(cfg, session_id);
 }
 
 // 把第二路音频混入主片段：逐样本相加并限幅。
@@ -526,6 +584,69 @@ static void mix_audio(std::vector<float>& dst, const std::vector<float>& src) {
         const float v = dst[i] + src[i];
         dst[i] = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
     }
+}
+
+// --extract <会话id> [--apply]：对**已经存下来的**一场会话跑一遍自动抽取。
+//
+// 默认**只读**，只打印抽出什么。加 `--apply` 才真的写库，并接着跑确认交互。
+//
+// 【为什么要这个命令】
+//   ① 抽取器的自检用的是手搓段落，而本项目栽过两次"测试数据与真实数据形状不一致"
+//      （§8.8⑨）。有了它就能拿**真实会议转录**验证抽取器认出了什么、认错了什么，
+//      不用重新录一遍音频。
+//   ② `--apply` 是一个正当功能：从历史会话补学知识。
+//      （2.6 之前的会话从没抽过；或者用户就是想拿几场旧会议喂一遍知识库。）
+//
+// 默认只读是刻意的：它同时是排查工具，反复跑不该改变库的状态
+// （写库会让 hits 累加、把缺口检测的排序搅乱）。
+static int run_extract(const AppConfig& cfg) {
+    auto& store = SessionStore::instance();
+    if (!store.init(cfg.db_path)) {
+        std::cerr << "[Extract] 打不开数据库: " << cfg.db_path << std::endl;
+        return 1;
+    }
+
+    const long long sid = cfg.extract_session;
+    const auto segs = store.fetch_segments(sid);
+    if (segs.empty()) {
+        std::cerr << "[Extract] 会话 #" << sid << " 没有段落（或不存在）" << std::endl;
+        return 1;
+    }
+
+    std::cout << "[Extract] 会话 #" << sid << " 共 " << segs.size() << " 段，开始抽取"
+              << std::endl;
+    const auto cands = knowledge::extract_candidates(segs, sid);
+    std::cout << "[Extract] 抽出 " << cands.size() << " 个候选：" << std::endl;
+    for (const auto& c : cands) {
+        std::cout << "    [" << c.kind << "] " << c.value
+                  << "  hits=" << c.hits
+                  << "  conf=" << c.confidence
+                  << "  seq=" << c.source_seq
+                  << "  依据: " << c.why << std::endl;
+        std::cout << "        证据: " << c.source_text << std::endl;
+    }
+
+    if (!cfg.extract_apply) {
+        std::cout << "[Extract] （只读，未写库；要写入并确认请加 --apply）" << std::endl;
+        store.close();
+        return 0;
+    }
+
+    std::string err;
+    const int n = knowledge::save_candidates(cands, &err);
+    std::cout << "[Extract] 已写入 " << n << " 条候选（全部 status=candidate，"
+                 "未被用作任何约束）" << std::endl;
+    if (!err.empty()) std::cerr << "[Extract] 部分写入失败：" << err << std::endl;
+
+    // 接着问用户 —— 和生产路径的顺序一致：先抽取落候选，再问。
+    //
+    // ⚠️ **不能在这之前 close()**：确认交互要从库里读候选（detect_gaps_from_store），
+    // 库关了它只会返回空列表，然后**一声不吭**地结束 —— 看起来像"没有问题要问"。
+    // 这个坑我踩了一次：先 close 再 ask，输出里连一行 [确认] 都没有，
+    // 排查半天才发现是库已关。
+    confirm_gaps_at_session_end(cfg, sid);
+    store.close();
+    return 0;
 }
 
 // --export <id>：命令行方式生成交付物
@@ -1549,6 +1670,228 @@ static int run_selftest(const AppConfig& cfg) {
                     return 1;
                 }
             }
+
+            // ---- 2.6 抽取器：从转录里认出专名候选 ----
+            //
+            // 【这一组的用例全部来自真实数据，不是我编的】
+            // 两个会话的转录都是真跑出来的：
+            //   #43  EnglishPod 播客 → 真专名 Marco / Erica / EnglishPod / TV
+            //   #42  jfk.wav        → **一个专名都没有**，但每句首词都大写（Ask/What/…）
+            // 第二句是这一组最要紧的用例：句首大写是**语法**不是**专名**证据，
+            // 认不出来就等于每句话都抽出一个假专名。
+            {
+                using namespace knowledge;
+                bool ex_ok = true;
+                std::string why3;
+
+                auto mkseg = [](int seq, const char* src, double conf = 0.85) {
+                    Segment s;
+                    s.seq        = seq;
+                    s.src_text   = src;
+                    s.confidence = conf;
+                    return s;
+                };
+                auto has = [](const std::vector<ExtractedCandidate>& v, const char* key) {
+                    for (const auto& c : v) if (c.key == key) return true;
+                    return false;
+                };
+                auto get = [](const std::vector<ExtractedCandidate>& v, const char* key)
+                             -> const ExtractedCandidate* {
+                    for (const auto& c : v) if (c.key == key) return &c;
+                    return nullptr;
+                };
+
+                // ① 句首大写不算证据（jfk 的形状：每句首词都大写，但没有专名）
+                {
+                    std::vector<Segment> segs = {
+                        mkseg(1, "Ask not what your country can do for you"),
+                        mkseg(2, "What your country can do for you"),
+                        mkseg(3, "And so my fellow Americans"),
+                    };
+                    const auto c = extract_candidates(segs, 1);
+                    if (has(c, "ask"))      { ex_ok = false; why3 = "句首词 Ask 被当成了专名"; }
+                    else if (has(c, "what")){ ex_ok = false; why3 = "句首词 What 被当成了专名"; }
+                    else if (has(c, "and")) { ex_ok = false; why3 = "句首词 And 被当成了专名"; }
+                }
+
+                // ② 非句首的大写词要认出来，而且要认成 person（人名句式）
+                {
+                    std::vector<Segment> segs = {
+                        mkseg(1, "EnglishPod. My name is Marco. And I'm Erica."),
+                        mkseg(2, "How are you, Erica? Marco, I'm doing really well."),
+                    };
+                    const auto c = extract_candidates(segs, 1);
+                    const auto* marco = get(c, "marco");
+                    const auto* erica = get(c, "erica");
+                    if (!marco || !erica) {
+                        ex_ok = false; why3 = "真专名 Marco / Erica 没被抽出来";
+                    } else {
+                        if (marco->kind != "person") { ex_ok = false; why3 = "Marco 应是 person（人称句式）"; }
+                        // 【次数必须准】第一版把"证据"和"计数"混在一起 ——
+                        // 既漏掉句首那次，又把同一处两条路径各算一次，
+                        // 于是界面显示"已经听到 3 次"而实际只有 2 次。
+                        else if (marco->hits != 2) { ex_ok = false; why3 = "Marco 出现次数应为 2"; }
+                        else if (erica->hits != 2) { ex_ok = false; why3 = "Erica 出现次数应为 2"; }
+                    }
+                    // CamelCase 在句首也要认（EnglishPod 正好在句首）
+                    if (ex_ok && !has(c, "englishpod")) {
+                        ex_ok = false; why3 = "句首的 CamelCase 词 EnglishPod 漏了";
+                    }
+                    // 缩写 TV
+                    if (ex_ok) {
+                        std::vector<Segment> t = {mkseg(1, "you hear in movies and TV shows")};
+                        if (!has(extract_candidates(t, 1), "tv")) {
+                            ex_ok = false; why3 = "缩写 TV 没被认出来";
+                        }
+                    }
+                }
+
+                // ③ 收缩式绝不能被当专名（实测 `I'm` 报过 hits=4）
+                {
+                    std::vector<Segment> segs = {
+                        mkseg(1, "And I'm Erica."),
+                        mkseg(2, "That's right. It's really good."),
+                        mkseg(3, "Don't worry, We're fine."),
+                    };
+                    const auto c = extract_candidates(segs, 1);
+                    for (const char* bad : {"i'm", "that's", "it's", "don't", "we're"}) {
+                        if (has(c, bad)) { ex_ok = false; why3 = std::string("收缩式被当成专名: ") + bad; }
+                    }
+                    // 但 O'Brien 这种"词中间有大写"的必须留下。
+                    //
+                    // 键是 `o brien`（**带空格**）：normalize_key 把撇号当**分隔符**处理
+                    // （和逗号一个待遇），所以 O'Brien → "o brien"。
+                    // 两版断言都写错了（先写 "o'brien"，再写 "obrien"），是我没先看
+                    // normalize_key 的行为就写断言 —— 这也是**用例写错不是代码错**。
+                    // 记一笔限制：`O'Brien` / `OBrien` / `O Brien` 会归成三个不同的键，
+                    // 已有的 8 条归一化用例没覆盖这种情况，本轮不动它（属遗留）。
+                    std::vector<Segment> ob = {mkseg(1, "I met O'Brien yesterday.")};
+                    if (ex_ok && !has(extract_candidates(ob, 1), "o brien")) {
+                        ex_ok = false; why3 = "O'Brien 被撇号规则误杀（R2 应该放行）";
+                    }
+                }
+
+                // ④ 人称句式里的假阳性：I'm doing / I'm really 不是人名
+                {
+                    std::vector<Segment> segs = {
+                        mkseg(1, "I'm doing really well."),
+                        mkseg(2, "I'm really excited because"),
+                    };
+                    const auto c = extract_candidates(segs, 1);
+                    if (has(c, "doing") || has(c, "really")) {
+                        ex_ok = false; why3 = "「I'm X」里的动词/副词被当成了人名（实测发生过）";
+                    }
+                }
+
+                // ⑤ 引号里的词：最强的信号，大小写不管
+                {
+                    std::vector<Segment> segs = {mkseg(1, "we call it \xe3\x80\x8c" "EchoMind" "\xe3\x80\x8d internally")};
+                    const auto c = extract_candidates(segs, 1);
+                    if (!has(c, "echomind")) { ex_ok = false; why3 = "引号里的词没被抽出来"; }
+                }
+
+                // ⑥ 中文人名（只能靠人称句式 —— 中文没有大小写）
+                {
+                    std::vector<Segment> segs = {mkseg(1, "\xe6\x88\x91\xe5\x8f\xab" "\xe5\xbc\xa0\xe4\xb8\x89" "\xef\xbc\x8c\xe4\xbd\xa0\xe5\xa5\xbd")};
+                    const auto c = extract_candidates(segs, 1);
+                    bool found_cn = false;
+                    for (const auto& x : c) if (x.kind == "person") found_cn = true;
+                    if (!found_cn) { ex_ok = false; why3 = "「我叫张三」里的中文人名没被抽出来"; }
+                }
+
+                // ⑦ 抽出来的东西**必须**是 candidate，绝不能是 confirmed（§6.5 红线）
+                {
+                    std::vector<Segment> segs = {mkseg(1, "My name is Marco.")};
+                    const auto c = extract_candidates(segs, 1);
+                    if (c.empty()) { ex_ok = false; why3 = "用例数据没抽出东西，后面的写入断言没意义"; }
+                    else {
+                        const std::string PRE2 = "__selftest_extract_";
+                        auto& ks2 = KnowledgeStore::instance();
+                        ks2.purge_key_prefix(PRE2);
+                        std::vector<ExtractedCandidate> shifted = c;
+                        for (auto& x : shifted) x.key = PRE2 + x.key;
+                        const int n = save_candidates(shifted);
+                        if (n <= 0) { ex_ok = false; why3 = "候选写入失败"; }
+                        else {
+                            KnowledgeItem got;
+                            if (ks2.get("person", PRE2 + "marco", &got)) {
+                                if (got.status != "candidate") {
+                                    ex_ok = false;
+                                    why3 = "自动抽取写进去的必须是 candidate，实际 " + got.status;
+                                }
+                                // 【次数必须一路传到库里】抽取器算出的 hits 不能在
+                                // save_candidates 那一步丢掉 —— 真数据上抓到过：
+                                // 抽取器说 2 次、库里查到 1 次（save_candidates 没传 item.hits）。
+                                else if (got.hits != 1) {
+                                    // 这个用例只有一段、Marco 只出现 1 次
+                                    ex_ok = false;
+                                    why3 = "hits 没传到库里（应 1，实际 "
+                                           + std::to_string(got.hits) + "）";
+                                }
+                                else if (!knowledge::usable_as_constraint(got)) {
+                                    // 这条应当成立：candidate 不能当约束
+                                } else {
+                                    ex_ok = false;
+                                    why3 = "candidate 竟然通过了 usable_as_constraint（红线破了）";
+                                }
+                            } else {
+                                ex_ok = false; why3 = "抽取的候选没写进库";
+                            }
+                        }
+                        ks2.purge_key_prefix(PRE2);
+                    }
+                }
+
+                std::cout << "[SelfTest] 自动抽取（句首不算/收缩式排除/次数准确/一律候选）: "
+                          << (ex_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+                if (!ex_ok) {
+                    std::cerr << "    " << why3 << std::endl;
+                    return 1;
+                }
+
+                // ⑧ **调用方给的 hits 必须被采信**（不是固定算 1）
+                //
+                // 【这条是被真数据抓出来的】抽取器算出「Erica 这场出现 2 次」，
+                // 但 upsert 的 INSERT 把 hits 硬编码成 1 —— 于是：
+                //   ① 问用户时显示"已经听到 1 次"，是假证据
+                //   ② `hits >= 3` 那条规则在一场会话内永远不可能为真
+                // 真实会话 #43 上跑出来才发现（`--extract 43` 说 2 次，`--gaps` 说 1 次）。
+                {
+                    const std::string PK = "__selftest_hits_";
+                    auto& ks3 = KnowledgeStore::instance();
+                    ks3.purge_key_prefix(PK);
+
+                    KnowledgeItem h;
+                    h.kind       = "term";
+                    h.key        = PK + "phoenix";
+                    h.value      = "Phoenix";
+                    h.status     = "candidate";
+                    h.confidence = 0.8;
+                    h.hits       = 5;          // 抽取器说：这场听到 5 次
+                    std::string e;
+                    if (ks3.upsert(h, &e) <= 0) {
+                        std::cerr << "[SelfTest] hits 用例写入失败: " << e << std::endl;
+                        return 1;
+                    }
+                    KnowledgeItem got3;
+                    if (!ks3.get("term", PK + "phoenix", &got3) || got3.hits != 5) {
+                        std::cerr << "[SelfTest] upsert 丢了调用方给的 hits（应为 5，实际 "
+                                  << got3.hits << "）—— 这会让「已经听到 N 次」显示假数字"
+                                  << std::endl;
+                        return 1;
+                    }
+                    // 值相同时累加的也应当是"本次听到的次数"，不是固定 1
+                    ks3.upsert(h, &e);
+                    if (!ks3.get("term", PK + "phoenix", &got3) || got3.hits != 10) {
+                        std::cerr << "[SelfTest] 值相同时 hits 应累加 5（10），实际 "
+                                  << got3.hits << std::endl;
+                        return 1;
+                    }
+                    ks3.purge_key_prefix(PK);
+                    std::cout << "[SelfTest] hits 采信（调用方给的次数不被丢掉）: ✅ 通过"
+                              << std::endl;
+                }
+            }
         }
     }
 
@@ -2076,6 +2419,7 @@ int main(int argc, char** argv) {
     if (cfg.demo_session) return run_demo_session(cfg);
     if (cfg.test_window)  return run_test_window(cfg);
     if (cfg.show_gaps)    return run_show_gaps(cfg);
+    if (cfg.extract_session >= 0) return run_extract(cfg);
     if (!cfg.dump_prompt.empty()) return run_dump_prompt(cfg);
     if (cfg.export_session >= 0) return run_export(cfg);
 
@@ -2648,16 +2992,16 @@ int main(int argc, char** argv) {
                 std::cout << "[纪要] 本次没有记录到内容，跳过生成" << std::endl;
             }
 
-            // ---- 2.4 确认交互：问用户几个知识问题，把回答落进知识库（§6.7）----
+            // ---- 2.6 自动抽取 + 2.4 确认交互（顺序固定：先抽后问）----
             //
-            // 【为什么必须放在 write() 之后】这是 §6.7 的硬约束，不是风格偏好：
+            // 【为什么放在 write() 之后】这是 §6.7 的硬约束，不是风格偏好：
             // 交付物已经落盘，用户在这里 Ctrl+C、或者干脆走开，
             // 会议纪要一个字都不会少。反过来就是"问了半天结果没生成纪要"——
             // 那是最不可原谅的失败方式，因为这个产品的核心承诺就是"结束就给总结"。
             //
-            // 第二句承诺（用得越久越懂你）从这一步开始才真正有输入：
-            // 在此之前知识库只有模型自己猜的东西，全是 candidate，进不了约束。
-            confirm_gaps_at_session_end(cfg, st.count > 0);
+            // 第二句承诺（用得越久越懂你）就是在这个函数里闭环的：
+            // 抽取（落候选）→ 询问（用户确认）→ 下一场三条腿才有东西可用。
+            learn_from_session(cfg, session_id, st.count > 0);
         }
 
         // 一次运行 = 一场会话：**结束就退出**。
