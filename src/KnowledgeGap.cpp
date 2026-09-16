@@ -81,12 +81,29 @@ std::vector<GapQuestion> detect_gaps(const std::vector<KnowledgeWithHistory>& en
         if (k.status == "archived") continue;
         if (k.value.empty()) continue;
 
+        // 问够次数了就不再问。
+        //
+        // 【为什么这是"提问稀缺"的关键一笔】没有这一条，用户每次按回车跳过，
+        // 下一场会话**同样这 5 个问题原样再来一遍** —— 第三次使用他就不看了。
+        // 跳过也是回答：连按 5 次回车的意思就是"别再问了"。
+        // 值发生变化时计数会被 upsert 清零（那时问题本身变了，值得再问）。
+        if (k.asked_count >= kMaxAsks) continue;
+
         // 按优先级从高到低试四条规则，命中第一条就出题 ——
         // 同一个键最多出一条问题，否则用户会看到三条问同一件事的题。
         GapQuestion q;
         bool hit = false;
 
-        if (has_demote_record(e.history)) {
+        // ① 值冲突：历史里有"确认过的值被改掉"的记录。
+        //
+        // 【必须有 status != confirmed 这个条件】实测踩过：
+        // 用户答完"以后都用 Qwen ASR"之后，这条已经是 confirmed，
+        // 但历史里那条 value_changed_demoted 还在 —— 只查历史的话，
+        // **它下一场会话又是第 1 问**，直接违反 §1.3「confirmed 且无变化一个字都不问」。
+        //
+        // 语义上也说得通：confirmed + 有降级记录 = 用户**已经就这次变化做过决定**了。
+        // （如果之后模型又改了值，upsert 会把它降回 candidate，那时自然会重新问。）
+        if (k.status != "confirmed" && has_demote_record(e.history)) {
             q.rule      = GapRule::ValueChanged;
             q.old_value = last_demoted_old(e.history);
             q.question  = u8"这个改过：「" + q.old_value + u8"」→「" + k.value +

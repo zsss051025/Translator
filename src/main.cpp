@@ -2,6 +2,7 @@
 #include <vector>
 #include <string>
 #include <conio.h>    // 用于 _kbhit() 和 _getch()
+#include <io.h>       // _isatty / _fileno：判断 stdin 是不是终端（确认交互要据此让路）
 #include <chrono>
 #include <thread>
 #include <cmath>
@@ -15,6 +16,7 @@
 #include "SessionStore.h"
 #include "KnowledgeStore.h"
 #include "KnowledgeGap.h"
+#include "ConfirmGaps.h"
 #include "DeliverableWriter.h"
 #include "LlmSummarizer.h"
 #include "SubtitleWindow.h"
@@ -26,6 +28,7 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <sstream>   // 确认交互的自检用 istringstream 喂脚本化回答
 
 // 仅对 ASCII 做小写化（中文不受影响）。
 // 用途：黑名单匹配必须大小写不敏感——原实现用 result.find() 是敏感的，
@@ -384,6 +387,80 @@ static DeliverableOutcome generate_deliverables(const AppConfig& cfg, long long 
         if (f.size() > 5 && f.compare(f.size() - 5, 5, ".html") == 0) out.html_path = f;
     }
     return out;
+}
+
+// stdin 是不是一个真实终端。
+//
+// 【为什么用 _isatty 而不是别的】产品将来会有 GUI 壳（§7 第 4 阶段），
+// 那时 stdin 不是终端 —— 确认交互必须**自动让路**，由 GUI 弹自己的对话框，
+// 而不是在后台默默 getline 然后永远等不到输入。
+// 管道/重定向（`Translator.exe | tee log.txt`）同理。
+static bool stdin_is_tty() {
+    return _isatty(_fileno(stdin)) != 0;
+}
+
+// 会话结束时的确认交互（§7 步骤 2.4）。**必须在交付物写完之后调用。**
+//
+// had_content：本场有没有记录到内容。空会话没什么可核对的，直接跳过。
+static void confirm_gaps_at_session_end(const AppConfig& cfg, bool had_content) {
+    using namespace knowledge;
+
+    if (!had_content) return;
+
+    // 决定这次到底问不问，并把**原因**打出来。
+    // 不打原因的话，"为什么这次没问"会变成一个只能靠读代码回答的问题。
+    bool ask = false;
+    const char* why = "";
+    switch (cfg.ask_mode) {
+    case AppConfig::AskMode::Never:
+        ask = false; why = "--no-ask";
+        break;
+    case AppConfig::AskMode::Always:
+        ask = true;  why = "--ask";
+        break;
+    case AppConfig::AskMode::Auto:
+        if (!cfg.wav_path.empty()) {
+            ask = false; why = "--wav 批处理模式（要交互加 --ask）";
+        } else if (!stdin_is_tty()) {
+            ask = false; why = "stdin 不是终端（管道/重定向/将来的 GUI 壳）";
+        } else {
+            ask = true;  why = "自动（stdin 是终端）";
+        }
+        break;
+    }
+
+    if (!ask) {
+        std::cout << "[确认] 跳过（" << why << "）" << std::endl;
+        return;
+    }
+
+    const auto questions = detect_gaps_from_store(kMaxQuestionsDefault);
+    if (questions.empty()) {
+        // §1.3：没有问题就一个字都不说。这里刻意静默 ——
+        // "这次没有问题"本身也是噪音，用户不需要为此看一行输出。
+        return;
+    }
+
+    auto& store = SessionStore::instance();
+    const auto stats = run_confirmation(
+        questions,
+        // 读一行。返回 false = 输入结束。
+        //
+        // 【为什么用 getline 而不是 _getch 裸读】答案经常是中文专名的正确写法，
+        // 裸读会把输入法打得七零八落。代价是没有超时；接受它，因为此时
+        // **交付物已经落盘**，进程多等一会儿不丢任何东西（见 ConfirmGaps.h 的说明）。
+        [](std::string& line) -> bool {
+            if (!std::getline(std::cin, line)) return false;   // EOF
+            return true;
+        },
+        std::cout,
+        kMaxQuestionsDefault);
+
+    if (stats.failed > 0) {
+        std::cerr << "[确认] 有 " << stats.failed
+                  << " 条没能写进知识库 —— 上面的 [失败] 行里有原因" << std::endl;
+    }
+    (void)store;
 }
 
 // 把第二路音频混入主片段：逐样本相加并限幅。
@@ -1340,30 +1417,37 @@ static int run_selftest(const AppConfig& cfg) {
         //
         // 这里一句 FTS 语句都不写：upsert 插进去，就必须能被 search() 查回来。
         // 全靠 knowledge 表上的触发器维护外部内容表的索引。
+        //
+        // 【检索词必须是这个用例独有的】第一版用 "phoenix" 检索并断言"恰好 1 条"，
+        // 结果真实数据里存在 `__demo_phoenix` 时自检就红了 ——
+        // **用户知识库里只要有一条叫 Phoenix 的真知识，自检就会失败。**
+        // 用一个不可能撞车的 token，断言才只反映本用例干了什么。
+        const std::string UNIQ = "ZqFtsRoundTrip9";
         {
             last_err.clear();
             KnowledgeItem s;
             s.kind        = TK;
             s.key         = "__selftest_ftsroundtrip";
-            s.value       = "Phoenix";
+            s.value       = UNIQ;
             s.status      = "candidate";
             s.confidence  = 0.8;
-            s.source_text = "The Phoenix project ships in Q4.";
+            s.source_text = "The " + UNIQ + " project ships in Q4.";
             if (ks.upsert(s, &last_err) <= 0) fail("检索用例写入失败");
 
             // 把 err 一并报出去：搜索的失败模式里最坑的是"SQL 没编译过"，
             // 那种情况下返回的是空结果，看起来和"真的没搜到"一模一样。
             last_err.clear();
-            const auto found = ks.search("phoenix", 20, &last_err);
+            const auto found = ks.search(UNIQ, 20, &last_err);
             if (found.size() != 1 || found[0].key != "__selftest_ftsroundtrip")
                 fail("触发器没把新写入的行放进 FTS 索引（search 查不到）");
 
-            // 中文也必须能查到（unicode61 分词器对 CJK 的行为要在这里钉住）
+            // 中文也必须能查到（unicode61 分词器对 CJK 的行为要在这里钉住）。
+            // 这一条只断言"非空" —— 库里本来就有中文条目时也成立。
             const auto cn = ks.search(u8"埃里卡");
             if (cn.empty()) fail("中文全文检索查不到（分词器或索引有问题）");
 
-            // kind 大小写不同的词也要命中：FTS 检索**不该**被大小写绊住
-            if (ks.search("PHOENIX").size() != 1) fail("检索应忽略大小写");
+            // 大小写不同的检索词也要命中：FTS 检索**不该**被大小写绊住
+            if (ks.search("zqftsroundtrip9").size() != 1) fail("检索应忽略大小写");
 
             // 全是标点 → 不该是错误，返回空即可
             std::string punct_err;
@@ -1372,7 +1456,7 @@ static int run_selftest(const AppConfig& cfg) {
 
             // 删掉之后必须查不到，否则检索会返回"幽灵记录"
             ks.purge_key_prefix("__selftest_ftsroundtrip");
-            if (!ks.search("phoenix").empty()) fail("删除没有同步到 FTS 索引（幽灵记录）");
+            if (!ks.search(UNIQ).empty()) fail("删除没有同步到 FTS 索引（幽灵记录）");
         }
 
         last_err.clear();
@@ -1391,7 +1475,7 @@ static int run_selftest(const AppConfig& cfg) {
         using knowledge::KnowledgeWithHistory;
 
         auto mk = [](long long id, const char* status, const char* value,
-                     int hits, double conf) {
+                     int hits, double conf, int asked = 0) {
             KnowledgeWithHistory e;
             e.item.id         = id;
             e.item.kind       = "term";
@@ -1400,6 +1484,7 @@ static int run_selftest(const AppConfig& cfg) {
             e.item.status     = status;
             e.item.hits       = hits;
             e.item.confidence = conf;
+            e.item.asked_count = asked;
             return e;
         };
         auto add_hist = [](KnowledgeWithHistory& e, const char* oldv, const char* newv,
@@ -1504,9 +1589,236 @@ static int run_selftest(const AppConfig& cfg) {
             if (!knowledge::detect_gaps({}).empty()) { gap_ok = false; why = "空输入不该出问题"; }
         }
 
-        std::cout << "[SelfTest] 知识缺口检测（四规则/去重/优先级/上限）: "
-                  << (gap_ok ? "✅ 9 例通过" : "❌ 失败") << std::endl;
+        // ⑩ 问够了就不再问 —— **"提问稀缺"真正落地的那一条**
+        //
+        // 没有它，用户每次按回车跳过，下一场会话同样的问题原样再来一遍。
+        // 用 asked_count 计数：问过 1 次还问（用户可能只是没想好），
+        // 问过 kMaxAsks 次就沉底。
+        {
+            std::vector<KnowledgeWithHistory> v = {
+                mk(200, "candidate", "Phoenix", 9, 0.9, 0),                 // 没问过 → 问
+                mk(201, "candidate", "Marko",   9, 0.9, 1),                 // 问过 1 次 → 还问
+                mk(202, "candidate", "Erika",   9, 0.9, knowledge::kMaxAsks), // 问够了 → 不问
+                mk(203, "candidate", "Q4",      9, 0.9, knowledge::kMaxAsks + 3),
+            };
+            const auto q = knowledge::detect_gaps(v);
+            if (q.size() != 2) {
+                gap_ok = false;
+                why = "asked_count 达到 kMaxAsks 的条目不该再被问（实际出了 "
+                      + std::to_string(q.size()) + " 条）";
+            }
+        }
+
+        // ⑪ **已经确认过的，即使历史里还留着降级记录也不再问**
+        //
+        // 这是实跑抓到的：用户答完"以后都用 Qwen ASR"之后那条已经是 confirmed，
+        // 但历史里的 value_changed_demoted 还在，于是它下一场会话又是第 1 问 ——
+        // 直接违反 §1.3「confirmed 且无变化一个字都不问」。
+        {
+            std::vector<KnowledgeWithHistory> v = {
+                mk(210, "confirmed", "Qwen ASR", 2, 1.0, 0),   // 用户确认过 → 不该问
+                mk(211, "candidate", "Qwen ASR", 2, 0.9, 0),   // 同形状但没确认 → 该问
+            };
+            add_hist(v[0], "Whisper large-v3", "Qwen ASR", "value_changed_demoted");
+            add_hist(v[1], "Whisper large-v3", "Qwen ASR", "value_changed_demoted");
+            const auto q = knowledge::detect_gaps(v);
+            if (q.size() != 1 || q[0].knowledge_id != 211) {
+                gap_ok = false;
+                why = "confirmed 的条目不该因为历史里有降级记录而被再问";
+            }
+        }
+
+        std::cout << "[SelfTest] 知识缺口检测（四规则/去重/优先级/上限/问过不再问）: "
+                  << (gap_ok ? "✅ 11 例通过" : "❌ 失败") << std::endl;
         if (!gap_ok) {
+            std::cerr << "    " << why << std::endl;
+            return 1;
+        }
+    }
+
+    // ---- 13) 会话结束的确认交互（§7 步骤 2.4）----
+    //
+    // 【这一组为什么用 stringstream 而不是手搓数据结构】
+    // §8.8⑨ 的教训：用例的输入必须来自**真实路径**。
+    // 所以这里不构造"理想的"问答对象，而是把回答**当用户敲的那样喂进
+    // run_confirmation 的真实循环**，让 interpret_answer / apply_answer /
+    // run_confirmation 全部真跑一遍，改动**真的落到数据库**上，再查回来断言。
+    // 唯一被替换的是"从哪读一行"—— 而那正是为了可测而刻意抽出来的接缝。
+    {
+        using namespace knowledge;
+
+        const std::string PRE = "__selftest_confirm_";
+        const std::string CKEY = PRE + "marko";
+        auto& ks = KnowledgeStore::instance();
+        ks.purge_key_prefix(PRE);
+
+        bool cf_ok = true;
+        std::string why;
+
+        // ---- 13a) 纯函数：一行输入 → 动作 ----
+        struct AnsCase { const char* in; AnswerKind want; const char* value; };
+        const AnsCase ac[] = {
+            {"",            AnswerKind::Skip,      ""},
+            {"   ",         AnswerKind::Skip,      ""},
+            {"y",           AnswerKind::Affirm,    ""},
+            {"YES",         AnswerKind::Affirm,    ""},
+            {u8"是",        AnswerKind::Affirm,    ""},
+            {u8"对",        AnswerKind::Affirm,    ""},
+            // 【最关键的两条】"n"/"no" 必须被认成"否"，否则字面量 "no"
+            // 会被当成用户给的新写法写进知识库，而且是 confirmed —— 它会进翻译约束。
+            {"n",           AnswerKind::Reject,    ""},
+            {"no",          AnswerKind::Reject,    ""},
+            {u8"不是",      AnswerKind::Reject,    ""},
+            // 新写法：两边空白要去掉
+            {"  Marco  ",   AnswerKind::NewValue,  "Marco"},
+            {u8"埃里卡",    AnswerKind::NewValue,  u8"埃里卡"},
+            {"??",          AnswerKind::NewValue,  "??"},
+            // 【真实路径抓到的 bug】PowerShell 往管道写第一行会带 UTF-8 BOM，
+            // "\uFEFFy" 当时掉进了"其余一律当新值"分支 —— 于是字面量 "y"
+            // 被当成专名写进库，而且是 confirmed（会进翻译约束）。
+            // 这些用例全部来自那次实跑，不是我编的。
+            {"\xEF\xBB\xBFy",      AnswerKind::Affirm,   ""},
+            {"\xEF\xBB\xBFMarco",  AnswerKind::NewValue, "Marco"},
+            {"\xEF\xBB\xBF",       AnswerKind::Skip,     ""},
+            {"\xE3\x80\x80y\xE3\x80\x80", AnswerKind::Affirm, ""},   // 全角空格
+            {"\xE2\x80\x8BMarco",  AnswerKind::NewValue, "Marco"},   // 零宽空格
+            // 粘进来一整句话 → 退化成 Skip（宁可不记，不可记错）
+            {"I think it should be Marco, the previous one was misheard I believe",
+             AnswerKind::Skip, ""},
+        };
+        int ac_pass = 0;
+        for (const auto& c : ac) {
+            const Answer a = interpret_answer(c.in);
+            if (a.kind == c.want && a.value == c.value) { ++ac_pass; continue; }
+            cf_ok = false;
+            why = std::string("输入解释不对: '") + c.in + "'";
+        }
+        std::cout << "[SelfTest] 确认交互·输入解释（是/否/新值/跳过）: "
+                  << (cf_ok ? "✅ " : "❌ ") << ac_pass << "/"
+                  << (sizeof(ac) / sizeof(ac[0])) << " 通过" << std::endl;
+
+        // ---- 13b) 循环 + 落库：走真实路径 ----
+        if (cf_ok) {
+            auto seed = [&](const std::string& key, const char* value,
+                            const char* status, int hits, double conf) -> long long {
+                KnowledgeItem it;
+                it.kind        = "person";
+                it.key         = key;
+                it.value       = value;
+                it.status      = status;
+                it.confidence  = conf;
+                it.source_text = u8"自检造的候选";
+                std::string e;
+                const long long id = ks.upsert(it, &e);
+                // hits 直接写到位（走 SQL，不改库的语义）
+                for (int i = 1; i < hits; ++i) ks.upsert(it, &e);
+                return id;
+            };
+
+            seed(CKEY,               "Marko",   "candidate", 1, 0.35);  // 低置信度 → 该问
+            seed(PRE + "phoenix",    "Phoenix", "candidate", 5, 0.90);  // 高频未确认 → 该问
+            seed(PRE + "keep",       "EnglishPod", "confirmed", 9, 0.95); // confirmed → 不该问
+
+            auto qs = detect_gaps_from_store(kMaxQuestionsDefault);
+            // 只留本组造的（库里可能有别的组留下的数据）
+            std::vector<GapQuestion> mine;
+            for (const auto& q : qs) {
+                if (q.key.rfind(PRE, 0) == 0) mine.push_back(q);
+            }
+            if (mine.size() != 2) {
+                cf_ok = false;
+                why = "本组应恰好出 2 个问题（confirmed 的那条不该出），实际 "
+                      + std::to_string(mine.size());
+            } else {
+                // ① 高频未确认那条 → 直接给新写法（Phoenix → Fenix）
+                // ② 低置信度那条   → 答 y，认可当前值
+                //
+                // 【为什么不写死 "y\nFenix\n"】第一版就是这么写的，结果挂在
+                // "答新写法之后值应变 Fenix，实际 Phoenix" —— 因为出题是按优先级排的，
+                // 高频未确认(3) 排在低置信度(4) 前面，于是 "y" 答给了 Phoenix、
+                // "Fenix" 答给了 Marko。**断言没错，是我把顺序想当然了。**
+                // 改成按规则生成回答，顺序怎么变都不影响这一组。
+                std::string script;
+                for (const auto& q : mine) {
+                    script += (q.rule == GapRule::HighFreqUnconfirmed) ? "Fenix\n" : "y\n";
+                }
+                std::istringstream scripted(script);
+                std::ostringstream sink;
+                const auto st = run_confirmation(
+                    mine,
+                    [&](std::string& line) -> bool {
+                        if (!std::getline(scripted, line)) return false;
+                        return true;
+                    },
+                    sink, kMaxQuestionsDefault);
+
+                if (st.asked != 2 || st.confirmed != 2 || st.failed != 0) {
+                    cf_ok = false;
+                    why = "问答统计不对: asked=" + std::to_string(st.asked) +
+                          " confirmed=" + std::to_string(st.confirmed) +
+                          " failed=" + std::to_string(st.failed);
+                }
+
+                KnowledgeItem got;
+                // 认可用当前值 → confirmed，值不变
+                if (!ks.get("person", PRE + "marko", &got) || got.status != "confirmed") {
+                    cf_ok = false;
+                    why = "答 y 之后 Marko 应变 confirmed";
+                } else if (got.value != "Marko") {
+                    cf_ok = false;
+                    why = "答 y 不该改值";
+                }
+
+                // 给了新写法 → confirmed 且值是新的
+                if (!ks.get("person", PRE + "phoenix", &got) || got.status != "confirmed") {
+                    cf_ok = false;
+                    why = "答新写法之后 Phoenix 应变 confirmed";
+                } else if (got.value != "Fenix") {
+                    cf_ok = false;
+                    why = "答新写法之后值应变 Fenix，实际 " + got.value;
+                }
+
+                // 【必须验的一步】答过的、以及 confirmed 的，**下一轮不能再问**
+                // —— 这是 §1.3 提问稀缺的回归线：问过就沉底。
+                auto again = detect_gaps_from_store(kMaxQuestionsDefault);
+                for (const auto& q : again) {
+                    if (q.key.rfind(PRE, 0) != 0) continue;
+                    // 只有在"问过一次"的额度还没用完时才允许再出现；
+                    // 已 confirmed 的一律不允许（confirmed 且无变化 = 一个字都不问）
+                    cf_ok = false;
+                    why = "已确认的条目第二次仍被问：" + q.key;
+                }
+            }
+        }
+
+        // ---- 13c) 跳过也要计数（问过就沉底）----
+        //
+        // 用户连按回车的意思就是"别再问了"。如果只在"答了"才计数，
+        // 同一个问题会永远排在候选里 —— 稀缺性直接失效。
+        if (cf_ok) {
+            std::istringstream scripted("\n\n");
+            std::ostringstream sink;
+            auto qs = detect_gaps_from_store(kMaxQuestionsDefault);
+            std::vector<GapQuestion> mine;
+            for (const auto& q : qs) if (q.key.rfind(PRE, 0) == 0) mine.push_back(q);
+            if (!mine.empty()) {
+                run_confirmation(mine, [&](std::string& l) {
+                    return static_cast<bool>(std::getline(scripted, l));
+                }, sink, kMaxQuestionsDefault);
+
+                KnowledgeItem got;
+                if (ks.get("person", PRE + "marko", &got) && got.asked_count < 1) {
+                    cf_ok = false;
+                    why = "跳过也必须记 asked_count（否则同样的问题永远再问）";
+                }
+            }
+        }
+
+        ks.purge_key_prefix(PRE);
+
+        std::cout << "[SelfTest] 确认交互·循环与落库（认可/新值/跳过计数）: "
+                  << (cf_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+        if (!cf_ok) {
             std::cerr << "    " << why << std::endl;
             return 1;
         }
@@ -2072,6 +2384,17 @@ int main(int argc, char** argv) {
             } else {
                 std::cout << "[纪要] 本次没有记录到内容，跳过生成" << std::endl;
             }
+
+            // ---- 2.4 确认交互：问用户几个知识问题，把回答落进知识库（§6.7）----
+            //
+            // 【为什么必须放在 write() 之后】这是 §6.7 的硬约束，不是风格偏好：
+            // 交付物已经落盘，用户在这里 Ctrl+C、或者干脆走开，
+            // 会议纪要一个字都不会少。反过来就是"问了半天结果没生成纪要"——
+            // 那是最不可原谅的失败方式，因为这个产品的核心承诺就是"结束就给总结"。
+            //
+            // 第二句承诺（用得越久越懂你）从这一步开始才真正有输入：
+            // 在此之前知识库只有模型自己猜的东西，全是 candidate，进不了约束。
+            confirm_gaps_at_session_end(cfg, st.count > 0);
         }
 
         // 一次运行 = 一场会话：**结束就退出**。

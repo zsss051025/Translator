@@ -60,6 +60,15 @@ constexpr int    kHighFreqHits        = 3;      // 出现这么多次还没确�
 constexpr double kLowConfidenceBelow  = 0.5;    // 识别置信度低于此值
 constexpr size_t kMaxQuestionsDefault = 5;      // §1.3 红线：最多问 5 个
 
+// 同一条知识最多被问几次。
+//
+// 【为什么必须是 2 而不是无限】"提问是稀缺资源"（§1.3）要能落地，
+// 就得有个地方记住"这条问过了"。没有它，用户每次跳过之后下一场会话
+// 还会看到一模一样的问题。2 次是这个取舍的中点：
+// 用户第一次可能没想好（允许再问一次），第二次还是跳过说明他不关心。
+// 值发生变化时计数清零（KnowledgeStore::upsert），那时值得重新问。
+constexpr int    kMaxAsks             = 2;
+
 // **核心纯函数**：输入知识+历史，输出候选问题。
 // 不碰数据库、不碰模型、不依赖时间 —— 所以能进 L1 自检。
 //

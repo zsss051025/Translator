@@ -247,7 +247,8 @@ KnowledgeStore& KnowledgeStore::instance() {
     return store;
 }
 
-long long KnowledgeStore::upsert(const KnowledgeItem& item, std::string* err) {
+long long KnowledgeStore::upsert(const KnowledgeItem& item, std::string* err,
+                                 const std::string& reason_override) {
     auto set_err = [&](const std::string& m) { if (err) *err = m; };
 
     if (!knowledge::is_valid_kind(item.kind)) {
@@ -365,7 +366,10 @@ long long KnowledgeStore::upsert(const KnowledgeItem& item, std::string* err) {
         sqlite3_stmt* st = nullptr;
         const char* sql =
             "UPDATE knowledge SET value = ?, status = ?, confidence = ?, "
-            "updated_at = ?, source_session = ?, source_seq = ?, source_text = ? "
+            "updated_at = ?, source_session = ?, source_seq = ?, source_text = ?, "
+            // 值一变，"问过几次"就清零：问题本身变了，值得重新问一次。
+            // 不清零的话，一条被问过两次没定性的知识，在值变化后就再也不问了。
+            "asked_count = 0, last_asked_at = NULL "
             "WHERE id = ?;";
         if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) {
             set_err(std::string("更新失败: ") + sqlite3_errmsg(db));
@@ -393,7 +397,9 @@ long long KnowledgeStore::upsert(const KnowledgeItem& item, std::string* err) {
             "(knowledge_id,old_value,new_value,changed_at,source_session,source_seq,"
             " source_text,reason) VALUES (?,?,?,?,?,?,?,?);";
         if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) == SQLITE_OK) {
-            const std::string reason = demote ? "value_changed_demoted" : "model_extracted";
+            const std::string reason = !reason_override.empty()
+                                           ? reason_override
+                                           : (demote ? "value_changed_demoted" : "model_extracted");
             sqlite3_bind_int64(st, 1, old.id);
             sqlite3_bind_text (st, 2, old.value.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_text (st, 3, item.value.c_str(), -1, SQLITE_TRANSIENT);
@@ -422,7 +428,7 @@ bool KnowledgeStore::get(const std::string& kind, const std::string& key,
     sqlite3_stmt* st = nullptr;
     const char* sql =
         "SELECT id,kind,key,value,status,confidence,hits,first_seen_at,updated_at,"
-        "source_session,source_seq,source_text FROM knowledge "
+        "source_session,source_seq,source_text,asked_count,last_asked_at FROM knowledge "
         "WHERE kind = ? AND key = ?;";
     if (sqlite3_prepare_v2(ss.db_, sql, -1, &st, nullptr) != SQLITE_OK) return false;
     sqlite3_bind_text(st, 1, kind.c_str(), -1, SQLITE_TRANSIENT);
@@ -447,6 +453,8 @@ bool KnowledgeStore::get(const std::string& kind, const std::string& key,
         out->source_session = sqlite3_column_int64(st, 9);
         out->source_seq     = sqlite3_column_int64(st, 10);
         out->source_text    = text(11);
+        out->asked_count    = sqlite3_column_int(st, 12);
+        out->last_asked_at  = text(13);
     }
     sqlite3_finalize(st);
     return found;
@@ -461,7 +469,7 @@ std::vector<KnowledgeItem> KnowledgeStore::list(const std::string& status, int l
 
     std::string sql =
         "SELECT id,kind,key,value,status,confidence,hits,first_seen_at,updated_at,"
-        "source_session,source_seq,source_text FROM knowledge";
+        "source_session,source_seq,source_text,asked_count,last_asked_at FROM knowledge";
     if (!status.empty()) sql += " WHERE status = ?";
     sql += " ORDER BY hits DESC, updated_at DESC LIMIT ?;";
 
@@ -489,6 +497,8 @@ std::vector<KnowledgeItem> KnowledgeStore::list(const std::string& status, int l
         k.source_session = sqlite3_column_int64(st, 9);
         k.source_seq     = sqlite3_column_int64(st, 10);
         k.source_text    = text(11);
+        k.asked_count    = sqlite3_column_int(st, 12);
+        k.last_asked_at  = text(13);
         out.push_back(std::move(k));
     }
     sqlite3_finalize(st);
@@ -518,7 +528,8 @@ std::vector<KnowledgeItem> KnowledgeStore::search(const std::string& query, int 
     // 所以下面两件事一起做：用原名、失败时报错。
     const char* sql =
         "SELECT k.id,k.kind,k.key,k.value,k.status,k.confidence,k.hits,"
-        "       k.first_seen_at,k.updated_at,k.source_session,k.source_seq,k.source_text "
+        "       k.first_seen_at,k.updated_at,k.source_session,k.source_seq,k.source_text,"
+        "       k.asked_count,k.last_asked_at "
         "FROM knowledge_fts JOIN knowledge k ON k.id = knowledge_fts.rowid "
         "WHERE knowledge_fts MATCH ? "
         "ORDER BY rank LIMIT ?;";
@@ -550,10 +561,36 @@ std::vector<KnowledgeItem> KnowledgeStore::search(const std::string& query, int 
         k.source_session = sqlite3_column_int64(st, 9);
         k.source_seq     = sqlite3_column_int64(st, 10);
         k.source_text    = text(11);
+        k.asked_count    = sqlite3_column_int(st, 12);
+        k.last_asked_at  = text(13);
         out.push_back(std::move(k));
     }
     sqlite3_finalize(st);
     return out;
+}
+
+bool KnowledgeStore::mark_asked(long long id, std::string* err) {
+    auto set_err = [&](const std::string& m) { if (err) *err = m; };
+
+    SessionStore& ss = SessionStore::instance();
+    std::lock_guard<std::mutex> lock(ss.mutex_);
+    if (ss.db_ == nullptr) { set_err("数据库未初始化"); return false; }
+
+    const std::string ts = SessionStore::now_string();
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(ss.db_,
+            "UPDATE knowledge SET asked_count = asked_count + 1, last_asked_at = ? "
+            "WHERE id = ?;", -1, &st, nullptr) != SQLITE_OK) {
+        set_err(std::string("记问答次数失败: ") + sqlite3_errmsg(ss.db_));
+        return false;
+    }
+    sqlite3_bind_text (st, 1, ts.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, id);
+    const int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) { set_err("记问答次数失败"); return false; }
+    if (sqlite3_changes(ss.db_) == 0) { set_err("条目不存在: " + std::to_string(id)); return false; }
+    return true;
 }
 
 bool KnowledgeStore::set_status(long long id, const std::string& status,

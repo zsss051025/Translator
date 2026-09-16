@@ -39,6 +39,7 @@ add_executable(Translator
 	src/SessionStore.cpp
 	src/KnowledgeStore.cpp
 	src/KnowledgeGap.cpp
+	src/ConfirmGaps.cpp
 	src/DeliverableWriter.cpp
 	src/LlmSummarizer.cpp
 	src/CaBundle.cpp
@@ -53,6 +54,7 @@ add_executable(Translator
 	inc/SessionStore.h
 	inc/KnowledgeStore.h
 	inc/KnowledgeGap.h
+	inc/ConfirmGaps.h
 	inc/DeliverableWriter.h
 	inc/LlmSummarizer.h
 	inc/CaBundle.h

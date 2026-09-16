@@ -2,6 +2,7 @@
 #include "sqlite3.h"
 
 #include <chrono>
+#include <cstring>
 #include <ctime>
 #include <iomanip>
 #include <iostream>
@@ -48,6 +49,14 @@ const char* kSchema =
     "  status         TEXT NOT NULL,"              // confirmed | candidate | archived
     "  confidence     REAL NOT NULL DEFAULT 0.0,"
     "  hits           INTEGER NOT NULL DEFAULT 0," // 被听到过多少次（决定"该问什么"的排序）
+    // 问过用户几次 / 最后一次是什么时候。
+    //
+    // 【为什么必须有这两列】没有它们，"提问是稀缺资源"（§1.3）就是句口号：
+    // 用户每次按回车跳过，下一次会话**同样这 5 个问题原样再问一遍**。
+    // 有了计数，每条知识最多问 kMaxAsks 次（见 KnowledgeGap.h），问过就沉底。
+    // 值发生变化时计数会清零（在 upsert 里）—— 那时候问题本身变了，值得再问一次。
+    "  asked_count    INTEGER NOT NULL DEFAULT 0,"
+    "  last_asked_at  TEXT,"
     "  first_seen_at  TEXT NOT NULL,"
     "  updated_at     TEXT NOT NULL,"
     // 证据：哪次会话、哪一段、原话。不可省——每条知识都要能回答"你凭什么这么说"
@@ -201,6 +210,46 @@ bool SessionStore::ensure_schema() {
                       << (rb_err ? rb_err : "?") << std::endl;
             if (rb_err) sqlite3_free(rb_err);
             return false;
+        }
+    }
+
+    // 【现象】2.4 之前建的库里没有 asked_count / last_asked_at 两列。
+    // 【原因】`CREATE TABLE IF NOT EXISTS` 对**已存在**的表是空操作，
+    //         它只会补表，**永远不会补列** —— 所以加列必须另走 ALTER TABLE。
+    // 【判断】用 PRAGMA table_info 先查在不在，不在才 ALTER。
+    //         SQLite 没有 "ADD COLUMN IF NOT EXISTS"，只能这样幂等。
+    //         加列语句写在**自检也能跑到的路径**上，所以老库第一次被打开就自动补上。
+    {
+        struct ColumnFix { const char* table; const char* column; const char* decl; };
+        const ColumnFix fixes[] = {
+            {"knowledge", "asked_count",   "ALTER TABLE knowledge ADD COLUMN asked_count INTEGER NOT NULL DEFAULT 0;"},
+            {"knowledge", "last_asked_at", "ALTER TABLE knowledge ADD COLUMN last_asked_at TEXT;"},
+        };
+        for (const auto& fx : fixes) {
+            const std::string pragma = std::string("PRAGMA table_info(") + fx.table + ");";
+            sqlite3_stmt* st = nullptr;
+            if (sqlite3_prepare_v2(db_, pragma.c_str(), -1, &st, nullptr) != SQLITE_OK) {
+                std::cerr << "[DB] table_info failed: " << sqlite3_errmsg(db_) << std::endl;
+                return false;
+            }
+            bool exists = false;
+            while (sqlite3_step(st) == SQLITE_ROW) {
+                const unsigned char* name = sqlite3_column_text(st, 1);
+                if (name && std::strcmp(reinterpret_cast<const char*>(name), fx.column) == 0) {
+                    exists = true;
+                    break;
+                }
+            }
+            sqlite3_finalize(st);
+            if (exists) continue;
+
+            char* alt_err = nullptr;
+            if (sqlite3_exec(db_, fx.decl, nullptr, nullptr, &alt_err) != SQLITE_OK) {
+                std::cerr << "[DB] 补列失败 " << fx.table << "." << fx.column
+                          << ": " << (alt_err ? alt_err : "?") << std::endl;
+                if (alt_err) sqlite3_free(alt_err);
+                return false;
+            }
         }
     }
 

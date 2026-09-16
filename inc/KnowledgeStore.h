@@ -23,6 +23,12 @@ struct KnowledgeItem {
     std::string status;                // confirmed | candidate | archived
     double      confidence     = 0.0;
     int         hits           = 0;    // 被听到过多少次（决定"该问什么"的排序）
+
+    // 问过用户几次 / 最后一次是什么时候（§1.3：提问是稀缺资源）
+    // 没有这两个字段，用户跳过的同一个问题会每次会话原样再问一遍。
+    int         asked_count    = 0;
+    std::string last_asked_at;
+
     std::string first_seen_at;
     std::string updated_at;
 
@@ -93,8 +99,21 @@ public:
     //                             值变了就意味着原来那条 confirmed 不再成立，
     //                             必须让用户重新确认一次（§6.5）
     //
+    // `reason_override`：历史里记的原因。空 = 按上下文自动判定
+    //   （值变了 → `value_changed_demoted`，否则 → `model_extracted`）。
+    //   用户主动改写的路径（2.4 确认交互）传 `user_edited` —— §6.8 定义了这三个原因，
+    //   而"用户说的"和"模型猜的"必须能区分：前者不需要再问，后者才需要。
+    //
     // 调用方负责先 normalize_key()。
-    long long upsert(const KnowledgeItem& item, std::string* err = nullptr);
+    long long upsert(const KnowledgeItem& item, std::string* err = nullptr,
+                     const std::string& reason_override = "");
+
+    // 记一次"问过用户"（2.4 的确认交互在**真正问出口之后**调用）。
+    //
+    // 【为什么在"问"的时候记，而不是在"答"的时候】跳过也是回答。
+    // 用户连按 5 次回车的意思就是"别再问了"，如果只在答了才计数，
+    // 同一个问题会永远排在候选里 —— 稀缺性直接失效。
+    bool mark_asked(long long id, std::string* err = nullptr);
 
     bool get(const std::string& kind, const std::string& key, KnowledgeItem* out) const;
 
