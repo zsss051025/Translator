@@ -18,6 +18,7 @@
 #include "KnowledgeGap.h"
 #include "ConfirmGaps.h"
 #include "KnowledgeExtract.h"
+#include "Utf8.h"
 #include "DeliverableWriter.h"
 #include "LlmSummarizer.h"
 #include "SubtitleWindow.h"
@@ -1418,6 +1419,199 @@ static int run_selftest(const AppConfig& cfg) {
             if (!fc_ok) {
                 std::cerr << "    " << why4 << std::endl;
                 return 1;
+            }
+        }
+
+        // ---- UTF-8 净化（交付物写出边界 + 摘要解析前）----
+        //
+        // 【用例的来历】`meeting-42.md` 是**真实产物**：用 `--summarizer local`（混元）
+        // 生成的整份文件不是合法 UTF-8，字节证据是 `### 询问你\xe7`
+        // —— `\xe7` 是个没写完的三字节首字节，下面一行还有孤立的续字节 `\x84`。
+        // 所以第一个用例直接抄那两个真实字节，而不是我编一个"看起来非法"的串。
+        {
+            bool u_ok = true;
+            std::string why5;
+
+            // ① 真实事故字节：截断的三字节首字节 + 孤立续字节
+            {
+                const std::string bad = "### \xe8\xaf\xa2\xe9\x97\xae\xe4\xbd\xa0\xe7"
+                                        "\n- \x84\xe5\x9b\xbd\xe5\xae\xb6";
+                if (utf8::is_valid(bad)) { u_ok = false; why5 = "真实事故字节被判成合法了"; }
+                size_t n = 0;
+                const std::string fixed = utf8::sanitize(bad, &n);
+                if (u_ok) {
+                    if (n != 2) { u_ok = false; why5 = "应替换 2 处，实际 " + std::to_string(n); }
+                    else if (!utf8::is_valid(fixed)) { u_ok = false; why5 = "净化后仍不合法"; }
+                }
+            }
+
+            // ② 合法输入必须**逐字节不变**
+            {
+                const std::string good = u8"正常的 UTF-8：中文、English、emoji 😀、"
+                                         u8"「引号」、ASCII abc123";
+                if (u_ok && !utf8::is_valid(good)) { u_ok = false; why5 = "合法串被判成非法"; }
+                size_t n = 0;
+                const std::string same = utf8::sanitize(good, &n);
+                if (u_ok && (n != 0 || same != good)) {
+                    u_ok = false; why5 = "合法输入被改动了（应逐字节不变）";
+                }
+            }
+
+            // ③ 严格性：这些都必须判**非法**。宽松写法会全部放过它们。
+            {
+                struct Uc { const char* name; std::string bytes; };
+                const Uc cases[] = {
+                    {u8"过长编码（2 字节表示 'A'）",  std::string("\xC1\x81", 2)},
+                    {u8"过长编码（3 字节表示 '/'）",  std::string("\xE0\x80\xAF", 3)},
+                    {u8"过长的 4 字节",               std::string("\xF0\x80\x80\xAF", 4)},
+                    {u8"UTF-16 代理对（U+D800）",     std::string("\xED\xA0\x80", 3)},
+                    {u8"超出 U+10FFFF",               std::string("\xF4\x90\x80\x80", 4)},
+                    {u8"孤立续字节",                  std::string("\x80", 1)},
+                    {u8"被截断的 2 字节序列",         std::string("\xC3", 1)},
+                    {u8"被截断的 3 字节序列",         std::string("\xE4\xB8", 2)},
+                    {u8"0xFF 不是合法首字节",         std::string("\xFF", 1)},
+                };
+                for (const auto& c : cases) {
+                    if (!u_ok) break;
+                    if (utf8::is_valid(c.bytes)) {
+                        u_ok = false;
+                        why5 = std::string("应判非法却放过了：") + c.name;
+                    }
+                }
+            }
+
+            // ④ 边界码点必须放过
+            {
+                struct Vc { const char* name; std::string bytes; };
+                const Vc cases[] = {
+                    {u8"U+0000",   std::string("\x00", 1)},
+                    {u8"U+007F",   std::string("\x7F", 1)},
+                    {u8"U+0080",   std::string("\xC2\x80", 2)},
+                    {u8"U+07FF",   std::string("\xDF\xBF", 2)},
+                    {u8"U+0800",   std::string("\xE0\xA0\x80", 3)},
+                    {u8"U+D7FF",   std::string("\xED\x9F\xBF", 3)},
+                    {u8"U+E000",   std::string("\xEE\x80\x80", 3)},
+                    {u8"U+FFFF",   std::string("\xEF\xBF\xBF", 3)},
+                    {u8"U+10000",  std::string("\xF0\x90\x80\x80", 4)},
+                    {u8"U+10FFFF", std::string("\xF4\x8F\xBF\xBF", 4)},
+                };
+                for (const auto& c : cases) {
+                    if (!u_ok) break;
+                    if (!utf8::is_valid(c.bytes)) {
+                        u_ok = false;
+                        why5 = std::string("应判合法却拒了：") + c.name;
+                    }
+                }
+            }
+
+            // ⑤ 坏字节不能把后面的好字节一起吞掉
+            {
+                const std::string mix = std::string("A") + "\xE7" + "B" + "\x84" + "C";
+                size_t n = 0;
+                const std::string fixed = utf8::sanitize(mix, &n);
+                if (u_ok) {
+                    if (n != 2) { u_ok = false; why5 = "应替换 2 处"; }
+                    else if (fixed.find('A') == std::string::npos ||
+                             fixed.find('B') == std::string::npos ||
+                             fixed.find('C') == std::string::npos) {
+                        u_ok = false; why5 = "净化把好字节一起吞了";
+                    }
+                }
+            }
+
+            std::cout << "[SelfTest] UTF-8 净化（严格判定/合法不动/坏字节不吞好字节）: "
+                      << (u_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+            if (!u_ok) {
+                std::cerr << "    " << why5 << std::endl;
+                return 1;
+            }
+
+            // ---- 多字节分隔符不能被按单字节比较 ----
+            //
+            // 【这是 meeting-42.md 真正的病根，比上面那组更要紧】
+            // 原代码：`item.find_first_of(u8"：:")` —— 按**单字节**比较，
+            // 而 u8"：" 是 EF BC 9A，于是它在找「0xEF 或 0xBC 或 0x9A 或 ':'」。
+            // **「的」= E7 9A 84，第二个字节就是 0x9A** → 被当成冒号：
+            //     "询问你的想法：要点" 里，它找到位置 10（「的」中间），真正的冒号在 18
+            //     substr(0,10) = "询问你" + 0xE7  ← 切在字符中间
+            // 结果整份交付物不再是合法 UTF-8。
+            //
+            // 【为什么这一条必须用「的」当用例】0x9A / 0xBC 是**极常见**的汉字续字节
+            // （的/地/得/等…），所以这个 bug 在实际输出里几乎必然命中 ——
+            // 用别的字测反而可能测不出来。
+            {
+                bool mb_ok = true;
+                std::string why6;
+
+                LlmSummarizer sm(LlmSummarizer::Backend::Local);
+                sm.set_target_language("zh");
+
+                // 本地后端的结构化纯文本格式
+                const std::string reply =
+                    u8"【类型】\n会议\n\n"
+                    u8"【概述】\n一段概述。\n\n"
+                    u8"【要点】\n"
+                    u8"- 询问你的想法：要点一；要点二\n"
+                    u8"- 讨论的进展：第三点\n\n"
+                    u8"【行动项】\n- 无\n";
+
+                MeetingSummary sum;
+                std::string perr;
+                if (!sm.parse_reply(reply, sum, perr)) {
+                    mb_ok = false; why6 = "解析失败: " + perr;
+                } else {
+                    if (sum.topics.size() != 2) {
+                        mb_ok = false;
+                        why6 = "应解析出 2 个主题，实际 " + std::to_string(sum.topics.size());
+                    } else {
+                        // 标题必须完整，不能被切在「的」中间
+                        if (sum.topics[0].title != u8"询问你的想法") {
+                            mb_ok = false;
+                            why6 = u8"标题被切坏了：'" + sum.topics[0].title +
+                                   u8"'（应为「询问你的想法」）";
+                        } else if (sum.topics[0].points.size() != 2 ||
+                                   sum.topics[0].points[0] != u8"要点一" ||
+                                   sum.topics[0].points[1] != u8"要点二") {
+                            mb_ok = false;
+                            why6 = u8"要点切分不对（全角冒号应只占一个分隔位）";
+                        } else if (sum.topics[1].title != u8"讨论的进展") {
+                            mb_ok = false;
+                            why6 = u8"第二行标题也错了：'" + sum.topics[1].title + u8"'";
+                        }
+                    }
+                    // 解析出来的每个字段都必须是合法 UTF-8
+                    if (mb_ok) {
+                        for (const auto& t : sum.topics) {
+                            if (!utf8::is_valid(t.title)) {
+                                mb_ok = false; why6 = "解析出的标题不是合法 UTF-8"; break;
+                            }
+                            for (const auto& pt : t.points) {
+                                if (!utf8::is_valid(pt)) {
+                                    mb_ok = false; why6 = "解析出的要点不是合法 UTF-8"; break;
+                                }
+                            }
+                        }
+                    }
+                }
+                // 半角冒号也得能切（模型偶尔吐 ASCII 冒号）
+                if (mb_ok) {
+                    const std::string reply2 =
+                        u8"【要点】\n- Ask about the plan: point one; point two\n";
+                    MeetingSummary s2;
+                    std::string e2;
+                    if (!sm.parse_reply(reply2, s2, e2) || s2.topics.size() != 1 ||
+                        s2.topics[0].title != "Ask about the plan") {
+                        mb_ok = false;
+                        why6 = "半角冒号的分隔没处理对";
+                    }
+                }
+
+                std::cout << "[SelfTest] 多字节分隔符（「的」不能被当成全角冒号）: "
+                          << (mb_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+                if (!mb_ok) {
+                    std::cerr << "    " << why6 << std::endl;
+                    return 1;
+                }
             }
         }
     }

@@ -1,4 +1,5 @@
 #include "DeliverableWriter.h"
+#include "Utf8.h"   // 写出边界的 UTF-8 净化
 
 #include <algorithm>
 #include <cctype>
@@ -7,6 +8,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <iostream>   // 写出边界的 UTF-8 净化失败时要报给用户
 #include <sstream>
 
 namespace fs = std::filesystem;
@@ -308,10 +310,35 @@ std::string canonicalize_date(const std::string& s) {
 }
 
 bool write_file(const fs::path& p, const std::string& content, bool with_bom) {
+    // ---- UTF-8 净化：交付物必须是合法 UTF-8 ----
+    //
+    // 【放在这里而不是每个字段各自处理】出口只有一个，漏不掉；
+    // 将来多一种交付物也自动被覆盖。
+    //
+    // 【为什么是"净化 + 大声报告"而不是拒绝】真实事故：用 `--summarizer local`（混元）
+    // 生成的 meeting-42.md **整份不是合法 UTF-8**（`### 询问你\xe7` —— `\xe7` 是个
+    // 没写完的三字节首字节）。
+    // 根因**不是模型**，是 `LlmSummarizer::parse_reply` 里
+    // `item.find_first_of(u8"：:")` 按单字节比较，把「的」（E7 9A 84）里的 0x9A
+    // 当成了冒号，一刀切在字符中间 —— 那一处已修。详见 Utf8.h 的说明。
+    // 拒绝写盘意味着用户一份交付物都拿不到，而那份交付物 99% 的内容是好的；
+    // 所以净化保证文件永远合法，但**必须打警告** —— 静默替换才是真正违反
+    // "绝不静默给错数据"那条规矩的做法。
+    size_t fixed = 0;
+    const std::string safe = utf8::sanitize(content, &fixed);
+    if (fixed > 0) {
+        std::cerr << "[Deliverable] 警告：" << p.filename().string() << " 里有 " << fixed
+                  << " 处非法 UTF-8 字节，已替换成 U+FFFD。文件本身现在合法，"
+                     "但那几处内容不可信。" << std::endl;
+        std::cerr << "[Deliverable] 这是**代码 bug 的症状**（按字节切了多字节字符），"
+                     "不是模型的问题。请查最近的字符串截断/分隔符比较改动。"
+                  << std::endl;
+    }
+
     std::ofstream f(p, std::ios::binary);
     if (!f) return false;
     if (with_bom) f.write("\xEF\xBB\xBF", 3);   // Excel 打开 CSV 需要 BOM 才不乱码
-    f.write(content.data(), static_cast<std::streamsize>(content.size()));
+    f.write(safe.data(), static_cast<std::streamsize>(safe.size()));
     return f.good();
 }
 

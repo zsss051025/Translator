@@ -1,5 +1,6 @@
 #include "LlmSummarizer.h"
 #include "CaBundle.h"
+#include "Utf8.h"   // 解析模型回复前先净化 UTF-8
 
 #include <algorithm>
 #include <cctype>
@@ -316,10 +317,35 @@ bool LlmSummarizer::parse_reply(const std::string& raw, MeetingSummary& out,
                 if (item.empty()) item = t;
                 // "主题名：要点1；要点2"
                 std::string title = item, points_str;
-                const size_t colon = item.find_first_of(u8"：:");
+                // 【绝不能写 find_first_of(u8"：:")】它按**单字节**比较，
+                // 而 u8"：" 是三个字节 EF BC 9A —— 于是它在找
+                // 「0xEF 或 0xBC 或 0x9A 或 ':'」中的任意一个字节。
+                // 而 **「的」= E7 9A 84，第二个字节就是 0x9A**，会被当成冒号。
+                //
+                // 实测后果（真实产物 meeting-42.md）：
+                //     item  = "询问你的想法：要点"
+                //     找到的位置 = 「的」中间那个字节（10），真正的冒号在 18
+                //     substr(0, 10) = "询问你" + 0xE7     ← 「的」被切成两半
+                //     文件里就是  ### 询问你\xe7          ← 整份文件不再是合法 UTF-8
+                //
+                // 注意：**这不是模型吐了半个字符，是我们自己切坏的。**
+                // 我一开始把责任归给了混元（说它输出半个 token），是错的 ——
+                // 直到发现"净化器报了 6 处坏字节，但摘要那一步一行警告都没有"
+                // 才对上账。凡是有多字节分隔符的地方都用 find() 整串匹配。
+                size_t colon = item.find(u8"：");
+                {
+                    const size_t half = item.find(':');
+                    if (half != std::string::npos &&
+                        (colon == std::string::npos || half < colon)) {
+                        colon = half;
+                    }
+                }
                 if (colon != std::string::npos) {
-                    title     = trim(item.substr(0, colon));
-                    points_str = trim(item.substr(colon + 1));
+                    title      = trim(item.substr(0, colon));
+                    // 加的是分隔符**本身的长度**，不是 1 —— 全角冒号占 3 字节，
+                    // 写 colon + 1 会从"要"字中间开始，又是一次切坏
+                    const size_t sep_len = item.compare(colon, 3, u8"：") == 0 ? 3 : 1;
+                    points_str = trim(item.substr(colon + sep_len));
                 }
                 TopicSummary ts;
                 ts.title = normalize_slot(title);
@@ -528,12 +554,27 @@ bool LlmSummarizer::summarize(const std::vector<Segment>& segs, MeetingSummary& 
     std::string raw;
     if (!call_model(system, user, raw, err)) return false;
 
-    // 本地小模型经常吐空或吐不按格式的内容，把原始输出打出来才好排查
-    std::cerr << "[Summarizer] 模型返回 " << raw.size() << " 字符" << std::endl;
+    // ---- 解析前先净化 UTF-8 ----
+    //
+    // 这**不是**因为模型会吐半个字符 —— 实测那类事故其实是解析器自己切出来的
+    // （见 parse_reply 里 `find_first_of` 那段注释）。这里做是因为：
+    // `call_model` 之后拿到的字符串来自模型，任何字节都可能出现，
+    // 而下游（逐行解析、切分、去重、来源回填）都默认文本是合法 UTF-8。
+    // 与其在每个下游函数里防，不如在入口收一次。
+    size_t fixed = 0;
+    const std::string clean = utf8::sanitize(raw, &fixed);
+    if (fixed > 0) {
+        std::cerr << "[Summarizer] 模型回复里有 " << fixed
+                  << " 处非法 UTF-8 字节，已净化后再解析（文件仍会生成，但那几处内容不可信）"
+                  << std::endl;
+    }
 
-    if (!parse_reply(raw, out, err)) {
+    // 本地小模型经常吐空或吐不按格式的内容，把原始输出打出来才好排查
+    std::cerr << "[Summarizer] 模型返回 " << clean.size() << " 字符" << std::endl;
+
+    if (!parse_reply(clean, out, err)) {
         std::cerr << "[Summarizer] 解析失败。模型原始回复：\n----\n"
-                  << raw.substr(0, 800) << "\n----" << std::endl;
+                  << clean.substr(0, 800) << "\n----" << std::endl;
         return false;
     }
 
