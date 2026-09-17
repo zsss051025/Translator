@@ -80,7 +80,7 @@ def main():
         p = subprocess.run(
             [EXE, "--wav", WAV, "--lang", "en", "--target", "en",
              "--summarizer", "rules", "--no-ask",
-             "--db", DB, "--out", os.path.join(ROOT, "passthrough_out")],
+             "--db", DB, "--out", os.path.join(ROOT, "out_passthrough")],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             cwd=ROOT)
 
