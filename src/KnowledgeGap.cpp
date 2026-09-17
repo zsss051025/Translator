@@ -11,6 +11,7 @@ const char* to_string(GapRule r) {
     case GapRule::ConflictingSpellings:  return "conflicting_spellings";
     case GapRule::InconsistentRendering: return "inconsistent_rendering";
     case GapRule::HighFreqUnconfirmed:   return "high_freq_unconfirmed";
+    case GapRule::AskDefinition:         return "ask_definition";
     case GapRule::NewlySeen:             return "newly_seen";
     case GapRule::LowConfidenceName:     return "low_confidence_name";
     }
@@ -23,17 +24,19 @@ int priority_of(GapRule r) {
     //   写法冲突次之 —— 同上，而且用户**答错的可能性最大**（选项不摆出来他只能猜）
     //   译法不一致再次 —— 同一个键的值变过多次
     //   高频未确认再次 —— 提了很多次却一直没定性，问一次收益最大
+    //   **问含义** 排在这里 —— 它不会让现状变坏（不问只是"少懂一点"），
+    //                       但它是**唯一能让系统真正学到内容**的问题，
+    //                       所以排在"没有知识"那两条前面，且每场限量 1 个
     //   本场新见再次 —— 自动抽取的出口，用户第一次用就是靠它把名字确定下来
-    //                     （优先级低于上面几条：那些是"已有知识出了问题"，
-    //                      这条只是"还没有知识"，不问不会让现状变坏）
     //   低置信度最后 —— 大概率只是听错了，价值最低
     switch (r) {
     case GapRule::ValueChanged:          return 1;
     case GapRule::ConflictingSpellings:  return 2;
     case GapRule::InconsistentRendering: return 3;
     case GapRule::HighFreqUnconfirmed:   return 4;
-    case GapRule::NewlySeen:             return 5;
-    case GapRule::LowConfidenceName:     return 6;
+    case GapRule::AskDefinition:         return 5;
+    case GapRule::NewlySeen:             return 6;
+    case GapRule::LowConfidenceName:     return 7;
     }
     return 99;
 }
@@ -114,6 +117,9 @@ bool likely_same_entity(const std::string& a, const std::string& b) {
 std::vector<GapQuestion> detect_gaps(const std::vector<KnowledgeWithHistory>& entries,
                                      size_t max_questions, long long current_session) {
     std::vector<GapQuestion> out;
+
+    // 本场已经问出去几个"它指什么"（见 kMaxDefinitionAsksPerSession）
+    size_t def_asked = 0;
 
     // ---- 第 0 步：先找出"同一个实体的多种写法"，合并成一条问题 ----
     //
@@ -248,6 +254,35 @@ std::vector<GapQuestion> detect_gaps(const std::vector<KnowledgeWithHistory>& en
             q.rule     = GapRule::InconsistentRendering;
             q.question = u8"「" + k.value + u8"」的写法变过好几次。固定成哪一种？";
             hit = true;
+        } else if (k.kind == "term" && k.definition.empty() &&
+                   (k.status == "confirmed" || k.hits >= 1)) {
+            // ③ 术语还没有**含义** → 问"它指什么"。
+            //
+            // 【为什么排在高频未确认**之前**】因为这一问本来就是**一问两用** ——
+            // 需求原话就是这么写的：
+            //     「它是你们项目中的一个重要技术概念吗？如果是，它具体指什么？」
+            // 用户答"是，指 Compile Once – Run Everywhere"这一句，
+            // 同时完成了**确认**（它值得记）和**学含义**（它是什么）。
+            // 排在高频后面的话，一个 hits=3 的术语会先被问"我打算把它记成术语，对吗？"，
+            // 用户按个 y 就结束了 —— 我们拿到了"确认"却永远拿不到"含义"，
+            // 而含义才是闭环里唯一真正让系统"懂"点什么的东西。
+            //
+            // 【为什么只问 term，不问 person】"Erica 指什么"是个没有意义的问题
+            // （人名不需要定义）。机构/项目名勉强可以问，但那更像闲聊，
+            // 而提问是稀缺资源 —— 先只做"技术术语"这一类最明确有价值的。
+            //
+            // 【没有它 `knowledge.definition` 永远是空的】
+            // 这是 §6.4③（含义复用）唯一的入口。
+            //
+            // 【为什么每场只问 1 个】见 kMaxDefinitionAsksPerSession：
+            // 用户要打一整句话，问三个他就不答了。
+            if (def_asked < kMaxDefinitionAsksPerSession) {
+                q.rule = GapRule::AskDefinition;
+                q.question = u8"你提到了「" + k.value +
+                             u8"」。它是你们项目里的重要概念吗？是的话，它指什么？";
+                hit = true;
+                ++def_asked;
+            }
         } else if (k.status == "candidate" && k.hits >= kHighFreqHits) {
             q.rule     = GapRule::HighFreqUnconfirmed;
             // 【措辞】旧版是「已经听到 N 次「X」，一直没确认过。它是对的说法吗？」

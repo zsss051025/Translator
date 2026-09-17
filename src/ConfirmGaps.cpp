@@ -108,7 +108,7 @@ bool is_negative(const std::string& low) {
 
 }  // namespace
 
-Answer interpret_answer(const std::string& raw) {
+Answer interpret_answer(const std::string& raw, size_t max_value_len) {
     Answer a;
     const std::string t = strip_invisible(raw);
     if (t.empty()) return a;                    // 回车 = 跳过，这是最主要的用法
@@ -123,8 +123,9 @@ Answer interpret_answer(const std::string& raw) {
     // 之前那个 Marko 好像是听错了"）。把它当值写进库，这条知识就废了，
     // 而且它会作为"术语约束"进到翻译 prompt 里。
     // 限长之后这种输入退化成 Skip —— 宁可少记一条，不可记错一条。
-    constexpr size_t kMaxValueLen = 60;
-    if (t.size() > kMaxValueLen) return a;
+    //
+    // 上限由调用方给：专名 60 字节足够，而"它指什么"要一整句话（见头文件）。
+    if (t.size() > max_value_len) return a;
 
     // 【为什么必须要求"含字母或汉字"】真实事故（会话 #46/#47）：
     // 用户在某个问题上答了 `1`，于是库里多出一条
@@ -188,6 +189,11 @@ std::string answer_hint_for(GapRule rule) {
         return u8"（回车 = 以后再问；y = 就用新的；n = 用回旧的；也可直接输入正确写法）";
     case GapRule::ConflictingSpellings:
         return u8"（输入编号选正确写法；n = 不是同一个东西，两个都留着；回车跳过）";
+    case GapRule::AskDefinition:
+        // 这条要用户**打一句话**，所以提示必须说清楚"直接说它的意思就行"。
+        // 长度上限见 interpret_answer（60 字节）：定义通常够用，
+        // 太长会被判成 Skip 而不是截断 —— 宁可少记一条，不可记错一条。
+        return u8"（直接输入它的意思；只确认这是个重要概念就按 y；回车跳过）";
     case GapRule::InconsistentRendering:
     case GapRule::HighFreqUnconfirmed:
         return u8"（回车跳过；y = 认可；也可以直接输入正确写法）";
@@ -267,6 +273,72 @@ ConfirmResult apply_answer(const GapQuestion& q, const Answer& a, std::string* e
         if (archived > 0) {
             r.detail += u8"（另外 " + std::to_string(archived) +
                         u8" 个写法已标为听错，不再使用）";
+        }
+        return r;
+    }
+
+    // ---- 问含义：用户那句话**就是含义本身**，不是"正确的写法" ----
+    //
+    // 【为什么必须单独一条分支】对别的规则，NewValue 表示"这个词应该写成什么"，
+    // 会写进 `value` 并进识别提示/翻译约束。而这条规则问的是"它指什么" ——
+    // 把「Compile Once – Run Everywhere，我们 eBPF 项目的核心方案」
+    // 当成 value 写进去，会**直接污染识别提示**（一句中文描述去当专名）。
+    //
+    // 用户答的这句话进 `definition`，出口只有摘要背景和检索。
+    // 这是一个很容易写错、而且写错了很难看出来的地方：
+    // 识别提示里混进一句中文，Whisper 不会报错，只会识别得更差。
+    if (q.rule == GapRule::AskDefinition) {
+        if (a.kind == AnswerKind::Skip || q.knowledge_id <= 0) {
+            r.outcome = ConfirmOutcome::Skipped;
+            return r;
+        }
+
+        // Reject：用户说"不是什么重要概念" → 保持 candidate，不改状态、不写含义。
+        //
+        // 故意**不 archive**：他说的是"这个概念不重要"，不是"这个词根本不存在"。
+        // 归档是不可逆的"用户否掉"（§6.5），用在一个"重要性"判断上太重了。
+        // 而且 asked_count 会让它最多再被问一次，不会没完没了。
+        if (a.kind == AnswerKind::Reject) {
+            r.outcome = ConfirmOutcome::RejectedUnchanged;
+            r.detail  = u8"已记下 —— 它不会被当作重要概念";
+            return r;
+        }
+
+        // **只改 definition，不走 upsert。**
+        //
+        // 【为什么】upsert 的同值分支会 `hits + 1`，而"用户答了一句它指什么"
+        // **不是又听到一次**。实测走 upsert 之后 `EnglishPod` 的 hits 从 3 变成 4 ——
+        // 上一场会话明明只听到 3 次，界面上却写 4 次。给用户看的数字必须是真数字。
+        if (a.kind == AnswerKind::NewValue) {
+            std::string de;
+            if (!ks.set_definition(q.kind, q.value, a.value, &de)) {
+                r.outcome = ConfirmOutcome::Failed;
+                r.detail  = de.empty() ? u8"写入含义失败" : de;
+                set_err(r.detail);
+                return r;
+            }
+        }
+
+        // 状态：已经是 confirmed 就不必再 set（`can_promote` 里 from == to 返回 false，
+        // 那会让"用户答对了却报失败"—— 这个坑 2.6d 已经踩过一次）。
+        KnowledgeItem cur;
+        const bool known = ks.get(q.kind, knowledge::normalize_key(q.value), &cur);
+        if (!(known && cur.status == "confirmed")) {
+            std::string e2;
+            if (!ks.set_status(q.knowledge_id, "confirmed", "user_confirmed", &e2)) {
+                r.outcome = ConfirmOutcome::Failed;
+                r.detail  = e2.empty() ? u8"确认状态失败" : e2;
+                set_err(r.detail);
+                return r;
+            }
+        }
+
+        if (a.kind == AnswerKind::NewValue) {
+            r.outcome = ConfirmOutcome::ConfirmedNewValue;
+            r.detail  = u8"记住了「" + q.value + u8"」的含义：" + a.value;
+        } else {
+            r.outcome = ConfirmOutcome::ConfirmedExisting;
+            r.detail  = u8"已确认：「" + q.value + u8"」是个重要概念（没记含义）";
         }
         return r;
     }
@@ -440,7 +512,9 @@ ConfirmStats run_confirmation(const std::vector<GapQuestion>& questions,
                 a = ca.answer;
             }
         } else {
-            a = interpret_answer(line);
+            // 「它指什么」要一整句话，所以单独放宽长度上限（见头文件）。
+            a = interpret_answer(line, q.rule == GapRule::AskDefinition
+                                            ? kMaxDefinitionLen : 60);
         }
 
         std::string ae;

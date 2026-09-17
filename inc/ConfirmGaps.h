@@ -62,7 +62,21 @@ struct Answer {
 // 【为什么必须区分 Reject 和 NewValue】把 "n" 当成"用户输入的新值"，
 // 就会把字面量 "no" 写进知识库当专名 —— 数据库污染，而且会进翻译约束。
 // 这个判定不能靠"看起来像不像值"来蒙，必须有明确的是/否词表。
-Answer interpret_answer(const std::string& raw);
+//
+// 【为什么长度上限要能传进来】`max_value_len` 默认 60 字节（专名足够）。
+//
+// 但 2.7 的"它指什么"问的是**一整句话**，而"Compile Once – Run Everywhere，
+// 是我们 eBPF 项目的核心方案"就已经 60+ 字节 —— 用默认上限会让**最自然的回答
+// 被静默判成跳过**，表现为"用户教了但系统什么都没记住"，而且看不出为什么。
+// 所以那条规则单独放宽到 kMaxDefinitionLen。
+//
+// 放宽不等于不设限：上限的作用是防止用户随手粘一整段话进来
+// （那会把一条知识变成一坨文本，而且定义会进摘要背景）。
+Answer interpret_answer(const std::string& raw,
+                        size_t max_value_len = 60);
+
+// 含义类回答的长度上限（字节）。够放一句话，又不至于把整段转录粘进来。
+constexpr size_t kMaxDefinitionLen = 300;
 
 // **选择题**的输入解释（仅 ConflictingSpellings 用）。
 //

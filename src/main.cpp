@@ -2946,7 +2946,12 @@ static int run_selftest(const AppConfig& cfg) {
         using knowledge::KnowledgeWithHistory;
 
         auto mk = [](long long id, const char* status, const char* value,
-                     int hits, double conf, int asked = 0) {
+                     int hits, double conf, int asked = 0,
+                     // 默认给一个非空含义 —— 否则 2.7 新加的"问含义"规则
+                     // 会在**每一**条 term 上都命中，把别的用例的期望条数全打乱，
+                     // 于是每条用例都不再在测它原本要测的东西。
+                     // 要测"没有含义"的用例请显式传空串。
+                     const char* def = u8"（用例占位含义）") {
             KnowledgeWithHistory e;
             e.item.id         = id;
             e.item.kind       = "term";
@@ -2956,6 +2961,7 @@ static int run_selftest(const AppConfig& cfg) {
             e.item.hits       = hits;
             e.item.confidence = conf;
             e.item.asked_count = asked;
+            e.item.definition = def;
             return e;
         };
         auto add_hist = [](KnowledgeWithHistory& e, const char* oldv, const char* newv,
@@ -3093,9 +3099,20 @@ static int run_selftest(const AppConfig& cfg) {
             add_hist(v[0], "Whisper large-v3", "Qwen ASR", "value_changed_demoted");
             add_hist(v[1], "Whisper large-v3", "Qwen ASR", "value_changed_demoted");
             const auto q = knowledge::detect_gaps(v);
-            if (q.size() != 1 || q[0].knowledge_id != 211) {
-                gap_ok = false;
-                why = "confirmed 的条目不该因为历史里有降级记录而被再问";
+            // 【2.7 之后这条断言的边界要收窄】原来断言"confirmed 的一条问题都不出"，
+            // 但"问含义"是**另一个**问题：前者是"同一件事反复问"（§1.3 要防的），
+            // 后者是"这个概念我还没学过"（用户第一次教它就是靠它）。
+            // 所以现在只断言：confirmed 的那条不能再被问**值**的问题。
+            for (const auto& x : q) {
+                if (x.knowledge_id == 210 && x.rule == GapRule::ValueChanged) {
+                    gap_ok = false;
+                    why = "confirmed 的条目不该因为历史里有降级记录而被再问";
+                }
+            }
+            bool has_211 = false;
+            for (const auto& x : q) if (x.knowledge_id == 211) has_211 = true;
+            if (gap_ok && !has_211) {
+                gap_ok = false; why = "没确认过的那条反而没被问";
             }
         }
 
@@ -3173,6 +3190,82 @@ static int run_selftest(const AppConfig& cfg) {
                     gap_ok = false; why = "两字母词被误判成同一个实体";
                 }
             }
+        }
+
+        // ⑮ **没有含义的术语要问"它指什么"** —— 这是闭环的核心那一问（步骤 2.7）
+        //
+        // 【为什么必须有】在它之前，一条知识能表达的全部内容是"这个词该写成什么样"。
+        // 系统能做的只有"把 Erica 认成 Erica"，**永远做不到知道 CO-RE 是什么**。
+        // 而用户能教给系统最有价值的东西恰恰是后者。
+        // 没有这条规则，`knowledge.definition` 那一列永远是空的。
+        {
+            std::vector<KnowledgeWithHistory> v = {
+                mk(300, "candidate", "CO-RE", 1, 0.9, 0, ""),   // 没含义 → 该问
+                mk(301, "candidate", "Phoenix", 1, 0.9, 0, u8"内部代号"),  // 有含义 → 不问
+            };
+            const auto q = knowledge::detect_gaps(v);
+            bool found = false;
+            for (const auto& x : q) {
+                if (x.rule == GapRule::AskDefinition) {
+                    if (found) { gap_ok = false; why = "含义问题出了不止一条"; }
+                    found = true;
+                    if (x.knowledge_id != 300) { gap_ok = false; why = "问错了条目"; }
+                }
+            }
+            if (!found) { gap_ok = false; why = "没有含义的术语没被问「它指什么」"; }
+        }
+
+        // ⑯ **每场最多问一个含义问题** —— 用户要打一整句话，问三个他就不答了
+        //
+        // 这条和"最多问 5 个问题"是两条独立的闸：5 个是总数（§1.3），
+        // 1 个是**开放式**问题的数（选择题按个 y 就行，开放式要打字）。
+        {
+            std::vector<KnowledgeWithHistory> v;
+            for (int i = 0; i < 6; ++i) {
+                v.push_back(mk(400 + i, "candidate", "术语T", 1, 0.9, 0, ""));
+            }
+            const auto q = knowledge::detect_gaps(v, 10);
+            size_t n_def = 0;
+            for (const auto& x : q) if (x.rule == GapRule::AskDefinition) ++n_def;
+            if (n_def > knowledge::kMaxDefinitionAsksPerSession) {
+                gap_ok = false;
+                why = "含义问题超过了每场上限（" + std::to_string(n_def) + " 条）";
+            }
+        }
+
+        // ⑰ **含义绝不进识别提示 / 翻译约束**（它只该进摘要背景和检索）
+        //
+        // 这条是 2.7 最容易写错、而且写错了最难发现的地方：
+        // 一句中文描述混进 Whisper 的 initial_prompt，Whisper 不会报错，
+        // 只会**识别得更差**；而 `constraint_terms` 只检查长度上限。
+        {
+            KnowledgeItem with_def;
+            with_def.kind       = "term";
+            with_def.key        = "co-re";
+            with_def.value      = "CO-RE";
+            with_def.status     = "confirmed";
+            with_def.confidence = 1.0;
+            with_def.definition = u8"Compile Once – Run Everywhere，eBPF 项目的核心方案";
+
+            const auto terms = knowledge::constraint_terms({with_def}, 32);
+            if (terms.size() != 1 || terms[0] != "CO-RE") {
+                gap_ok = false;
+                why = "有含义的术语应只把「写法」交给约束，实际: " +
+                      (terms.empty() ? std::string("(空)") : terms[0]);
+            }
+            for (const auto& t : terms) {
+                if (t.find(u8"Compile") != std::string::npos ||
+                    t.find(u8"eBPF") != std::string::npos) {
+                    gap_ok = false; why = "含义漏进了翻译约束/识别提示";
+                }
+            }
+            // 但它必须进**摘要背景** —— 否则"学了没用上"，闭环在最后一步断掉
+            const auto lines = knowledge::background_lines({with_def}, 8);
+            bool in_bg = false;
+            for (const auto& l : lines) {
+                if (l.find(u8"Compile Once") != std::string::npos) in_bg = true;
+            }
+            if (!in_bg) { gap_ok = false; why = "含义没进摘要背景（用户教了但没用上）"; }
         }
 
         // 【这里刻意不写"共 N 例"】原来写死了 `"✅ 11 例通过"`，

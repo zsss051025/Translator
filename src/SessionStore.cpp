@@ -11,7 +11,13 @@
 namespace {
 
 
-const char* kSchema =
+// 【为什么拆成两段 + 拼起来】FTS 那段 DDL 需要被**第二次**用到：
+// 给 `definition` 加列时，老库的 FTS 表和触发器必须整个重建
+// （`CREATE VIRTUAL TABLE IF NOT EXISTS` 不会给已存在的表加列，
+//   `CREATE TRIGGER IF NOT EXISTS` 同理不会替换触发器），
+// 重建时要用同一份 DDL。抄第二份就是等着两边走散 —— 本项目已经栽过三次。
+// 合并定义放在两个常量**之后**（见 kFtsDdl 末尾）。
+const char* kSchemaCore =
     "CREATE TABLE IF NOT EXISTS sessions ("
     "  id         INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  started_at TEXT NOT NULL,"
@@ -57,6 +63,20 @@ const char* kSchema =
     // 值发生变化时计数会清零（在 upsert 里）—— 那时候问题本身变了，值得再问一次。
     "  asked_count    INTEGER NOT NULL DEFAULT 0,"
     "  last_asked_at  TEXT,"
+    // **含义 / 定义**（2026-09-17 补，步骤 2.7）。
+    //
+    // 【为什么 knowledge 表必须有这一列 —— 这是"闭环"最要紧的一环】
+    // 在它之前，一条知识能表达的全部内容是"这个词该写成什么样"（key → value 的写法映射）。
+    // 于是系统能做的只有"把 Erica 认成 Erica"，永远做不到**知道 CO-RE 是什么**。
+    // 而"越用越懂你"的真实价值恰恰在后一半：
+    //     第一次会议：用户提到 CO-RE，系统只知道多了个陌生词
+    //     问用户 →「指 Compile Once – Run Everywhere，我们 eBPF 项目的核心方案」
+    //     第二次会议：摘要背景里带上这句，模型就知道 CO-RE 不是错别字、是技术方案
+    //
+    // 【它绝不进识别提示 / 翻译约束】一句定义塞进 Whisper 的 initial_prompt
+    // 只会挤掉真正的专名（那串有 224 token 预算），对识别也毫无帮助。
+    // 它的出口只有两个：**摘要背景**和**检索**（`search_knowledge`）。
+    "  definition     TEXT,"
     "  first_seen_at  TEXT NOT NULL,"
     "  updated_at     TEXT NOT NULL,"
     // 证据：哪次会话、哪一段、原话。不可省——每条知识都要能回答"你凭什么这么说"
@@ -94,18 +114,22 @@ const char* kSchema =
     "  created_at     TEXT NOT NULL,"
     "  updated_at     TEXT NOT NULL"
     ");"
-    "CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status);"
+    "CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status);";
 
-    // FTS5 全文索引（--ask 用）。
-    //
-    // 【为什么必须有这一条】它同时验证了 SQLITE_ENABLE_FTS5 宏真的生效了 ——
-    // 宏没定义时这句会直接报 "no such module: fts5"，schema 执行失败、整个程序起不来，
-    // 而不是等用到 --ask 时才发现。
-    //
-    // 用 content='' 的外部内容表（contentless）不合适，因为知识条目会被改写；
-    // 这里就用普通 FTS5 表，写入时由 KnowledgeStore 同步。
+// FTS5 全文索引（--ask / search_knowledge / 定义检索）。
+//
+// 【为什么必须有这一条】它同时验证了 SQLITE_ENABLE_FTS5 宏真的生效了 ——
+// 宏没定义时这句会直接报 "no such module: fts5"，schema 执行失败、整个程序起不来，
+// 而不是等用到 --ask 时才发现。
+//
+// 用 content='' 的外部内容表（contentless）不合适，因为知识条目会被改写；
+// 这里就用普通 FTS5 表，写入时由 KnowledgeStore 同步。
+const char* kFtsDdl =
     "CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5("
-    "  key, value, source_text,"
+    // definition 也要进索引：用户答的那句话（"Compile Once – Run Everywhere"）
+    // 是**检索时最该命中的内容** —— 它在转录里根本不存在，
+    // 不索引它就等于"用户教会了系统、系统却检索不到"。
+    "  key, value, definition, source_text,"
     "  content='knowledge', content_rowid='id',"
     "  tokenize='unicode61'"                       // unicode61 对中英混排都能用
     ");"
@@ -122,19 +146,21 @@ const char* kSchema =
     //
     // 触发器是官方推荐的写法，而且把"不能忘、不能写错"变成了数据库自己的责任。
     "CREATE TRIGGER IF NOT EXISTS knowledge_ai AFTER INSERT ON knowledge BEGIN"
-    "  INSERT INTO knowledge_fts(rowid,key,value,source_text)"
-    "  VALUES (new.id,new.key,new.value,new.source_text);"
+    "  INSERT INTO knowledge_fts(rowid,key,value,definition,source_text)"
+    "  VALUES (new.id,new.key,new.value,new.definition,new.source_text);"
     "END;"
     "CREATE TRIGGER IF NOT EXISTS knowledge_ad AFTER DELETE ON knowledge BEGIN"
-    "  INSERT INTO knowledge_fts(knowledge_fts,rowid,key,value,source_text)"
-    "  VALUES ('delete',old.id,old.key,old.value,old.source_text);"
+    "  INSERT INTO knowledge_fts(knowledge_fts,rowid,key,value,definition,source_text)"
+    "  VALUES ('delete',old.id,old.key,old.value,old.definition,old.source_text);"
     "END;"
     "CREATE TRIGGER IF NOT EXISTS knowledge_au AFTER UPDATE ON knowledge BEGIN"
-    "  INSERT INTO knowledge_fts(knowledge_fts,rowid,key,value,source_text)"
-    "  VALUES ('delete',old.id,old.key,old.value,old.source_text);"
-    "  INSERT INTO knowledge_fts(rowid,key,value,source_text)"
-    "  VALUES (new.id,new.key,new.value,new.source_text);"
+    "  INSERT INTO knowledge_fts(knowledge_fts,rowid,key,value,definition,source_text)"
+    "  VALUES ('delete',old.id,old.key,old.value,old.definition,old.source_text);"
+    "  INSERT INTO knowledge_fts(rowid,key,value,definition,source_text)"
+    "  VALUES (new.id,new.key,new.value,new.definition,new.source_text);"
     "END;";
+
+const std::string kSchema = std::string(kSchemaCore) + kFtsDdl;
 
 }  // namespace
 
@@ -181,7 +207,7 @@ bool SessionStore::init(const std::string& db_path) {
     }
 
     char* err = nullptr;
-    rc = sqlite3_exec(db_, kSchema, nullptr, nullptr, &err);
+    rc = sqlite3_exec(db_, kSchema.c_str(), nullptr, nullptr, &err);
     if (rc != SQLITE_OK) {
         std::cerr << "[DB] schema failed: " << (err ? err : "?") << std::endl;
         if (err) sqlite3_free(err);
@@ -224,6 +250,10 @@ bool SessionStore::ensure_schema() {
         const ColumnFix fixes[] = {
             {"knowledge", "asked_count",   "ALTER TABLE knowledge ADD COLUMN asked_count INTEGER NOT NULL DEFAULT 0;"},
             {"knowledge", "last_asked_at", "ALTER TABLE knowledge ADD COLUMN last_asked_at TEXT;"},
+            // 2.7：含义/定义。**这一列的缺失后果最隐蔽** ——
+            // 老库不会有报错，只是"用户教会它的东西无处可存"，
+            // 表现为问完定义之后 `--terms` 里什么都没有。
+            {"knowledge", "definition",    "ALTER TABLE knowledge ADD COLUMN definition TEXT;"},
         };
         for (const auto& fx : fixes) {
             const std::string pragma = std::string("PRAGMA table_info(") + fx.table + ");";
@@ -250,6 +280,64 @@ bool SessionStore::ensure_schema() {
                 if (alt_err) sqlite3_free(alt_err);
                 return false;
             }
+        }
+    }
+
+    // ---- FTS 索引的重建迁移（2.7）----
+    //
+    // 【为什么 ALTER TABLE 不够】`definition` 加进了 FTS 的列清单，
+    // 但 `CREATE VIRTUAL TABLE IF NOT EXISTS` 对已存在的表是空操作、
+    // `CREATE TRIGGER IF NOT EXISTS` 同理不会替换触发器 ——
+    // 于是老库里会出现最难看的一种状态：**内容表有 definition 列、索引里没有**，
+    // 查询不报错，只是永远搜不到用户教它的那句话。
+    //
+    // 【做法】整块 DROP 再按同一份 kFtsDdl 建回来，最后 rebuild 从内容表灌数据。
+    // 内容表（knowledge）一个字都不动 —— 索引是可重建的派生数据。
+    {
+        bool need = false;
+        sqlite3_stmt* st = nullptr;
+        if (sqlite3_prepare_v2(db_, "PRAGMA table_info(knowledge_fts);", -1, &st, nullptr) == SQLITE_OK) {
+            bool has_def = false, any = false;
+            while (sqlite3_step(st) == SQLITE_ROW) {
+                any = true;
+                const unsigned char* name = sqlite3_column_text(st, 1);
+                if (name && std::strcmp(reinterpret_cast<const char*>(name), "definition") == 0) {
+                    has_def = true;
+                    break;
+                }
+            }
+            sqlite3_finalize(st);
+            need = any && !has_def;
+        }
+        if (need) {
+            std::cout << "[DB] knowledge_fts 缺少 definition 列，正在重建索引"
+                         "（内容表不动，索引是可重建的派生数据）..." << std::endl;
+            const char* ddl =
+                "DROP TRIGGER IF EXISTS knowledge_ai;"
+                "DROP TRIGGER IF EXISTS knowledge_ad;"
+                "DROP TRIGGER IF EXISTS knowledge_au;"
+                "DROP TABLE IF EXISTS knowledge_fts;";
+            char* derr = nullptr;
+            if (sqlite3_exec(db_, ddl, nullptr, nullptr, &derr) != SQLITE_OK) {
+                std::cerr << "[DB] 重建 FTS 失败（DROP）: " << (derr ? derr : "?") << std::endl;
+                if (derr) sqlite3_free(derr);
+                return false;
+            }
+            char* cerr2 = nullptr;
+            if (sqlite3_exec(db_, kFtsDdl, nullptr, nullptr, &cerr2) != SQLITE_OK) {
+                std::cerr << "[DB] 重建 FTS 失败（CREATE）: " << (cerr2 ? cerr2 : "?") << std::endl;
+                if (cerr2) sqlite3_free(cerr2);
+                return false;
+            }
+            // 内容表的数据灌回索引
+            char* rerr = nullptr;
+            if (sqlite3_exec(db_, "INSERT INTO knowledge_fts(knowledge_fts) VALUES('rebuild');",
+                             nullptr, nullptr, &rerr) != SQLITE_OK) {
+                std::cerr << "[DB] rebuild 失败: " << (rerr ? rerr : "?") << std::endl;
+                if (rerr) sqlite3_free(rerr);
+                return false;
+            }
+            std::cout << "[DB] FTS 索引已重建" << std::endl;
         }
     }
 

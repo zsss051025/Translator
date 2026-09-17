@@ -6,6 +6,7 @@
 #include <iostream>
 
 #include "SessionStore.h"   // 复用 db_ 与 now_string()
+#include "Utf8.h"           // 背景里的含义要按字符边界截断
 
 // sqlite3 的声明。SessionStore.h 里只做了前向声明，这里需要真正的 API。
 #include "sqlite3.h"
@@ -340,7 +341,26 @@ std::vector<std::string> background_lines(const std::vector<KnowledgeItem>& item
         }
         if (dup) continue;
         seen_keys.push_back(dk);
-        out.push_back("- " + k->value + u8"（" + kind_label_zh(k->kind) + u8"）");
+        // **含义进背景，这是"第二次会议受益"真正的落点。**
+        //
+        // 没有它，背景行只有「CO-RE（术语）」——模型知道"这是个该保留原样的词"，
+        // 但不知道它是什么。用户教会系统的那句
+        // 「Compile Once – Run Everywhere，我们 eBPF 项目的核心方案」
+        // 如果不进背景，就等于**学了但没用上**，闭环在最后一步断掉。
+        //
+        // 限长：背景是给模型的陈述，不是档案。一句定义塞太长会挤掉转录本身
+        //（user content 有预算，见 LlmSummarizer）。超长的截断并显式标注，
+        // 让模型知道后面还有。
+        constexpr size_t kMaxDefChars = 200;
+        std::string line = "- " + k->value + u8"（" + kind_label_zh(k->kind) + u8"）";
+        if (!k->definition.empty()) {
+            std::string d = k->definition;
+            if (d.size() > kMaxDefChars) {
+                d = utf8::truncate(d, kMaxDefChars, u8"…");
+            }
+            line += u8"：" + d;
+        }
+        out.push_back(line);
     }
     return out;
 }
@@ -414,6 +434,25 @@ long long KnowledgeStore::upsert(const KnowledgeItem& item, std::string* err,
         sqlite3_finalize(st);
     }
 
+    // 只在调用方**给了**含义时才动 definition 那一列。
+    //
+    // 【为什么单独一条 UPDATE、而不是塞进上面两条】含义描述的是**这个实体**，
+    // 不是"这一次的写法"：值变了（Erika → Erica）含义照样成立，不该被清掉；
+    // 而调用方不给含义时（绝大多数写入路径）也绝不能把它覆盖成空 ——
+    // 那等于"用户教过的东西被下一次自动抽取抹掉"，而且**用户看不出来**。
+    auto write_definition = [&](long long id) {
+        if (item.definition.empty()) return;
+        sqlite3_stmt* st = nullptr;
+        if (sqlite3_prepare_v2(db, "UPDATE knowledge SET definition = ?, updated_at = ? WHERE id = ?;",
+                               -1, &st, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text (st, 1, item.definition.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text (st, 2, ts.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(st, 3, id);
+            sqlite3_step(st);
+            sqlite3_finalize(st);
+        }
+    };
+
     // 会话内的出现次数由调用方给（抽取器知道"这个名字这场听到了几次"）。
     //
     // 【为什么不能像第一版那样写死 1】写死会让两个东西失准：
@@ -428,9 +467,9 @@ long long KnowledgeStore::upsert(const KnowledgeItem& item, std::string* err,
         sqlite3_stmt* st = nullptr;
         const char* sql =
             "INSERT INTO knowledge"
-            "(kind,key,value,status,confidence,hits,first_seen_at,updated_at,"
+            "(kind,key,value,definition,status,confidence,hits,first_seen_at,updated_at,"
             " source_session,source_seq,source_text) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?);";
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?);";
         if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) {
             set_err(std::string("插入失败: ") + sqlite3_errmsg(db));
             return -1;
@@ -438,14 +477,18 @@ long long KnowledgeStore::upsert(const KnowledgeItem& item, std::string* err,
         sqlite3_bind_text  (st, 1, item.kind.c_str(),  -1, SQLITE_TRANSIENT);
         sqlite3_bind_text  (st, 2, key.c_str(),        -1, SQLITE_TRANSIENT);
         sqlite3_bind_text  (st, 3, item.value.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text  (st, 4, status.c_str(),     -1, SQLITE_TRANSIENT);
-        sqlite3_bind_double(st, 5, item.confidence);
-        sqlite3_bind_int   (st, 6, initial_hits);
-        sqlite3_bind_text  (st, 7, ts.c_str(), -1, SQLITE_TRANSIENT);
+        // definition 为空时绑 NULL，不要绑空串 ——
+        // 后面判"有没有教过含义"用的是 is_null/empty 两种情况都要算"没有"。
+        if (item.definition.empty()) sqlite3_bind_null(st, 4);
+        else sqlite3_bind_text(st, 4, item.definition.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text  (st, 5, status.c_str(),     -1, SQLITE_TRANSIENT);
+        sqlite3_bind_double(st, 6, item.confidence);
+        sqlite3_bind_int   (st, 7, initial_hits);
         sqlite3_bind_text  (st, 8, ts.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64 (st, 9, item.source_session);
-        sqlite3_bind_int64 (st, 10, item.source_seq);
-        sqlite3_bind_text  (st, 11, item.source_text.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text  (st, 9, ts.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64 (st, 10, item.source_session);
+        sqlite3_bind_int64 (st, 11, item.source_seq);
+        sqlite3_bind_text  (st, 12, item.source_text.c_str(), -1, SQLITE_TRANSIENT);
 
         const int rc = sqlite3_step(st);
         sqlite3_finalize(st);
@@ -473,6 +516,7 @@ long long KnowledgeStore::upsert(const KnowledgeItem& item, std::string* err,
             sqlite3_step(st);
             sqlite3_finalize(st);
         }
+        write_definition(old.id);
         return old.id;
     }
 
@@ -535,6 +579,7 @@ long long KnowledgeStore::upsert(const KnowledgeItem& item, std::string* err,
         }
     }
     // 全文索引跟着改：由 knowledge 上的 AFTER UPDATE 触发器负责，这里不写任何 FTS 语句。
+    write_definition(old.id);
     return old.id;
 }
 
@@ -550,7 +595,7 @@ bool KnowledgeStore::get(const std::string& kind, const std::string& key,
     sqlite3_stmt* st = nullptr;
     const char* sql =
         "SELECT id,kind,key,value,status,confidence,hits,first_seen_at,updated_at,"
-        "source_session,source_seq,source_text,asked_count,last_asked_at FROM knowledge "
+        "source_session,source_seq,source_text,asked_count,last_asked_at,definition FROM knowledge "
         "WHERE kind = ? AND key = ?;";
     if (sqlite3_prepare_v2(ss.db_, sql, -1, &st, nullptr) != SQLITE_OK) return false;
     sqlite3_bind_text(st, 1, kind.c_str(), -1, SQLITE_TRANSIENT);
@@ -577,13 +622,53 @@ bool KnowledgeStore::get(const std::string& kind, const std::string& key,
         out->source_text    = text(11);
         out->asked_count    = sqlite3_column_int(st, 12);
         out->last_asked_at  = text(13);
+        out->definition     = text(14);
     }
     sqlite3_finalize(st);
     return found;
 }
 
-std::vector<KnowledgeItem> KnowledgeStore::list(const std::string& status, int limit) const {
-    std::vector<KnowledgeItem> out;
+bool KnowledgeStore::set_definition(const std::string& kind, const std::string& key,
+                                    const std::string& definition, std::string* err) {
+    auto set_err = [&](const std::string& m) { if (err) *err = m; };
+    if (definition.empty()) {
+        set_err(u8"含义为空 —— 不写（空含义不等于「用户说它没有含义」）");
+        return false;
+    }
+    SessionStore& ss = SessionStore::instance();
+    std::lock_guard<std::mutex> lock(ss.mutex_);
+    if (ss.db_ == nullptr) { set_err(u8"库未打开"); return false; }
+
+    const std::string nk = knowledge::normalize_key(key);
+    sqlite3_stmt* st = nullptr;
+    const char* sql = "UPDATE knowledge SET definition = ?, updated_at = ? "
+                      "WHERE kind = ? AND key = ?;";
+    if (sqlite3_prepare_v2(ss.db_, sql, -1, &st, nullptr) != SQLITE_OK) {
+        set_err(std::string("准备失败: ") + sqlite3_errmsg(ss.db_));
+        return false;
+    }
+    const std::string ts = SessionStore::now_string();
+    sqlite3_bind_text (st, 1, definition.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (st, 2, ts.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (st, 3, kind.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (st, 4, nk.c_str(), -1, SQLITE_TRANSIENT);
+    const int rc = sqlite3_step(st);
+    const int changed = sqlite3_changes(ss.db_);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) {
+        set_err(std::string("写入失败: ") + sqlite3_errmsg(ss.db_));
+        return false;
+    }
+    if (changed == 0) {
+        // 没有对应行 —— 不建新行（含义必须附着在一条已有知识上）
+        set_err(u8"库里没有这条知识，含义无处附着");
+        return false;
+    }
+    // FTS 索引由 knowledge 上的 AFTER UPDATE 触发器自动跟上，这里不写任何 FTS 语句。
+    return true;
+}
+
+std::vector<KnowledgeItem> KnowledgeStore::list(const std::string& status, int limit) const {    std::vector<KnowledgeItem> out;
 
     SessionStore& ss = SessionStore::instance();
     std::lock_guard<std::mutex> lock(ss.mutex_);
@@ -591,7 +676,7 @@ std::vector<KnowledgeItem> KnowledgeStore::list(const std::string& status, int l
 
     std::string sql =
         "SELECT id,kind,key,value,status,confidence,hits,first_seen_at,updated_at,"
-        "source_session,source_seq,source_text,asked_count,last_asked_at FROM knowledge";
+        "source_session,source_seq,source_text,asked_count,last_asked_at,definition FROM knowledge";
     if (!status.empty()) sql += " WHERE status = ?";
     sql += " ORDER BY hits DESC, updated_at DESC LIMIT ?;";
 
@@ -621,6 +706,7 @@ std::vector<KnowledgeItem> KnowledgeStore::list(const std::string& status, int l
         k.source_text    = text(11);
         k.asked_count    = sqlite3_column_int(st, 12);
         k.last_asked_at  = text(13);
+        k.definition     = text(14);
         out.push_back(std::move(k));
     }
     sqlite3_finalize(st);
@@ -651,7 +737,7 @@ std::vector<KnowledgeItem> KnowledgeStore::search(const std::string& query, int 
     const char* sql =
         "SELECT k.id,k.kind,k.key,k.value,k.status,k.confidence,k.hits,"
         "       k.first_seen_at,k.updated_at,k.source_session,k.source_seq,k.source_text,"
-        "       k.asked_count,k.last_asked_at "
+        "       k.asked_count,k.last_asked_at,k.definition "
         "FROM knowledge_fts JOIN knowledge k ON k.id = knowledge_fts.rowid "
         "WHERE knowledge_fts MATCH ? "
         "ORDER BY rank LIMIT ?;";
@@ -685,6 +771,7 @@ std::vector<KnowledgeItem> KnowledgeStore::search(const std::string& query, int 
         k.source_text    = text(11);
         k.asked_count    = sqlite3_column_int(st, 12);
         k.last_asked_at  = text(13);
+        k.definition     = text(14);
         out.push_back(std::move(k));
     }
     sqlite3_finalize(st);

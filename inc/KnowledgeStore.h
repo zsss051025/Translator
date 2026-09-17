@@ -24,6 +24,19 @@ struct KnowledgeItem {
     double      confidence     = 0.0;
     int         hits           = 0;    // 被听到过多少次（决定"该问什么"的排序）
 
+    // **含义 / 定义**（步骤 2.7）。
+    //
+    // 【为什么必须有这个字段 —— 它是闭环里"越用越懂你"真正的内容】
+    // 没有它，一条知识能表达的全部内容是"这个词该写成什么样"（key → value）。
+    // 于是系统只能做到"把 Erica 认成 Erica"，**永远做不到"知道 CO-RE 是什么"**。
+    // 而用户能教给系统的最有价值的东西恰恰是后者：
+    //     CO-RE = Compile Once – Run Everywhere，我们 eBPF 项目的核心方案
+    //
+    // 【出口只有两个】摘要背景 + 检索。
+    // **绝不进识别提示 / 翻译约束** —— 一句定义塞进 Whisper 的 initial_prompt
+    // 只会挤掉真正的专名（那串只有 224 token 预算），对识别毫无帮助。
+    std::string definition;
+
     // 问过用户几次 / 最后一次是什么时候（§1.3：提问是稀缺资源）
     // 没有这两个字段，用户跳过的同一个问题会每次会话原样再问一遍。
     int         asked_count    = 0;
@@ -151,6 +164,18 @@ public:
     bool mark_asked(long long id, std::string* err = nullptr);
 
     bool get(const std::string& kind, const std::string& key, KnowledgeItem* out) const;
+
+    // 只写"含义"这一列，**不动其它任何字段**。
+    //
+    // 【为什么不能走 upsert】upsert 会顺手把 `hits + 1`（同值分支）。
+    // 而"用户答了一句它指什么"**不是又听到一次** —— 走 upsert 的话，
+    // 库里显示"这场听到 3 次"会变成 4 次，那是**给用户看的错数字**
+    // （实测：答完 EnglishPod 的含义，hits 从 3 变成 4）。
+    // 这个项目对"界面上显示的数字是真的"很在意，所以宁可为它单开一条写路径。
+    //
+    // 只做一件事：UPDATE definition。没有对应行时返回 false（不建新行）。
+    bool set_definition(const std::string& kind, const std::string& key,
+                        const std::string& definition, std::string* err = nullptr);
 
     // 按状态列条目。status 为空表示不过滤。
     std::vector<KnowledgeItem> list(const std::string& status = "", int limit = 200) const;

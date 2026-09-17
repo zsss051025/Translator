@@ -22,12 +22,13 @@
 
 namespace knowledge {
 
-// 六条规则
+// 七条规则
 enum class GapRule {
     ValueChanged,            // 旧值 ≠ 新值：与已有 Confirmed 值冲突（§6.6 第四条）
     ConflictingSpellings,    // 同一个实体的两种写法（Erica / Erika）—— 见下面 struct 的说明
     InconsistentRendering,   // 译法不一致：同一个键的值变过多次（§6.6 第一条）
     HighFreqUnconfirmed,     // 高频未确认：hits >= 3 却还是 candidate（§6.6 第二条）
+    AskDefinition,           // 术语还没有含义 —— 问"它指什么"（§6.4③，闭环的核心）
     NewlySeen,               // 本场第一次见到的专名（§6.4① 自动抽取的出口）
     LowConfidenceName,       // 低置信度专名：confidence < 0.5（§6.6 第三条）
 };
@@ -93,6 +94,16 @@ constexpr size_t kMaxQuestionsDefault = 5;      // §1.3 红线：最多问 5 �
 // 用户第一次可能没想好（允许再问一次），第二次还是跳过说明他不关心。
 // 值发生变化时计数清零（KnowledgeStore::upsert），那时值得重新问。
 constexpr int    kMaxAsks             = 2;
+
+// **每场会话最多问几个"它指什么"**。
+//
+// 【为什么单独限一个更小的数】别的规则是选择题（按 y / 输个编号），
+// 而"CO-RE 指什么"要求用户**打一句话**。一场会问三个这种问题，
+// 用户就不答了 —— 直接违反 §1.3。所以定义类问题**每场最多 1 个**，
+// 排在靠前的位置（它是唯一能真正让系统"懂"点什么的问题）。
+//
+// 剩下的术语不会丢：下次会话接着问，一次一个，until 每个都问过（kMaxAsks 为上限）。
+constexpr size_t kMaxDefinitionAsksPerSession = 1;
 
 // **核心纯函数**：输入知识+历史，输出候选问题。
 // 不碰数据库、不碰模型、不依赖时间 —— 所以能进 L1 自检。
