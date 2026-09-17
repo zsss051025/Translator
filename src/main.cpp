@@ -2083,6 +2083,113 @@ static int run_selftest(const AppConfig& cfg) {
                     return 1;
                 }
 
+                // ---- ⑨ 中文专名抽取（R6/R7）----
+                //
+                // 【为什么必须有这一组】中文没有大小写、没有词边界 —— 英文那套规则
+                // 在中文里一条都用不上。结果就是中文会议里「张伟负责下周的报价」
+                // 一个候选都抽不出来 → 知识库不长 → 没问题可问 → 三条腿没输入
+                // → "越用越懂你"在中文场景下完全不成立。
+                //
+                // ⚠️ **这些用例是我写的，不是真实 ASR 输出**（§8.8⑨ 的教训要求用真数据）。
+                // 中文侧现在没有真实录音可用，所以这一组只验"规则在中文会议语言形状上
+                // 认不认得出"。**真实 ASR 输出上的准确率还要靠录一场中文会议来验**
+                // （录完跑 `--extract <id>`）。这一点在 STATE.md 里标了 ⚠️。
+                {
+                    bool z_ok = true;
+                    std::string whyz;
+                    auto mkz = [](int seq, const char* src) {
+                        Segment s;
+                        s.seq        = seq;
+                        s.src_text   = src;
+                        s.confidence = 0.85;
+                        return s;
+                    };
+                    auto hasz = [](const std::vector<ExtractedCandidate>& v, const char* k) {
+                        for (const auto& c : v) if (c.key == k) return true;
+                        return false;
+                    };
+                    auto kindz = [](const std::vector<ExtractedCandidate>& v, const char* k)
+                                    -> std::string {
+                        for (const auto& c : v) if (c.key == k) return c.kind;
+                        return {};
+                    };
+
+                    // 一场"像样"的中文周会片段
+                    const std::vector<Segment> segs = {
+                        mkz(1, u8"大家好，今天这个会我们主要讨论三件事。"),
+                        mkz(2, u8"张伟负责下周的报价，李经理跟进客户那边的反馈。"),
+                        mkz(3, u8"凤凰项目的排期由王工来定，星辰科技那边也在等我们的回复。"),
+                        mkz(4, u8"另外李小明提出，交付计划要不要往后挪一周。"),
+                        mkz(5, u8"这个项目需要延期，于是我们就成为了负责人。"),
+                        mkz(6, u8"张总说下周五之前必须给出结论。"),
+                        mkz(7, u8"星辰科技的对接人是王老师，凤凰项目下周启动。"),
+                        mkz(8, u8"好处是我们不用重新做，他说的对。"),
+                        mkz(9, u8"施工队那边今天进不了场，工具还没到位。"),
+                    };
+                    const auto c = extract_candidates(segs, 1);
+
+                    // 该抽到的（8 个）
+                    struct Want { const char* key; const char* kind; };
+                    const Want want[] = {
+                        {u8"张伟",     "person"},
+                        {u8"李经理",   "person"},
+                        {u8"李小明",   "person"},
+                        {u8"张总",     "person"},
+                        {u8"王工",     "person"},
+                        {u8"王老师",   "person"},
+                        {u8"凤凰项目", "term"},
+                        {u8"星辰科技", "term"},
+                    };
+                    for (const auto& w : want) {
+                        if (!z_ok) break;
+                        const std::string k = knowledge::normalize_key(w.key);
+                        if (!hasz(c, k.c_str())) {
+                            z_ok = false;
+                            whyz = std::string(u8"该抽到却漏了：") + w.key;
+                        } else if (kindz(c, k.c_str()) != w.kind) {
+                            z_ok = false;
+                            whyz = std::string(u8"kind 不对：") + w.key + u8"（应为 "
+                                   + w.kind + u8"，实际 " + kindz(c, k.c_str()) + u8"）";
+                        }
+                    }
+
+                    // 绝不能抽到的
+                    const char* never[] = {
+                        u8"交付计划",   // 后缀表里刻意没收"计划"
+                        u8"这个项目",   // 泛指前缀 + 弱后缀
+                        u8"于是",       // 黑名单（于 是姓氏）
+                        u8"成为",       // 黑名单（成 是姓氏）
+                        u8"边的",       // 人名里不能含虚词（"那边 的 反馈"）
+                        u8"施工",       // 施 是姓氏、工 是称谓 → 必须被黑名单挡住
+                        u8"工作", u8"工具", u8"好处",
+                    };
+                    for (const char* bad : never) {
+                        if (!z_ok) break;
+                        const std::string k = knowledge::normalize_key(bad);
+                        if (hasz(c, k.c_str())) {
+                            z_ok = false;
+                            whyz = std::string(u8"不该抽到却抽了：") + bad;
+                        }
+                    }
+
+                    // 次数必须准：凤凰项目/星辰科技 各出现 2 次
+                    if (z_ok) {
+                        for (const auto& x : c) {
+                            if (x.key == knowledge::normalize_key(u8"星辰科技") && x.hits != 2) {
+                                z_ok = false;
+                                whyz = u8"星辰科技 出现次数应为 2，实际 " + std::to_string(x.hits);
+                            }
+                        }
+                    }
+
+                    std::cout << "[SelfTest] 中文专名抽取（姓氏+佐证 / 后缀 / 假阳性拦截）: "
+                              << (z_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+                    if (!z_ok) {
+                        std::cerr << "    " << whyz << std::endl;
+                        return 1;
+                    }
+                }
+
                 // ⑧ **调用方给的 hits 必须被采信**（不是固定算 1）
                 //
                 // 【这条是被真数据抓出来的】抽取器算出「Erica 这场出现 2 次」，
