@@ -13,6 +13,7 @@
 #include "DeepSeekTranslator.h"
 #include "audio_capture.h"
 #include "SpeechEngine.h"
+#include "ModelLog.h"
 #include "SessionStore.h"
 #include "KnowledgeStore.h"
 #include "KnowledgeGap.h"
@@ -3745,6 +3746,14 @@ int main(int argc, char** argv) {
     system("chcp 65001");
 
     AppConfig cfg = AppConfig::from(argc, argv);
+
+    // **必须在任何模型加载之前**装好日志过滤。
+    //
+    // 实测一次真实启动，模型加载阶段会打几百行 control token / tensor / KV cache，
+    // 把 `>>> 已开始记录 <<<` 那两行埋在里面 —— 用户不知道自己该什么时候开始放视频。
+    // 放在 cfg.dump() 之前，是为了让 `--list` 这类不加载模型的路径也保持一致行为。
+    modellog::install_silencer(cfg.verbose);
+
     cfg.dump();
     if (cfg.list_only) return 0;
     if (cfg.selftest)  return run_selftest(cfg);

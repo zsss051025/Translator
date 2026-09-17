@@ -18,6 +18,16 @@ struct AppConfig {
     bool        demo_session = false; // --demo-session：写入一场演示会话后退出（用于验证导出）
     bool        test_window  = false; // --test-window：只弹悬浮字幕窗看外观，不加载模型/不采集音频
 
+    // --verbose：保留 llama.cpp / whisper.cpp 的**全部**加载日志。
+    //
+    // 默认它们是**关掉**的（只留警告和错误）。实测一次真实启动会打几百行
+    // control token / tensor / KV cache，把
+    //     >>> 已开始记录 <<<
+    // 那一行埋在中间 —— 用户不知道自己该什么时候开始放视频，
+    // 猜错几秒就意味着那几秒的音频没被录到。
+    // 排查"模型加载失败 / 显存不够"时才需要打开它。
+    bool        verbose      = false;
+
     // --wav <文件>：不采集真实音频，改为回放一个 WAV 走完整管线。
     //
     // 它存在的理由不是"多一个输入源"，而是**让端到端可复现**：
