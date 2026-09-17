@@ -71,13 +71,9 @@ std::string last_demoted_old(const std::vector<KnowledgeStore::HistoryRow>& hist
     return {};
 }
 
-std::string fmt_conf(double c) {
-    std::ostringstream oss;
-    oss.setf(std::ios::fixed);
-    oss.precision(2);
-    oss << c;
-    return oss.str();
-}
+// 【fmt_conf 已删除】它唯一的作用是把 confidence 格式化进面向用户的句子里
+//（「识别置信度只有 0.40」）。文案搬去 Interaction 之后这个函数没有调用者了 ——
+// 而它没有调用者正好说明**内部数值不再出现在任何给用户看的文本里**。
 
 // ---- 同一个实体的多种写法（ConflictingSpellings）---------------------------
 
@@ -184,29 +180,20 @@ std::vector<GapQuestion> detect_gaps(const std::vector<KnowledgeWithHistory>& en
             q.value        = first.value;
             q.hits         = first.hits;
 
-            std::string opts, in_use;
-            for (size_t gi = 0; gi < group.size(); ++gi) {
-                const KnowledgeItem& it = entries[group[gi]].item;
+            for (const size_t gi : group) {
+                // ⚠️ `gi` **就是** entries 的下标（group 里装的是下标）。
+                // 2.8 改写这段时我写成了 `entries[group[gi]]` —— 多套了一层，
+                // 于是选项顺序被打乱（自检报 `Erika(2) Erica(3)`，没按 hits 排），
+                // 而且 gi 一大就越界。自检抓住的就是这个。
+                const KnowledgeItem& it = entries[gi].item;
                 GapQuestion::Alt alt;
                 alt.knowledge_id = it.id;
                 alt.value        = it.value;
                 alt.hits         = it.hits;
                 q.alternatives.push_back(alt);
-                covered[group[gi]] = true;
-
-                if (gi) opts += u8"　";
-                opts += std::to_string(gi + 1) + u8") " + it.value +
-                        u8"（听到 " + std::to_string(it.hits) + u8" 次）";
-                if (it.status == "confirmed") in_use = it.value;
+                covered[gi] = true;
+                if (it.status == "confirmed") q.in_use = it.value;
             }
-
-            // 把冲突摆出来是这个问题**全部的价值**（见头文件里 alternatives 的说明）。
-            std::string tail;
-            if (!in_use.empty()) {
-                tail = u8"现在按「" + in_use + u8"」在用。";
-            }
-            q.question = u8"我这儿记了 " + std::to_string(q.alternatives.size()) +
-                         u8" 种写法：" + opts + u8"。是同一个吗？哪个对？" + tail;
             out.push_back(std::move(q));
         }
     }
@@ -247,12 +234,9 @@ std::vector<GapQuestion> detect_gaps(const std::vector<KnowledgeWithHistory>& en
         if (k.status != "confirmed" && has_demote_record(e.history)) {
             q.rule      = GapRule::ValueChanged;
             q.old_value = last_demoted_old(e.history);
-            q.question  = u8"这个改过：「" + q.old_value + u8"」→「" + k.value +
-                          u8"」。以后都用「" + k.value + u8"」吗？";
             hit = true;
         } else if (k.status == "candidate" && distinct_values(e.history) >= 2) {
             q.rule     = GapRule::InconsistentRendering;
-            q.question = u8"「" + k.value + u8"」的写法变过好几次。固定成哪一种？";
             hit = true;
         } else if (k.kind == "term" && k.definition.empty() &&
                    (k.status == "confirmed" || k.hits >= 1)) {
@@ -278,26 +262,11 @@ std::vector<GapQuestion> detect_gaps(const std::vector<KnowledgeWithHistory>& en
             // 用户要打一整句话，问三个他就不答了。
             if (def_asked < kMaxDefinitionAsksPerSession) {
                 q.rule = GapRule::AskDefinition;
-                q.question = u8"你提到了「" + k.value +
-                             u8"」。它是你们项目里的重要概念吗？是的话，它指什么？";
                 hit = true;
                 ++def_asked;
             }
         } else if (k.status == "candidate" && k.hits >= kHighFreqHits) {
             q.rule     = GapRule::HighFreqUnconfirmed;
-            // 【措辞】旧版是「已经听到 N 次「X」，一直没确认过。它是对的说法吗？」
-            //
-            // 两个毛病（用户原话：「感觉根本不是人类的会问出的东西」）：
-            //   ① 「说法」说的是**措辞/论断**，用来指一个专名是词不达意。
-            //      问一个名字"这个说法对吗"，等于问"这句话是真的吗"。
-            //   ② 更根本的：用户在听音频，他**没法知道**这个词该拼成什么样。
-            //      真正属于他的决定是"**要不要让我把这个词记下来当名字用**" ——
-            //      这才是他能回答、也愿意回答的问题。
-            //      拼写对不对是**我们**该自己收敛的事（靠写法冲突规则去问）。
-            // 所以改成：把"我打算怎么用它"说清楚，再问他认不认。
-            q.question = u8"「" + k.value + u8"」这场听到 " + std::to_string(k.hits) +
-                         u8" 次了，我打算把它记下来当" + kind_label_zh(k.kind) +
-                         u8"用。对吗？";
             hit = true;
         } else if (current_session > 0 && k.status == "candidate" &&
                    k.source_session == current_session && is_name_like_kind(k.kind)) {
@@ -313,19 +282,13 @@ std::vector<GapQuestion> detect_gaps(const std::vector<KnowledgeWithHistory>& en
             // 只问专名形状的 kind（term/person/project）—— fact/decision 是句子，
             // 让用户去确认一整句话的措辞没有意义。
             q.rule     = GapRule::NewlySeen;
-            // 【措辞】旧版是「第一次听到「X」。这个词的写法对吗？」
-            //
-            // 和上面同病：把"拼写对不对"推给一个**刚听到、还没看到字**的人。
-            // 而且"第一次听到"是个**系统视角**的说法 —— 用户不关心这是我第几次听，
-            // 他只关心"你是不是要记我的东西"。
-            // 改成直接问那个决定：要不要记住它。
-            q.question = u8"新听到「" + k.value + u8"」，要记住它吗？";
             hit = true;
         } else if (k.status == "candidate" &&
                    k.confidence >= 0.0 && k.confidence < kLowConfidenceBelow) {
+            // 【旧文案曾经把 confidence 直接打给用户】——「识别置信度只有 0.40」。
+            // 那是我们的内部数值，用户既看不懂也不知道该怎么用。
+            // 现在这里只留事实（这条规则命中了），措辞由 Interaction 层决定。
             q.rule     = GapRule::LowConfidenceName;
-            q.question = u8"「" + k.value + u8"」的识别置信度只有 " + fmt_conf(k.confidence) +
-                         u8"，可能是听错了。正确的写法是什么？";
             hit = true;
         }
 

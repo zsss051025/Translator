@@ -180,25 +180,88 @@ ChoiceAnswer interpret_choice(const std::string& raw, size_t n_options) {
     return ca;
 }
 
-std::string answer_hint_for(GapRule rule) {
-    switch (rule) {
-    // 低置信度专名问的是"正确的写法是什么"，肯定词没有意义 —— 让提示说实话
-    case GapRule::LowConfidenceName:
-        return u8"（直接输入正确写法；认可当前写法就按 y；回车跳过）";
+// ---------------------------------------------------------------------------
+// 适配器：内部结构 → 交互层的输入模型
+// ---------------------------------------------------------------------------
+//
+// 这个函数**只做事实搬运，不写任何面向用户的话**。
+// 判断标准很简单：这里出现的每个字符串都必须是**数据**（用户说过/写过的原文），
+// 一旦出现"请""吗""。「"这类语气词，就说明文案漏到这一层了。
+//
+// 【关于 familiarity】hits 是跨会话累加的（upsert 里 `hits = hits + 本次次数`），
+// 所以它**不能**翻译成"这场听到 N 次"——那是错的数字。
+// 它只能翻译成定性描述：1 次 / 不止一次 / 多次，三种说法在跨会话语义下都是真的。
+namespace {
+
+interaction::Familiarity familiarity_of(int hits) {
+    if (hits >= 3) return interaction::Familiarity::ManyTimes;
+    if (hits >= 2) return interaction::Familiarity::AFewTimes;
+    return interaction::Familiarity::FirstTime;
+}
+
+bool is_person_kind(const std::string& kind) { return kind == "person"; }
+bool is_project_kind(const std::string& kind) {
+    return kind == "project";
+}
+
+}  // namespace
+
+interaction::Prompt to_prompt(const GapQuestion& q) {
+    interaction::Prompt p;
+    p.subject     = q.value;
+    p.familiarity = familiarity_of(q.hits);
+
+    switch (q.rule) {
     case GapRule::ValueChanged:
-        return u8"（回车 = 以后再问；y = 就用新的；n = 用回旧的；也可直接输入正确写法）";
+        p.kind     = interaction::Kind::UpdateChangedValue;
+        p.previous = q.old_value;
+        p.current  = q.value;
+        break;
+
     case GapRule::ConflictingSpellings:
-        return u8"（输入编号选正确写法；n = 不是同一个东西，两个都留着；回车跳过）";
-    case GapRule::AskDefinition:
-        // 这条要用户**打一句话**，所以提示必须说清楚"直接说它的意思就行"。
-        // 长度上限见 interpret_answer（60 字节）：定义通常够用，
-        // 太长会被判成 Skip 而不是截断 —— 宁可少记一条，不可记错一条。
-        return u8"（直接输入它的意思；只确认这是个重要概念就按 y；回车跳过）";
+        p.kind = interaction::Kind::PickSpelling;
+        for (const auto& a : q.alternatives) p.options.push_back(a.value);
+        p.current = q.in_use;
+        break;
+
     case GapRule::InconsistentRendering:
+        p.kind = interaction::Kind::UnifySpelling;
+        break;
+
+    case GapRule::AskDefinition:
+        p.kind = interaction::Kind::AskTermMeaning;
+        break;
+
+    case GapRule::LowConfidenceName:
+        p.kind = interaction::Kind::SuggestCorrectSpelling;
+        break;
+
     case GapRule::HighFreqUnconfirmed:
-        return u8"（回车跳过；y = 认可；也可以直接输入正确写法）";
+    case GapRule::NewlySeen:
+        // 同一个内部规则会因为**知识类型**给出完全不同的问法 ——
+        // 这正是"按类型生成自然的问题"的落点，也是解耦的价值：
+        // 规则侧只有两条，用户侧看到的是三种不同的问法。
+        if (is_person_kind(q.kind))        p.kind = interaction::Kind::ConfirmPersonName;
+        else if (is_project_kind(q.kind))  p.kind = interaction::Kind::ConfirmProjectName;
+        else                               p.kind = interaction::Kind::ConfirmTerm;
+        break;
     }
-    return u8"（回车跳过）";
+    return p;
+}
+
+interaction::Outcome to_outcome(const GapQuestion& q, ConfirmOutcome o) {
+    switch (o) {
+    case ConfirmOutcome::Skipped:           return interaction::Outcome::Skipped;
+    case ConfirmOutcome::Failed:            return interaction::Outcome::Failed;
+    case ConfirmOutcome::ConfirmedExisting: return interaction::Outcome::Accepted;
+    case ConfirmOutcome::ConfirmedNewValue:
+        // 教了含义和"改了个写法"是两件不同的事，回执也不该一样
+        return q.rule == GapRule::AskDefinition ? interaction::Outcome::MeaningLearned
+                                                : interaction::Outcome::Corrected;
+    case ConfirmOutcome::RevertedToOld:     return interaction::Outcome::Declined;
+    case ConfirmOutcome::RejectedUnchanged: return interaction::Outcome::Declined;
+    }
+    return interaction::Outcome::Skipped;
 }
 
 // ===============================================================
@@ -269,11 +332,10 @@ ConfirmResult apply_answer(const GapQuestion& q, const Answer& a, std::string* e
             }
         }
         r.outcome = ConfirmOutcome::ConfirmedNewValue;
-        r.detail  = u8"记住了：" + a.value;
-        if (archived > 0) {
-            r.detail += u8"（另外 " + std::to_string(archived) +
-                        u8" 个写法已标为听错，不再使用）";
-        }
+        r.value   = a.value;
+        // archived 的数量也不往文案里塞 —— 交互层的 PickSpelling 回执
+        // 本来就会说"另一种写法我标成听错了"，不需要一个会变的数字。
+        (void)archived;
         return r;
     }
 
@@ -300,7 +362,7 @@ ConfirmResult apply_answer(const GapQuestion& q, const Answer& a, std::string* e
         // 而且 asked_count 会让它最多再被问一次，不会没完没了。
         if (a.kind == AnswerKind::Reject) {
             r.outcome = ConfirmOutcome::RejectedUnchanged;
-            r.detail  = u8"已记下 —— 它不会被当作重要概念";
+            // 措辞交给交互层：这一层只知道"用户拒绝了"这一个事实
             return r;
         }
 
@@ -335,10 +397,10 @@ ConfirmResult apply_answer(const GapQuestion& q, const Answer& a, std::string* e
 
         if (a.kind == AnswerKind::NewValue) {
             r.outcome = ConfirmOutcome::ConfirmedNewValue;
-            r.detail  = u8"记住了「" + q.value + u8"」的含义：" + a.value;
+            r.value   = a.value;
         } else {
             r.outcome = ConfirmOutcome::ConfirmedExisting;
-            r.detail  = u8"已确认：「" + q.value + u8"」是个重要概念（没记含义）";
+            r.value   = q.value;
         }
         return r;
     }
@@ -383,7 +445,7 @@ ConfirmResult apply_answer(const GapQuestion& q, const Answer& a, std::string* e
             return r;
         }
         r.outcome = ConfirmOutcome::ConfirmedNewValue;
-        r.detail  = u8"记住了：" + a.value;
+        r.value   = a.value;
         return r;
     }
 
@@ -396,7 +458,7 @@ ConfirmResult apply_answer(const GapQuestion& q, const Answer& a, std::string* e
             return r;
         }
         r.outcome = ConfirmOutcome::ConfirmedExisting;
-        r.detail  = u8"已确认：" + q.value;
+        r.value   = q.value;
         return r;
     }
 
@@ -428,7 +490,7 @@ ConfirmResult apply_answer(const GapQuestion& q, const Answer& a, std::string* e
             return r;
         }
         r.outcome = ConfirmOutcome::RevertedToOld;
-        r.detail  = u8"已改回：" + q.old_value;
+        r.value   = q.old_value;
         return r;
     }
 
@@ -439,7 +501,9 @@ ConfirmResult apply_answer(const GapQuestion& q, const Answer& a, std::string* e
     // 识别提示和翻译约束（§6.5），不会污染任何东西；
     // 而且 asked_count 会让它最多再被问一次（见 kMaxAsks），不会没完没了。
     r.outcome = ConfirmOutcome::RejectedUnchanged;
-    r.detail  = u8"已记下这个写法不对 —— 它不会被用作约束";
+    // 这里只说"用户拒绝了"这一个**事实** —— 说给用户听的那句话由交互层生成。
+    // 旧版这里是 `已记下这个写法不对 —— 它不会被用作约束`：
+    // 「约束」是我们的内部词，用户不知道什么叫约束，也不知道"不被用作约束"是好事还是坏事。
     return r;
 }
 
@@ -460,18 +524,22 @@ ConfirmStats run_confirmation(const std::vector<GapQuestion>& questions,
         return stats;
     }
 
-    out << u8"\n[确认] 这场会话里有 " << n << u8" 条知识想跟你核对（回车跳过，Enter 直接过）：\n";
+    out << "\n" << interaction::intro(n) << "\n";
 
     for (size_t i = 0; i < n; ++i) {
         const GapQuestion& q = questions[i];
-        out << "  " << (i + 1) << ". " << q.question << "\n      "
-            << answer_hint_for(q.rule) << "\n";
+
+        // 内部问题结构 → 交互层的输入模型。**这一层只搬事实，不写措辞。**
+        interaction::Prompt prompt = to_prompt(q);
+
+        out << "  " << (i + 1) << ". " << interaction::question(prompt) << "\n      "
+            << interaction::hint(prompt) << "\n";
 
         std::string line;
         if (!read_line || !read_line(line)) {
             // 输入结束（EOF / Ctrl+C / GUI 里没有对话框）。
             // **不是错误** —— 交付物早就写完了，这里收尾即可。
-            out << u8"      （输入结束，剩下的先不问；以后还会再提）\n";
+            out << "      " << interaction::no_input_note() << "\n";
             break;
         }
 
@@ -524,33 +592,34 @@ ConfirmStats run_confirmation(const std::vector<GapQuestion>& questions,
             // **不 archive**：用户说的是"它们不是一回事"，不是"这两个都不对"。
             // 它们是两个真实存在的词，只是我误以为相近而已。
             r.outcome = ConfirmOutcome::RejectedUnchanged;
-            r.detail  = u8"已记下它们是两个不同的东西，两个都留着";
         } else {
             r = apply_answer(q, a, &ae);
         }
+
+        // 回执：**由交互层根据"内部结论 + 用户给的答案"生成**。
+        // 这一层不拼任何面向用户的句子，只负责把结论和值递过去。
+        prompt.answer  = r.value.empty() ? a.value : r.value;
+        prompt.failure = r.detail;      // detail 只在失败时有内容（见头文件）
+        const interaction::Outcome oc = to_outcome(q, r.outcome);
+
         switch (r.outcome) {
         case ConfirmOutcome::Skipped:
             ++stats.skipped;
-            out << u8"      跳过（以后还会再问，最多再问一次）\n";
             break;
         case ConfirmOutcome::ConfirmedExisting:
         case ConfirmOutcome::ConfirmedNewValue:
         case ConfirmOutcome::RevertedToOld:
         case ConfirmOutcome::RejectedUnchanged:
             ++stats.confirmed;
-            out << "      " << r.detail << "\n";
             break;
         case ConfirmOutcome::Failed:
             ++stats.failed;
-            out << u8"      [失败] " << r.detail << "\n";
             break;
         }
+        out << "      " << interaction::acknowledgment(prompt, oc) << "\n";
     }
 
-    out << u8"[确认] 记下 " << stats.confirmed << u8" 条，跳过 " << stats.skipped
-        << u8" 条";
-    if (stats.failed > 0) out << u8"，失败 " << stats.failed << u8" 条";
-    out << "\n";
+    out << interaction::summary(stats.confirmed, stats.skipped, stats.failed) << "\n";
     return stats;
 }
 

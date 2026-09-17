@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "Interaction.h"
 #include "KnowledgeGap.h"
 #include "KnowledgeStore.h"
 
@@ -74,7 +75,6 @@ struct Answer {
 // （那会把一条知识变成一坨文本，而且定义会进摘要背景）。
 Answer interpret_answer(const std::string& raw,
                         size_t max_value_len = 60);
-
 // 含义类回答的长度上限（字节）。够放一句话，又不至于把整段转录粘进来。
 constexpr size_t kMaxDefinitionLen = 300;
 
@@ -94,9 +94,6 @@ struct ChoiceAnswer {
 };
 ChoiceAnswer interpret_choice(const std::string& raw, size_t n_options);
 
-// 面向用户的提示：告诉用户可以怎么答。跟着每条问题打出来。
-std::string answer_hint_for(GapRule rule);
-
 // ---------------------------------------------------------------
 // 把回答落到库里
 // ---------------------------------------------------------------
@@ -111,11 +108,33 @@ enum class ConfirmOutcome {
 
 struct ConfirmResult {
     ConfirmOutcome outcome = ConfirmOutcome::Skipped;
-    std::string    detail;        // 给用户看的一句话，已经在库里改过了
+
+    // 用户这次给出的值（新写法 / 含义），用于回执。
+    // **只带数据不带措辞** —— 说给用户听的那句话由 Interaction 层生成。
+    std::string    value;
+
+    // **只用来说明失败原因**（原始错误串）。成功路径永远为空：
+    // 一旦这里装了"给用户看的一句话"，文案就又回到这一层了。
+    std::string    detail;
 };
 
 // 落库。失败不抛异常，走 err。
 ConfirmResult apply_answer(const GapQuestion& q, const Answer& a, std::string* err = nullptr);
+
+// ---------------------------------------------------------------
+// 内部结构 → 交互层的输入模型（**适配器，不是文案**）
+// ---------------------------------------------------------------
+//
+// 【为什么放在这里，而不是放在 Interaction 里】
+// Interaction 的核心约束是"不认识 GapQuestion / KnowledgeItem"（见它头文件的说明），
+// 而流程层本来就是两者相遇的地方 —— 让它做翻译，依赖方向就是单向的：
+//
+//     KnowledgeGap  →(GapQuestion)→  ConfirmGaps  →(Prompt)→  Interaction
+//
+// 箭头不回头。所以"该问什么"的代码里再也拼不出面向用户的中文，
+// 文案改动也不影响缺口检测的自检。
+interaction::Prompt  to_prompt(const GapQuestion& q);
+interaction::Outcome to_outcome(const GapQuestion& q, ConfirmOutcome o);
 
 // ---------------------------------------------------------------
 // 问答循环

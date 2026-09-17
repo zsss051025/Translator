@@ -40,6 +40,7 @@ add_executable(Translator
 	src/KnowledgeStore.cpp
 	src/KnowledgeGap.cpp
 	src/ConfirmGaps.cpp
+	src/Interaction.cpp
 	src/KnowledgeExtract.cpp
 	src/Utf8.cpp
 	src/AgentTool.cpp

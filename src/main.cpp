@@ -310,8 +310,13 @@ static int run_show_gaps(const AppConfig& cfg) {
     }
     int n = 0;
     for (const auto& q : qs) {
+        // 走**同一条**渲染路径：诊断打出来的问句必须和真跑时一模一样。
+        // 这里以前直接打 q.question，而那个字段已经删掉了 —— 就是为了不让
+        // "该问什么"的代码有机会拼文案（拼了就会把内部状态漏给用户）。
+        const auto prompt = knowledge::to_prompt(q);
         std::cout << "   " << ++n << ". [" << knowledge::to_string(q.rule) << "] "
-                  << q.question << std::endl;
+                  << interaction::question(prompt) << std::endl
+                  << "      " << interaction::hint(prompt) << std::endl;
     }
     SessionStore::instance().close();
     return 0;
@@ -3146,14 +3151,29 @@ static int run_selftest(const AppConfig& cfg) {
                 // hits 降序 —— **刻意不按 confirmed 排前面**：
                 // 这个真实案例里 confirmed 的恰恰是错的那个，
                 // 按状态排序等于拿错误答案引导用户。
-                gap_ok = false; why = "选项应按 hits 降序（证据多的在前）";
-            } else if (q[0].question.find("Erika") == std::string::npos) {
-                // 冲突必须**摆出来**，这是这个问题全部的价值
-                gap_ok = false; why = "问题里没提到另一种写法 —— 用户还是只能瞎猜";
-            } else if (q[0].question.find(u8"现在按") == std::string::npos) {
-                gap_ok = false; why = "没说清当前在用哪个写法（用户不知道改动影响什么）";
+                gap_ok = false;
+                why = "选项应按 hits 降序（证据多的在前），实际：";
+                for (const auto& a : q[0].alternatives) {
+                    why += a.value + "(" + std::to_string(a.hits) + ") ";
+                }
+            // 【断言改成打在**渲染之后的文案**上】
+            // 2.8 之后 GapQuestion 里已经没有 question 字段（措辞搬去了交互层），
+            // 所以这里改成走真实渲染路径再看结果 —— 这比打在一个中间字段上更有意义：
+            // 它验的是"用户到底会看到什么"。
             } else if (q[0].alternatives[0].knowledge_id == 0) {
                 gap_ok = false; why = "选项没带上 knowledge_id，落库时选不了";
+            } else {
+                const auto shown = interaction::question(knowledge::to_prompt(q[0]));
+                if (shown.find("Erika") == std::string::npos) {
+                    // 冲突必须**摆出来**，这是这个问题全部的价值
+                    gap_ok = false; why = "问题里没提到另一种写法 —— 用户还是只能瞎猜";
+                } else if (shown.find(u8"现在用的是") == std::string::npos) {
+                    gap_ok = false;
+                    why = "没说清当前在用哪个写法（用户不知道改动影响什么）";
+                } else if (shown.find("Erika") != std::string::npos &&
+                           shown.find("Erica") == std::string::npos) {
+                    gap_ok = false; why = "两种写法没有都列出来";
+                }
             }
         }
 
@@ -3266,6 +3286,164 @@ static int run_selftest(const AppConfig& cfg) {
                 if (l.find(u8"Compile Once") != std::string::npos) in_bg = true;
             }
             if (!in_bg) { gap_ok = false; why = "含义没进摘要背景（用户教了但没用上）"; }
+        }
+
+        // ⑱ **交互层独立自检**（步骤 2.8）
+        //
+        // 【为什么这一组能存在，本身就是架构的证据】它不需要数据库、不需要缺口检测、
+        // 不需要 KnowledgeItem —— 只喂 interaction::Prompt 就能验全部文案。
+        // 以前文案长在 KnowledgeGap.cpp 里，验它就得先把知识库和检测规则都跑起来。
+        //
+        // 【这一组守的是产品体验，不是"字符串对不对"】
+        // 用户原话：「感觉自己是在给数据库做标注，而不是在教 AI 学习」。
+        // 所以下面每一条断言都在守同一件事：**不许把内部状态漏给用户**。
+        {
+            using interaction::Familiarity;
+            using interaction::Kind;
+            using interaction::Outcome;
+            using interaction::Prompt;
+            bool ix_ok = true;
+            std::string iwhy;
+
+            auto mkp = [](Kind k, const char* subject) {
+                Prompt p;
+                p.kind    = k;
+                p.subject = subject;
+                return p;
+            };
+
+            // ① 人名：要说清"我为什么觉得它值得记住"（提到过 = 用户自己的经历，
+            //    不是我们的计数器）
+            {
+                Prompt p = mkp(Kind::ConfirmPersonName, "Marco");
+                p.familiarity = Familiarity::ManyTimes;
+                const std::string s = interaction::question(p);
+                if (s.find("Marco") == std::string::npos) {
+                    ix_ok = false; iwhy = "人名问题里没有那个名字";
+                } else if (s.find(u8"多次提到") == std::string::npos) {
+                    ix_ok = false; iwhy = "没说清为什么值得记（少了'多次提到'这个理由）";
+                } else if (s.find(u8"人名") == std::string::npos) {
+                    ix_ok = false; iwhy = "没告诉用户这是个什么人名";
+                }
+            }
+
+            // ② 技术术语：要问"这是不是术语"，而且要问含义
+            {
+                Prompt p = mkp(Kind::AskTermMeaning, "CO-RE");
+                const std::string s = interaction::question(p);
+                if (s.find("CO-RE") == std::string::npos ||
+                    s.find(u8"技术术语") == std::string::npos ||
+                    s.find(u8"指什么") == std::string::npos) {
+                    ix_ok = false; iwhy = "术语问题没同时问到'是不是术语'和'它指什么'";
+                }
+            }
+
+            // ③ 值变化：**必须把"我原来记的是什么"摆出来**
+            //    —— 否则用户不知道自己在同意什么，而这一问正是"我在学习"的证据
+            {
+                Prompt p = mkp(Kind::UpdateChangedValue, "凤凰项目");
+                p.previous = u8"10 月上线";
+                p.current  = u8"11 月上线";
+                const std::string s = interaction::question(p);
+                if (s.find(u8"10 月上线") == std::string::npos ||
+                    s.find(u8"11 月上线") == std::string::npos) {
+                    ix_ok = false; iwhy = "值变化的问题里没有同时出现旧值和新值";
+                }
+            }
+
+            // ④ 回执：不许是"已确认"，要说明**以后我会拿它做什么**
+            {
+                Prompt p = mkp(Kind::ConfirmPersonName, "Marco");
+                p.answer = "Marco";
+                const std::string s = interaction::acknowledgment(p, Outcome::Accepted);
+                if (s.find("Marco") == std::string::npos) {
+                    ix_ok = false; iwhy = "回执里没有那个名字";
+                } else if (s.find(u8"以后") == std::string::npos) {
+                    ix_ok = false; iwhy = "回执没说清'以后会怎么用它'（这是闭环感的落点）";
+                }
+            }
+
+            // ⑤ 教了含义的回执：要复述那份含义 —— 让用户看见"我教的东西被记住了"
+            {
+                Prompt p = mkp(Kind::AskTermMeaning, "CO-RE");
+                p.answer = u8"Compile Once – Run Everywhere";
+                const std::string s = interaction::acknowledgment(p, Outcome::MeaningLearned);
+                if (s.find(u8"Compile Once") == std::string::npos) {
+                    ix_ok = false; iwhy = "教了含义之后回执里没有那份含义";
+                }
+            }
+
+            // ⑥ **内部状态一个字都不许出现**（这一组最重要的一条）
+            //
+            // 把内部才会有的说法全列出来，任何一种出现在**任何**一条文案里都算失败。
+            // 为什么用"禁用词表"这种笨办法：漏一个字段的代价是用户看到
+            // 「已经听到 4 次」「识别置信度只有 0.40」这种莫名其妙的东西，
+            // 而这类文案改一次很难被发现（没人会去读自己的输出）。
+            {
+                const char* kForbidden[] = {
+                    u8"已经听到", u8"听到 ", u8"次「", u8"一直没确认", u8"最多再问",
+                    u8"置信度", u8"candidate", u8"Candidate", u8"confirmed",
+                    u8"已确认：", u8"标记为", u8"hits", u8"状态", u8"约束",
+                    u8"知识库", u8"入库", u8"跳过（以后",
+                };
+                // 把各种组合都渲染一遍
+                std::vector<Prompt> all;
+                for (Kind k : {Kind::ConfirmPersonName, Kind::ConfirmTerm,
+                               Kind::AskTermMeaning, Kind::ConfirmProjectName,
+                               Kind::UpdateChangedValue, Kind::PickSpelling,
+                               Kind::UnifySpelling, Kind::SuggestCorrectSpelling}) {
+                    Prompt p = mkp(k, "X");
+                    p.previous = "A";
+                    p.current  = "B";
+                    p.options  = {"X", "Y"};
+                    p.answer   = "C";
+                    all.push_back(p);
+                }
+                for (const auto& p : all) {
+                    std::vector<std::string> texts = {
+                        interaction::question(p),
+                        interaction::hint(p),
+                        interaction::acknowledgment(p, Outcome::Accepted),
+                        interaction::acknowledgment(p, Outcome::Corrected),
+                        interaction::acknowledgment(p, Outcome::MeaningLearned),
+                        interaction::acknowledgment(p, Outcome::Skipped),
+                        interaction::acknowledgment(p, Outcome::Declined),
+                    };
+                    for (const auto& t : texts) {
+                        for (const char* bad : kForbidden) {
+                            if (t.find(bad) != std::string::npos) {
+                                ix_ok = false;
+                                iwhy = std::string("内部状态漏进了文案：命中禁用词「") +
+                                       bad + u8"」—— " + t;
+                            }
+                        }
+                    }
+                }
+                // 开场和收尾也一样要过这一关
+                for (const char* bad : kForbidden) {
+                    if (interaction::intro(3).find(bad) != std::string::npos ||
+                        interaction::intro(1).find(bad) != std::string::npos ||
+                        interaction::summary(2, 3, 0).find(bad) != std::string::npos ||
+                        interaction::no_input_note().find(bad) != std::string::npos) {
+                        ix_ok = false;
+                        iwhy = std::string("开场/收尾里有内部状态：") + bad;
+                    }
+                }
+            }
+
+            // ⑦ 失败是唯一允许说技术原因的地方 —— 那时候藏着原因更坏
+            {
+                Prompt p = mkp(Kind::ConfirmTerm, "X");
+                p.failure = u8"数据库被锁";
+                const std::string s = interaction::acknowledgment(p, Outcome::Failed);
+                if (s.find(u8"数据库被锁") == std::string::npos) {
+                    ix_ok = false; iwhy = "失败原因没告诉用户";
+                }
+            }
+
+            std::cout << "[SelfTest] 交互层文案（类型化提问/理由/回执/内部状态不外泄）: "
+                      << (ix_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+            if (!ix_ok) { std::cerr << "    " << iwhy << std::endl; return 1; }
         }
 
         // 【这里刻意不写"共 N 例"】原来写死了 `"✅ 11 例通过"`，
