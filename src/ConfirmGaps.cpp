@@ -78,15 +78,63 @@ std::string lower_ascii(const std::string& s) {
     return out;
 }
 
+// 剥掉句尾的**语气助词**。
+//
+// 【为什么必须有这一步 —— 真实事故，而且是数据损坏】
+// 用户在"这是正确的人名写法吗？"下面回答了「是的」。
+// 而词表里只有「是」「对的」「好的」，**没有「是的」** ——
+// 于是它掉进了"其余内容一律当用户给出的正确写法"那个分支：
+//     term/person  marco = 是的   status=confirmed
+//     term/person  erica = 是的   status=confirmed
+// 真实后果（实测 demo.db）：`initial_prompt = "EnglishPod, CarsPacked, 是的, TV"`，
+// 翻译术语表里也有「是的」；而 Marco / Erica 这两个**正确的人名整个消失了**。
+// 也就是说：**用户答了一句"是的"，系统把两个人名删了、塞进去两个字。**
+//
+// 【为什么用"剥语气词"而不是继续往表里加词】
+// 「是的」「对的」「好的」「是啊」「对呀」「可以啊」「行吧」……这类说法穷举不完，
+// 加一个漏一个。而它们的共同结构是**核心词 + 句尾语气助词**。
+// 把尾巴剥掉再查表，一整类问题一起解决。
+//
+// 【为什么这样剥是安全的】只在"查肯定/否定表"时生效，不影响真正的值：
+// 一个专名以「啊/吧/呀」结尾虽然可能（"小啊"），但那种情况下它也不会
+// 正好等于表里的「是」「对」「好」—— 剥离后仍然不命中，原样当新值处理。
+std::string strip_trailing_particles(const std::string& low) {
+    // 只剥 ASCII 空白 + 常见句尾助词/标点。逐个剥，支持「是的呀」这种叠用。
+    static const char* kParticles[] = {
+        " ", "\t", "!", ".", "~", u8"的", u8"了", u8"呀", u8"啊", u8"吧",
+        u8"嘛", u8"哦", u8"喔", u8"噢", u8"嘞", u8"啦", u8"咯", u8"咧",
+        u8"哈", u8"哟", u8"唷", u8"呢", u8"滴", u8"。", u8"！", u8"～",
+    };
+    std::string s = low;
+    for (;;) {
+        bool cut = false;
+        for (const char* p : kParticles) {
+            const size_t n = std::strlen(p);
+            if (s.size() >= n && s.compare(s.size() - n, n, p) == 0) {
+                const std::string next = s.substr(0, s.size() - n);
+                if (next.empty()) break;      // 别把整个词剥没
+                s = next;
+                cut = true;
+                break;
+            }
+        }
+        if (!cut) break;
+    }
+    return s;
+}
+
 // **触发表**（宁宽勿漏）：这些词算"是"。
 //
 // 和判定表分开是项目的既定规矩（PROJECT.md §8.3）：
 // 往这里加词是安全的，改 interpret_answer 里的分支不是。
 bool is_affirmative(const std::string& low) {
     static const char* kYes[] = {
-        "y", "ye", "yes", "yeah", "yep", "ok", "okay", "sure", "right", "correct",
-        u8"是", u8"对", u8"对的", u8"好", u8"好的", u8"嗯", u8"没错", u8"正确",
-        u8"确认", u8"可以", u8"就这样",
+        "y", "ye", "yes", "yeah", "yep", "yup", "ok", "okay", "okey", "sure",
+        "right", "correct", "yes please",
+        u8"是", u8"对", u8"好", u8"嗯", u8"行", u8"中", u8"能", u8"要",
+        u8"没错", u8"正确", u8"确认", u8"可以", u8"就这样", u8"就是这个",
+        u8"是这样的", u8"就是这样", u8"没问题", u8"对头", u8"妥", u8"妥了",
+        u8"嗯嗯", u8"是滴", u8"好滴", u8"阔以",
     };
     for (const char* w : kYes) if (low == w) return true;
     return false;
@@ -99,8 +147,10 @@ bool is_affirmative(const std::string& low) {
 // 这类污染一旦发生，用户看到的译文会莫名其妙地变成 "no"。
 bool is_negative(const std::string& low) {
     static const char* kNo[] = {
-        "n", "no", "nope", "wrong", "not",
-        u8"不", u8"不是", u8"不对", u8"错", u8"错了", u8"否", u8"不用", u8"不要",
+        "n", "no", "nope", "wrong", "not", "never",
+        u8"不", u8"不是", u8"不对", u8"错", u8"错了", u8"否", u8"不用",
+        u8"不要", u8"没有", u8"没用", u8"不行", u8"别", u8"甭", u8"算了",
+        u8"拉倒", u8"取消", u8"不必",
     };
     for (const char* w : kNo) if (low == w) return true;
     return false;
@@ -114,8 +164,13 @@ Answer interpret_answer(const std::string& raw, size_t max_value_len) {
     if (t.empty()) return a;                    // 回车 = 跳过，这是最主要的用法
 
     const std::string low = lower_ascii(t);
-    if (is_affirmative(low)) { a.kind = AnswerKind::Affirm; return a; }
-    if (is_negative(low))    { a.kind = AnswerKind::Reject; return a; }
+    // 先按原样查表，再按"剥掉句尾语气词"的形式查一遍。
+    //
+    // 两步都做是刻意的：「是的」剥成「是」命中；而表里若真有一个以「的」结尾的
+    // 肯定词（比如「就是这样」不以此结尾，但将来可能加），原样查也不会漏。
+    const std::string core = strip_trailing_particles(low);
+    if (is_affirmative(low) || is_affirmative(core)) { a.kind = AnswerKind::Affirm; return a; }
+    if (is_negative(low) || is_negative(core))        { a.kind = AnswerKind::Reject; return a; }
 
     // 其余内容一律当"用户给出的正确写法"。
     //

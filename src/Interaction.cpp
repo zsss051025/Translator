@@ -1,5 +1,7 @@
 #include "Interaction.h"
 
+#include <cstring>   // std::strlen（剥系词时比对字面量长度）
+
 // 注意：这个文件**不许** include KnowledgeGap.h / KnowledgeStore.h。
 // 理由见头文件开头 —— 那是这一层存在的意义。
 
@@ -35,6 +37,42 @@ const char* entity_word(Kind k) {
 
 std::string quoted(const std::string& s) {
     return u8"「" + s + u8"」";
+}
+
+// 剥掉用户答案开头的**系词**，避免回执里出现「指的是指的是…」。
+//
+// 【真实数据】用户答「指的是电视节目的缩写」，回执就成了
+//     「「TV」是指指的是电视节目的缩写」
+// 读起来像结巴 —— 而这是"我记住了"那一句，是全篇最该干净的地方。
+//
+// 【为什么只剥多字形式】「指的是」「是指」「就是」这些是明确的系词短语，
+// 剥掉不会有歧义。**不剥单字「是」「指」**：`是非` / `指标` 这类词
+// 会被剥坏（`指的是非` 就错了）。宁可留一点冗余，不能改坏用户的答案。
+std::string strip_leading_copula(const std::string& s) {
+    static const char* kCopulas[] = {
+        u8"指的是", u8"是指", u8"就是指", u8"就是", u8"的意思就是",
+        u8"意思就是", u8"是一个", u8"是一种", u8"是一种叫做",
+    };
+    // 允许前面有空白/冒号/逗号
+    size_t b = 0;
+    while (b < s.size() && (s[b] == ' ' || s[b] == '\t')) ++b;
+    for (const char* c : kCopulas) {
+        const size_t n = std::strlen(c);
+        if (s.size() >= b + n && s.compare(b, n, c) == 0) {
+            std::string rest = s.substr(b + n);
+            // 系词后面可能还跟一个冒号/逗号
+            size_t rb = 0;
+            while (rb < rest.size() &&
+                   (rest[rb] == ' ' || rest[rb] == '\t' ||
+                    rest.compare(rb, 3, u8"：") == 0 || rest.compare(rb, 3, u8"，") == 0 ||
+                    rest[rb] == ':' || rest[rb] == ',')) {
+                rb += (rest[rb] == ':' || rest[rb] == ',') ? 1 : 3;
+            }
+            rest = rest.substr(rb);
+            if (!rest.empty()) return rest;      // 剥空了就保留原文
+        }
+    }
+    return s;
 }
 
 }  // namespace
@@ -157,7 +195,8 @@ std::string acknowledgment(const Prompt& p, Outcome o) {
         return u8"先不记这条。";
 
     case Outcome::MeaningLearned:
-        return u8"记住了：" + quoted(p.subject) + u8"是指" + p.answer +
+        return u8"记住了：" + quoted(p.subject) + u8"是指" +
+               strip_leading_copula(p.answer) +
                u8"。以后整理纪要和检索的时候我会用上这个理解。";
 
     case Outcome::Corrected:

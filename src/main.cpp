@@ -3374,6 +3374,30 @@ static int run_selftest(const AppConfig& cfg) {
                 }
             }
 
+            // ⑤b 用户的答案自带系词时**不许出现「指的是指的是」**
+            //
+            // 【真实数据】用户答「指的是电视节目的缩写」，回执成了
+            //     「「TV」是指指的是电视节目的缩写」
+            // 这是"我记住了"那一句，全篇最该干净的地方。
+            {
+                Prompt p = mkp(Kind::AskTermMeaning, "TV");
+                p.answer = u8"指的是电视节目的缩写";
+                const std::string s = interaction::acknowledgment(p, Outcome::MeaningLearned);
+                if (s.find(u8"是指指的是") != std::string::npos ||
+                    s.find(u8"指的是指的是") != std::string::npos) {
+                    ix_ok = false; iwhy = "回执里系词重复了（指的是指的是）";
+                } else if (s.find(u8"电视节目的缩写") == std::string::npos) {
+                    ix_ok = false; iwhy = "剥系词时把用户答案本身弄丢了";
+                }
+                // 不带系词的答案必须原样保留
+                Prompt q2 = mkp(Kind::AskTermMeaning, "CarsPacked");
+                q2.answer = u8"装车，将行李或物品装上车";
+                const std::string s2 = interaction::acknowledgment(q2, Outcome::MeaningLearned);
+                if (s2.find(u8"装车，将行李或物品装上车") == std::string::npos) {
+                    ix_ok = false; iwhy = "不带系词的答案被改动了";
+                }
+            }
+
             // ⑥ **内部状态一个字都不许出现**（这一组最重要的一条）
             //
             // 把内部才会有的说法全列出来，任何一种出现在**任何**一条文案里都算失败。
@@ -3525,11 +3549,35 @@ static int run_selftest(const AppConfig& cfg) {
             {"YES",         AnswerKind::Affirm,    ""},
             {u8"是",        AnswerKind::Affirm,    ""},
             {u8"对",        AnswerKind::Affirm,    ""},
+            // 【真实数据事故】用户答了「是的」，而表里只有「是」「对的」「好的」——
+            // 于是它掉进"其余内容一律当新值"分支，把两个人名（Marco/Erica）
+            // 覆盖成了「是的」，而且是 confirmed：`initial_prompt` 变成
+            // "EnglishPod, CarsPacked, 是的, TV"，正确的人名整个消失。
+            // 「核心词 + 句尾语气词」这一整类一起解决（见 strip_trailing_particles）。
+            {u8"是的",      AnswerKind::Affirm,    ""},
+            {u8"是啊",      AnswerKind::Affirm,    ""},
+            {u8"是呀",      AnswerKind::Affirm,    ""},
+            {u8"对的",      AnswerKind::Affirm,    ""},
+            {u8"对啊",      AnswerKind::Affirm,    ""},
+            {u8"好的",      AnswerKind::Affirm,    ""},
+            {u8"好的呀",    AnswerKind::Affirm,    ""},
+            {u8"嗯嗯",      AnswerKind::Affirm,    ""},
+            {u8"没错的",    AnswerKind::Affirm,    ""},
+            {u8"可以的",    AnswerKind::Affirm,    ""},
+            {u8"行",        AnswerKind::Affirm,    ""},
+            {u8"行吧",      AnswerKind::Affirm,    ""},
+            {u8"没问题",    AnswerKind::Affirm,    ""},
+            {u8"是这样的",  AnswerKind::Affirm,    ""},
+            {u8"是的。",    AnswerKind::Affirm,    ""},
+            {"YES",         AnswerKind::Affirm,    ""},
             // 【最关键的两条】"n"/"no" 必须被认成"否"，否则字面量 "no"
             // 会被当成用户给的新写法写进知识库，而且是 confirmed —— 它会进翻译约束。
             {"n",           AnswerKind::Reject,    ""},
             {"no",          AnswerKind::Reject,    ""},
             {u8"不是",      AnswerKind::Reject,    ""},
+            {u8"没有",      AnswerKind::Reject,    ""},
+            {u8"不用了",    AnswerKind::Reject,    ""},
+            {u8"算了",      AnswerKind::Reject,    ""},
             // 新写法：两边空白要去掉
             {"  Marco  ",   AnswerKind::NewValue,  "Marco"},
             {u8"埃里卡",    AnswerKind::NewValue,  u8"埃里卡"},
