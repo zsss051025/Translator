@@ -8,6 +8,7 @@ namespace knowledge {
 const char* to_string(GapRule r) {
     switch (r) {
     case GapRule::ValueChanged:          return "value_changed";
+    case GapRule::ConflictingSpellings:  return "conflicting_spellings";
     case GapRule::InconsistentRendering: return "inconsistent_rendering";
     case GapRule::HighFreqUnconfirmed:   return "high_freq_unconfirmed";
     case GapRule::NewlySeen:             return "newly_seen";
@@ -19,18 +20,20 @@ const char* to_string(GapRule r) {
 int priority_of(GapRule r) {
     // 越小越先问。排序依据是"不问的代价"：
     //   值冲突最危险 —— 库里可能已经是错的，而且它会进约束影响后续翻译
-    //   译法不一致次之 —— 直接影响用户读到的译文质量
+    //   写法冲突次之 —— 同上，而且用户**答错的可能性最大**（选项不摆出来他只能猜）
+    //   译法不一致再次 —— 同一个键的值变过多次
     //   高频未确认再次 —— 提了很多次却一直没定性，问一次收益最大
     //   本场新见再次 —— 自动抽取的出口，用户第一次用就是靠它把名字确定下来
-    //                     （优先级低于上面三条：那三条是"已有知识出了问题"，
+    //                     （优先级低于上面几条：那些是"已有知识出了问题"，
     //                      这条只是"还没有知识"，不问不会让现状变坏）
     //   低置信度最后 —— 大概率只是听错了，价值最低
     switch (r) {
     case GapRule::ValueChanged:          return 1;
-    case GapRule::InconsistentRendering: return 2;
-    case GapRule::HighFreqUnconfirmed:   return 3;
-    case GapRule::NewlySeen:             return 4;
-    case GapRule::LowConfidenceName:     return 5;
+    case GapRule::ConflictingSpellings:  return 2;
+    case GapRule::InconsistentRendering: return 3;
+    case GapRule::HighFreqUnconfirmed:   return 4;
+    case GapRule::NewlySeen:             return 5;
+    case GapRule::LowConfidenceName:     return 6;
     }
     return 99;
 }
@@ -73,14 +76,141 @@ std::string fmt_conf(double c) {
     return oss.str();
 }
 
+// ---- 同一个实体的多种写法（ConflictingSpellings）---------------------------
+
+// 只差一个字符吗？要求同首字母、长度差 ≤1、总长 ≥4。
+//
+// 【为什么条件卡这么紧】判错的代价是"把两个不相干的东西问成同一个"
+// —— 那会让用户在两个无关词之间做选择，比不问更糟。
+//   · 首字母必须相同：`Marco`/`Narco` 是编辑距离 1，但它们是不同的词，
+//     而现实里听错的首字母极少变（辅音听错更常见：c/k、b/p、s/z）。
+//   · 长度 ≥4：`PC`/`PB`/`TV` 这种两字母词编辑距离 1 太容易碰上，
+//     而且它们本来就靠 R3 缩写形状进来的，含义完全不同。
+//   · 编辑距离 ≤1：`Erica`/`Erika`(1)、`Marco`/`Marko`(1)、`Samuel`/`Samual`(1)。
+//     `EnglishPod`/`EnglishPot`(1) 也会命中 —— 这是想要的。
+bool likely_same_entity(const std::string& a, const std::string& b) {
+    if (a == b) return false;
+    if (a.size() < 4 || b.size() < 4) return false;
+    if (a[0] != b[0]) return false;
+    const size_t la = a.size(), lb = b.size();
+    if (la > lb + 1 || lb > la + 1) return false;
+
+    // 编辑距离（只有插入/替换/删除，不需要完整 DP 表）
+    std::vector<int> prev(lb + 1), cur(lb + 1);
+    for (size_t j = 0; j <= lb; ++j) prev[j] = static_cast<int>(j);
+    for (size_t i = 1; i <= la; ++i) {
+        cur[0] = static_cast<int>(i);
+        for (size_t j = 1; j <= lb; ++j) {
+            const int cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+            cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost});
+        }
+        prev.swap(cur);
+    }
+    return prev[lb] <= 1;
+}
+
 }  // namespace
 
 std::vector<GapQuestion> detect_gaps(const std::vector<KnowledgeWithHistory>& entries,
                                      size_t max_questions, long long current_session) {
     std::vector<GapQuestion> out;
 
-    for (const auto& e : entries) {
+    // ---- 第 0 步：先找出"同一个实体的多种写法"，合并成一条问题 ----
+    //
+    // 这一步必须在逐条出题**之前**做，否则那几个键会各自被问一遍
+    // —— 那正是用户真跑 #13 遇到的情况（Erica 和 Erika 被问成两个独立问题，
+    // 他的两个回答互相矛盾，而且他无从知道该矛盾）。
+    //
+    // 命中的键会被标记 covered，逐条循环里直接跳过：一件事只问一次。
+    std::vector<bool> covered(entries.size(), false);
+    {
+        // 候选**和已确认的都要看**。
+        //
+        // 【为什么不能只看 candidate —— 用户真跑 #13 就是这个形态】
+        // 那一场之后库里是：`Erika` = confirmed（用户按了 y）、`Erica` = candidate。
+        // 只扫 candidate 的话，这个冲突**永远问不出来**：
+        // 而它恰恰是最该问的一次 —— confirmed 的那个正在进识别提示
+        // （实测 `initial_prompt = "Marco, Erika"`），错的那一个**已经在生效了**。
+        //
+        // 【和"confirmed 不再问"冲突吗】不冲突。那条规矩（§1.3）防的是
+        // "**同一件事**反复问"。这里是一个**新出现的、与已确认值矛盾的事实** ——
+        // 与"值被改掉了要重新问"（ValueChanged）是同一个道理。
+        // 而且 `asked_count >= kMaxAsks` 这道闸仍然生效，问两次就停。
+        std::vector<size_t> cand;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const KnowledgeItem& k = entries[i].item;
+            if (k.status == "archived") continue;
+            if (k.value.empty() || k.asked_count >= kMaxAsks) continue;
+            if (!is_name_like_kind(k.kind)) continue;
+            cand.push_back(i);
+        }
+
+        for (size_t x = 0; x < cand.size(); ++x) {
+            if (covered[cand[x]]) continue;
+            std::vector<size_t> group{cand[x]};
+            for (size_t y = x + 1; y < cand.size(); ++y) {
+                if (covered[cand[y]]) continue;
+                if (likely_same_entity(entries[cand[x]].item.key,
+                                       entries[cand[y]].item.key)) {
+                    group.push_back(cand[y]);
+                }
+            }
+            if (group.size() < 2) continue;
+
+            // hits 多的排前面 —— 选项 1 是"证据更多的那一个"。
+            //
+            // 【为什么不把 confirmed 排前面】看起来"已经确认过的"更该当默认，
+            // 但用户这个真实案例恰恰相反：confirmed 的是听错的 `Erika`（2 次），
+            // candidate 的才是对的 `Erica`（3 次）。按状态排序会把错的那个
+            // 摆在第一位，等于**用一个错误答案去引导用户**。
+            // 所以按纯证据（hits）排，并且把"现在用的是哪个"显式写进问题里
+            // —— 让用户知道改动的影响面，而不是靠位置暗示。
+            std::sort(group.begin(), group.end(), [&](size_t a, size_t b) {
+                return entries[a].item.hits > entries[b].item.hits;
+            });
+
+            GapQuestion q;
+            q.rule = GapRule::ConflictingSpellings;
+            const KnowledgeItem& first = entries[group[0]].item;
+            q.knowledge_id = first.id;
+            q.kind         = first.kind;
+            q.key          = first.key;
+            q.value        = first.value;
+            q.hits         = first.hits;
+
+            std::string opts, in_use;
+            for (size_t gi = 0; gi < group.size(); ++gi) {
+                const KnowledgeItem& it = entries[group[gi]].item;
+                GapQuestion::Alt alt;
+                alt.knowledge_id = it.id;
+                alt.value        = it.value;
+                alt.hits         = it.hits;
+                q.alternatives.push_back(alt);
+                covered[group[gi]] = true;
+
+                if (gi) opts += u8"　";
+                opts += std::to_string(gi + 1) + u8") " + it.value +
+                        u8"（听到 " + std::to_string(it.hits) + u8" 次）";
+                if (it.status == "confirmed") in_use = it.value;
+            }
+
+            // 把冲突摆出来是这个问题**全部的价值**（见头文件里 alternatives 的说明）。
+            std::string tail;
+            if (!in_use.empty()) {
+                tail = u8"现在按「" + in_use + u8"」在用。";
+            }
+            q.question = u8"我这儿记了 " + std::to_string(q.alternatives.size()) +
+                         u8" 种写法：" + opts + u8"。是同一个吗？哪个对？" + tail;
+            out.push_back(std::move(q));
+        }
+    }
+
+    for (size_t ei = 0; ei < entries.size(); ++ei) {
+        const auto& e = entries[ei];
         const KnowledgeItem& k = e.item;
+
+        // 已经被"写法冲突"那条合并问过，不再单独问（一件事只问一次）
+        if (covered[ei]) continue;
 
         // archived 是用户明确否掉的，再问就是烦人（§1.3 提问稀缺）
         if (k.status == "archived") continue;
@@ -120,8 +250,19 @@ std::vector<GapQuestion> detect_gaps(const std::vector<KnowledgeWithHistory>& en
             hit = true;
         } else if (k.status == "candidate" && k.hits >= kHighFreqHits) {
             q.rule     = GapRule::HighFreqUnconfirmed;
-            q.question = u8"已经听到 " + std::to_string(k.hits) + u8" 次「" + k.value +
-                         u8"」，一直没确认过。它是对的说法吗？";
+            // 【措辞】旧版是「已经听到 N 次「X」，一直没确认过。它是对的说法吗？」
+            //
+            // 两个毛病（用户原话：「感觉根本不是人类的会问出的东西」）：
+            //   ① 「说法」说的是**措辞/论断**，用来指一个专名是词不达意。
+            //      问一个名字"这个说法对吗"，等于问"这句话是真的吗"。
+            //   ② 更根本的：用户在听音频，他**没法知道**这个词该拼成什么样。
+            //      真正属于他的决定是"**要不要让我把这个词记下来当名字用**" ——
+            //      这才是他能回答、也愿意回答的问题。
+            //      拼写对不对是**我们**该自己收敛的事（靠写法冲突规则去问）。
+            // 所以改成：把"我打算怎么用它"说清楚，再问他认不认。
+            q.question = u8"「" + k.value + u8"」这场听到 " + std::to_string(k.hits) +
+                         u8" 次了，我打算把它记下来当" + kind_label_zh(k.kind) +
+                         u8"用。对吗？";
             hit = true;
         } else if (current_session > 0 && k.status == "candidate" &&
                    k.source_session == current_session && is_name_like_kind(k.kind)) {
@@ -137,7 +278,13 @@ std::vector<GapQuestion> detect_gaps(const std::vector<KnowledgeWithHistory>& en
             // 只问专名形状的 kind（term/person/project）—— fact/decision 是句子，
             // 让用户去确认一整句话的措辞没有意义。
             q.rule     = GapRule::NewlySeen;
-            q.question = u8"第一次听到「" + k.value + u8"」。这个词的写法对吗？";
+            // 【措辞】旧版是「第一次听到「X」。这个词的写法对吗？」
+            //
+            // 和上面同病：把"拼写对不对"推给一个**刚听到、还没看到字**的人。
+            // 而且"第一次听到"是个**系统视角**的说法 —— 用户不关心这是我第几次听，
+            // 他只关心"你是不是要记我的东西"。
+            // 改成直接问那个决定：要不要记住它。
+            q.question = u8"新听到「" + k.value + u8"」，要记住它吗？";
             hit = true;
         } else if (k.status == "candidate" &&
                    k.confidence >= 0.0 && k.confidence < kLowConfidenceBelow) {

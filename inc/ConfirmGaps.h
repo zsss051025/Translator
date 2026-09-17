@@ -64,6 +64,22 @@ struct Answer {
 // 这个判定不能靠"看起来像不像值"来蒙，必须有明确的是/否词表。
 Answer interpret_answer(const std::string& raw);
 
+// **选择题**的输入解释（仅 ConflictingSpellings 用）。
+//
+// 为什么不直接复用 interpret_answer：那条路径**刻意**把纯数字判成 Skip
+// （真实事故：用户答了 `1`，于是库里多出一条 `term preview = 1 status=confirmed`）。
+// 那个判定现在仍然是对的 —— 对"是/否 + 请给正确写法"这类问题，数字不是有意义的回答。
+//
+// 但"这儿有两种写法，哪个对？"这类问题里，**数字就是最自然的回答**。
+// 两种语义不能共用一条解析，否则必然要牺牲一边：要么允许数字当值
+// （重新引入那起事故），要么用户没法选（只能把那个词重打一遍）。
+struct ChoiceAnswer {
+    Answer answer;             // 非选择题语义时的常规解释
+    int    choice   = -1;      // >=1 表示选了第几个选项（1-based）
+    bool   not_same = false;   // 用户说"不是同一个东西"（n / 不是）
+};
+ChoiceAnswer interpret_choice(const std::string& raw, size_t n_options);
+
 // 面向用户的提示：告诉用户可以怎么答。跟着每条问题打出来。
 std::string answer_hint_for(GapRule rule);
 

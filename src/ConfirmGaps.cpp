@@ -149,6 +149,36 @@ Answer interpret_answer(const std::string& raw) {
     return a;
 }
 
+ChoiceAnswer interpret_choice(const std::string& raw, size_t n_options) {
+    ChoiceAnswer ca;
+    const std::string t = strip_invisible(raw);
+
+    // 纯数字（1..n）→ 选了第几个。**只认单个数字**：
+    // 多位数、带别的字符都退回常规解释，避免把 "12" 这类输入
+    // 在选项只有 2 个时误判成"选项 1 和 2"。
+    if (t.size() == 1 && t[0] >= '1' && t[0] <= '9') {
+        const int n = t[0] - '0';
+        if (static_cast<size_t>(n) <= n_options) {
+            ca.choice = n;
+            return ca;
+        }
+    }
+
+    // "n / 不是" 在选择题里是"这两个不是同一个东西"——
+    // 和普通问题里的"否掉当前值"语义不同，所以单独一个标志。
+    const std::string low = lower_ascii(t);
+    if (!t.empty() && is_negative(low)) {
+        ca.not_same = true;
+        return ca;
+    }
+
+    ca.answer = interpret_answer(raw);
+    // 「y」在选择题里没有确定含义（选哪个？），不替用户猜 —— 退化成 Skip。
+    // 提示语里已经写明要输入编号。
+    if (ca.answer.kind == AnswerKind::Affirm) ca.answer = Answer();
+    return ca;
+}
+
 std::string answer_hint_for(GapRule rule) {
     switch (rule) {
     // 低置信度专名问的是"正确的写法是什么"，肯定词没有意义 —— 让提示说实话
@@ -156,6 +186,8 @@ std::string answer_hint_for(GapRule rule) {
         return u8"（直接输入正确写法；认可当前写法就按 y；回车跳过）";
     case GapRule::ValueChanged:
         return u8"（回车 = 以后再问；y = 就用新的；n = 用回旧的；也可直接输入正确写法）";
+    case GapRule::ConflictingSpellings:
+        return u8"（输入编号选正确写法；n = 不是同一个东西，两个都留着；回车跳过）";
     case GapRule::InconsistentRendering:
     case GapRule::HighFreqUnconfirmed:
         return u8"（回车跳过；y = 认可；也可以直接输入正确写法）";
@@ -171,6 +203,73 @@ ConfirmResult apply_answer(const GapQuestion& q, const Answer& a, std::string* e
     auto set_err = [&](const std::string& m) { if (err) *err = m; };
     ConfirmResult r;
     auto& ks = KnowledgeStore::instance();
+
+    // ---- 写法冲突：用户选了一个写法 ----
+    //
+    // 【为什么要把其余的降级成 archived】它们不是"另一个知识"，而是**同一个词的听错版本**。
+    // 留着它们会：① 继续被当成独立候选去问；② 万一被确认就进识别提示
+    //    （实测发生过：`initial_prompt = "Marco, Erika"`，而正确的是 Erica）。
+    // 降级而不是删除，是因为"我听过 Erika 这个写法"本身是有价值的历史
+    // —— 而且删除不可逆（§6.5 的 archived 语义）。
+    if (q.rule == GapRule::ConflictingSpellings && !a.value.empty() &&
+        !q.alternatives.empty()) {
+        KnowledgeItem item;
+        item.kind        = q.kind;
+        item.key         = knowledge::normalize_key(a.value);
+        item.value       = a.value;
+        item.status      = "confirmed";
+        item.confidence  = 1.0;
+        item.source_text = u8"用户在写法冲突时选定";
+
+        std::string e1;
+        const long long id = ks.upsert(item, &e1, "user_edited");
+        if (id <= 0) {
+            r.outcome = ConfirmOutcome::Failed;
+            r.detail  = e1.empty() ? u8"写入知识库失败" : e1;
+            set_err(r.detail);
+            return r;
+        }
+        std::string e2;
+        // 【必须跳过"已经是 confirmed"的情况】`can_promote` 里 `from == to` 一律返回 false
+        // （"状态没变就不是一次状态变更"），于是对**已经确认过**的那个写法调
+        // set_status(id, "confirmed") 会失败。
+        //
+        // 而这恰恰是最常见的答案："现在用的这个是对的，另一个是听错的" ——
+        // 实测就撞上了：真跑一遍确认循环，第 1 问（Marco/Marko）报
+        //     [失败] 状态不允许从 confirmed 变为 confirmed
+        // 用户明明答对了，却被告知写不进去。
+        //
+        // 所以先读当前状态：已经是 confirmed 就算成功（本来就无需变更），
+        // 不要拿"没变化"当错误报给用户。
+        {
+            KnowledgeItem cur;
+            const bool known = ks.get(item.kind, item.key, &cur);
+            if (known && cur.status == "confirmed") {
+                // 已经是用户认可过的写法，什么都不用做
+            } else if (!ks.set_status(id, "confirmed", "user_confirmed", &e2)) {
+                r.outcome = ConfirmOutcome::Failed;
+                r.detail  = e2.empty() ? u8"确认状态失败" : e2;
+                set_err(r.detail);
+                return r;
+            }
+        }
+
+        int archived = 0;
+        for (const auto& alt : q.alternatives) {
+            if (knowledge::normalize_key(alt.value) == item.key) continue;
+            std::string e3;
+            if (ks.set_status(alt.knowledge_id, "archived", "superseded_by_spelling", &e3)) {
+                ++archived;
+            }
+        }
+        r.outcome = ConfirmOutcome::ConfirmedNewValue;
+        r.detail  = u8"记住了：" + a.value;
+        if (archived > 0) {
+            r.detail += u8"（另外 " + std::to_string(archived) +
+                        u8" 个写法已标为听错，不再使用）";
+        }
+        return r;
+    }
 
     if (a.kind == AnswerKind::Skip || q.knowledge_id <= 0) {
         r.outcome = ConfirmOutcome::Skipped;
@@ -308,17 +407,53 @@ ConfirmStats run_confirmation(const std::vector<GapQuestion>& questions,
 
         // 问过就记一次。**在 apply_answer 之前记** ——
         // 用户跳过也是"问过了"，只在答了才计数的话，同一个问题会永远排在候选里。
-        std::string me;
-        if (!KnowledgeStore::instance().mark_asked(q.knowledge_id, &me)) {
-            // 记不上不算致命：最坏的后果是这个问题下次还会问一遍。
-            // 但它必须可见 —— 静默失败正是本项目反复栽的坑。
-            out << u8"      [警告] 问答次数没记上：" << me << "\n";
+        //
+        // 【写法冲突必须把组里**每一个**都记上】那个问题一次问了 N 个写法，
+        // 只记第一个的话，剩下的几个下一场还会被单独问一遍 ——
+        // 用户会觉得"我不是刚回答过这个吗"。一件事只问一次，计数就要跟着问题的范围走。
+        std::vector<long long> asked_ids{q.knowledge_id};
+        if (q.rule == GapRule::ConflictingSpellings) {
+            for (const auto& alt : q.alternatives) {
+                if (alt.knowledge_id != q.knowledge_id) asked_ids.push_back(alt.knowledge_id);
+            }
+        }
+        for (const long long id : asked_ids) {
+            std::string me;
+            if (!KnowledgeStore::instance().mark_asked(id, &me)) {
+                // 记不上不算致命：最坏的后果是这个问题下次还会问一遍。
+                // 但它必须可见 —— 静默失败正是本项目反复栽的坑。
+                out << u8"      [警告] 问答次数没记上（#" << id << "）：" << me << "\n";
+            }
         }
 
-        const Answer a = interpret_answer(line);
-        std::string ae;
-        const ConfirmResult r = apply_answer(q, a, &ae);
+        // 选择题（写法冲突）走**另一条**解析：它的数字输入是有意义的，
+        // 而 interpret_answer 刻意把纯数字判成 Skip（见 interpret_choice 的说明）。
+        Answer a;
+        bool not_same = false;
+        if (q.rule == GapRule::ConflictingSpellings) {
+            const ChoiceAnswer ca = interpret_choice(line, q.alternatives.size());
+            not_same = ca.not_same;
+            if (ca.choice >= 1 && static_cast<size_t>(ca.choice) <= q.alternatives.size()) {
+                a.kind  = AnswerKind::NewValue;
+                a.value = q.alternatives[static_cast<size_t>(ca.choice) - 1].value;
+            } else {
+                a = ca.answer;
+            }
+        } else {
+            a = interpret_answer(line);
+        }
 
+        std::string ae;
+        ConfirmResult r;
+        if (not_same) {
+            // "不是同一个东西" —— 两个都留着，但都还是 candidate。
+            // **不 archive**：用户说的是"它们不是一回事"，不是"这两个都不对"。
+            // 它们是两个真实存在的词，只是我误以为相近而已。
+            r.outcome = ConfirmOutcome::RejectedUnchanged;
+            r.detail  = u8"已记下它们是两个不同的东西，两个都留着";
+        } else {
+            r = apply_answer(q, a, &ae);
+        }
         switch (r.outcome) {
         case ConfirmOutcome::Skipped:
             ++stats.skipped;

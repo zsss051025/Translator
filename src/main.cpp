@@ -2329,6 +2329,45 @@ static int run_selftest(const AppConfig& cfg) {
                     }
                 }
 
+                // ⑧ 整段大写的**标题行**里，一个词都不算专名证据
+                //
+                // 【真实数据（用户真跑会话 #13，段 98）】
+                // 播客的小标题是 `PUTTING IT TOGETHER`。整行大写里 8 个字母的
+                // `TOGETHER` 满足"连续 ≥2 个大写"，于是被判成缩写抽了出来，
+                // 还被问了一句「第一次听到「TOGETHER」。这个词的写法对吗？」
+                //
+                // 这条同时验两个修法，缺一个都会漏：
+                //   · 全大写当缩写**必须限长**（真缩写都在 5 个字母内）
+                //   · 整行大写是**排版**，这段在"大写"上零信息量，应当整段作废
+                {
+                    std::vector<Segment> segs = {
+                        mkseg(1, "PUTTING IT TOGETHER"),
+                        mkseg(2, "Welcome to EnglishPod."),
+                    };
+                    const auto c = extract_candidates(segs, 1);
+                    for (const char* bad : {"together", "putting"}) {
+                        if (has(c, bad)) {
+                            ex_ok = false;
+                            why3 = std::string("全大写标题行里的普通词被当成专名: ") + bad;
+                        }
+                    }
+                    // 但真正的缩写（≤5 字母）仍然要认出来 —— 别把 R3 修死
+                    if (ex_ok) {
+                        std::vector<Segment> t =
+                            {mkseg(1, "our KPI and the CRM system")};
+                        const auto ct = extract_candidates(t, 1);
+                        if (!has(ct, "kpi") || !has(ct, "crm")) {
+                            ex_ok = false;
+                            why3 = "真缩写 KPI/CRM 被全大写限长误杀了";
+                        }
+                    }
+                    // 单个词的段不整段作废（信息不足，不据此下结论）
+                    if (ex_ok) {
+                        std::vector<Segment> t = {mkseg(1, "OKAY")};
+                        (void)extract_candidates(t, 1);   // 只要求不崩、不误伤别的判据
+                    }
+                }
+
                 std::cout << "[SelfTest] 自动抽取（句首不算/收缩式排除/次数准确/一律候选）: "
                           << (ex_ok ? "✅ 通过" : "❌ 失败") << std::endl;
                 if (!ex_ok) {
@@ -2900,7 +2939,7 @@ static int run_selftest(const AppConfig& cfg) {
         if (!db_ok) return 1;
     }
 
-    // ---- 12) 知识缺口检测四条规则（§6.6 / §6.7）----
+    // ---- 12) 知识缺口检测六条规则（§6.6 / §6.7）----
     // 全内存构造，不碰数据库、不碰模型。
     {
         using knowledge::GapRule;
@@ -3060,8 +3099,90 @@ static int run_selftest(const AppConfig& cfg) {
             }
         }
 
-        std::cout << "[SelfTest] 知识缺口检测（四规则/去重/优先级/上限/问过不再问）: "
-                  << (gap_ok ? "✅ 11 例通过" : "❌ 失败") << std::endl;
+        // ⑫ **同一个实体的两种写法必须合并成一条问题**（用户真跑会话 #13 的形态）
+        //
+        // 真实经过：库里本来有 `Erica`（#43 听到，3 次），#13 这一场 Whisper
+        // 听成了 `Erika`。旧代码把它们当两条互不相干的知识，问了两个独立问题：
+        //     3. 已经听到 3 次「Erica」，一直没确认过。它是对的说法吗？  → 跳过
+        //     4. 第一次听到「Erika」。这个词的写法对吗？                 → 按了 y
+        // 用户的两个回答互相矛盾，而他**无从知道**这两个写法指的是同一个人
+        // —— 两个问题都没提到对方。结果 `Erika` 成了 confirmed，
+        // 下一场的 `initial_prompt` 变成 `Marco, Erika`（正确的是 Erica）。
+        //
+        // 所以这一组断言的是"**只出一条**"，而不是"能识别出冲突" ——
+        // 分开问两条也算"识别出来了"，但那正是出问题的地方。
+        {
+            std::vector<KnowledgeWithHistory> v = {
+                mk(220, "confirmed", "Erika", 2, 0.84, 0),   // 用户按过 y 的（其实是听错）
+                mk(221, "candidate", "Erica", 3, 0.80, 0),   // 证据更多的那个（对）
+            };
+            const auto q = knowledge::detect_gaps(v);
+            if (q.size() != 1) {
+                gap_ok = false;
+                why = "两种写法应合并成**一条**问题，实际出了 " +
+                      std::to_string(q.size()) + " 条";
+            } else if (q[0].rule != GapRule::ConflictingSpellings) {
+                gap_ok = false; why = "写法冲突没走 ConflictingSpellings 规则";
+            } else if (q[0].alternatives.size() != 2) {
+                gap_ok = false; why = "选项数应为 2";
+            } else if (q[0].alternatives[0].value != "Erica") {
+                // hits 降序 —— **刻意不按 confirmed 排前面**：
+                // 这个真实案例里 confirmed 的恰恰是错的那个，
+                // 按状态排序等于拿错误答案引导用户。
+                gap_ok = false; why = "选项应按 hits 降序（证据多的在前）";
+            } else if (q[0].question.find("Erika") == std::string::npos) {
+                // 冲突必须**摆出来**，这是这个问题全部的价值
+                gap_ok = false; why = "问题里没提到另一种写法 —— 用户还是只能瞎猜";
+            } else if (q[0].question.find(u8"现在按") == std::string::npos) {
+                gap_ok = false; why = "没说清当前在用哪个写法（用户不知道改动影响什么）";
+            } else if (q[0].alternatives[0].knowledge_id == 0) {
+                gap_ok = false; why = "选项没带上 knowledge_id，落库时选不了";
+            }
+        }
+
+        // ⑬ 相近但**不相干**的两个专名不能被误合并
+        //
+        // 合并错比不合并更糟：那会让用户在两个无关的词之间做选择。
+        {
+            std::vector<KnowledgeWithHistory> v = {
+                mk(230, "candidate", "Phoenix", 3, 0.9, 0),
+                mk(231, "candidate", "Marco",   3, 0.9, 0),
+            };
+            const auto q = knowledge::detect_gaps(v);
+            if (q.size() != 2) {
+                gap_ok = false;
+                why = "不相干的专名被误合并了（应各出一条，实际 " +
+                      std::to_string(q.size()) + " 条）";
+            }
+            for (const auto& x : q) {
+                if (x.rule == GapRule::ConflictingSpellings) {
+                    gap_ok = false; why = "不相干的专名走了写法冲突规则";
+                }
+            }
+        }
+
+        // ⑭ 两字母词不能靠编辑距离合并（PC / PB 这种太容易撞上）
+        {
+            std::vector<KnowledgeWithHistory> v = {
+                mk(240, "candidate", "PC", 3, 0.9, 0),
+                mk(241, "candidate", "PB", 3, 0.9, 0),
+            };
+            const auto q = knowledge::detect_gaps(v);
+            for (const auto& x : q) {
+                if (x.rule == GapRule::ConflictingSpellings) {
+                    gap_ok = false; why = "两字母词被误判成同一个实体";
+                }
+            }
+        }
+
+        // 【这里刻意不写"共 N 例"】原来写死了 `"✅ 11 例通过"`，
+        // 而加用例的人（我）不会记得回来改数字 —— 本轮加了 ⑫⑬⑭ 三条之后，
+        // 它照样打"11 例通过"，**在骗人**。手写计数就是这个下场。
+        // 想报真实数字就得让计数跟着用例走（像上面输入解释那组用数组长度），
+        // 而这组的用例是十四个代码块、不是一张表，所以宁可不报数字：
+        // 失败时 `why` 会指名道姓说是哪一条，那才是真正有用的信息。
+        std::cout << "[SelfTest] 知识缺口检测（六规则/去重/优先级/上限/问过不再问）: "
+                  << (gap_ok ? "✅ 通过" : "❌ 失败") << std::endl;
         if (!gap_ok) {
             std::cerr << "    " << why << std::endl;
             return 1;
@@ -3128,6 +3249,47 @@ static int run_selftest(const AppConfig& cfg) {
         std::cout << "[SelfTest] 确认交互·输入解释（是/否/新值/跳过）: "
                   << (cf_ok ? "✅ " : "❌ ") << ac_pass << "/"
                   << (sizeof(ac) / sizeof(ac[0])) << " 通过" << std::endl;
+
+        // ---- 13a2) 选择题解析（仅写法冲突用）----
+        //
+        // 【为什么必须和 interpret_answer 分开】后者**刻意**把纯数字判成 Skip
+        // （真实事故：用户答 `1`，库里多出一条 `term preview = 1 status=confirmed`）。
+        // 那个判定对"是/否 + 请给正确写法"仍然正确，但"这儿有两种写法选哪个"这类问题里，
+        // **数字就是最自然的回答**。两边共用一条解析必然牺牲一边：
+        // 要么允许数字当值（重新引入事故），要么用户没法选。
+        {
+            struct ChCase { const char* in; int choice; bool not_same; AnswerKind kind; };
+            const ChCase cc[] = {
+                {"1",     1, false, AnswerKind::Skip},
+                {"2",     2, false, AnswerKind::Skip},
+                {"3",    -1, false, AnswerKind::Skip},   // 越界 → 不当选择，退化成常规解释
+                {"12",   -1, false, AnswerKind::Skip},   // 多位数不认（选项最多 5 个）
+                {"n",    -1, true,  AnswerKind::Skip},
+                {u8"不是", -1, true, AnswerKind::Skip},
+                {"",     -1, false, AnswerKind::Skip},
+                // 「y」在选择题里没有确定含义（选哪个？）—— 不替用户猜，退化成 Skip
+                {"y",    -1, false, AnswerKind::Skip},
+                // 直接打出正确写法也认
+                {"Erica", -1, false, AnswerKind::NewValue},
+            };
+            int cc_pass = 0;
+            for (const auto& c : cc) {
+                const ChoiceAnswer ca = interpret_choice(c.in, 2);
+                if (ca.choice == c.choice && ca.not_same == c.not_same &&
+                    ca.answer.kind == c.kind) { ++cc_pass; continue; }
+                cf_ok = false;
+                why = std::string("选择题解析不对: ") + c.in +
+                      "（choice=" + std::to_string(ca.choice) +
+                      " not_same=" + (ca.not_same ? "1" : "0") + "）";
+                break;
+            }
+            std::cout << "[SelfTest] 选择题解析（编号/不是同一个/越界/y 不猜）: "
+                      << (cf_ok ? "✅ " + std::to_string(cc_pass) + "/" +
+                                  std::to_string(sizeof(cc) / sizeof(cc[0])) + " 通过"
+                                : "❌ 失败")
+                      << std::endl;
+            if (!cf_ok) { std::cerr << "    " << why << std::endl; return 1; }
+        }
 
         // ---- 13b) 循环 + 落库：走真实路径 ----
         if (cf_ok) {

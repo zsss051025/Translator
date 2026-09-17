@@ -141,7 +141,16 @@ Ev classify_token(const Token& t) {
     }
     if (is_never_name(lower_ascii(w))) return Ev::None;
 
-    if (all_upper && !any_lower) return Ev::StrongShape;      // R3: API / CRM / TV
+    // R3：全大写 = 缩写形状（API / CRM / TV / PC）。
+    //
+    // ⚠️ **必须限长。** 真实数据给的教训（用户真跑会话 #13）：
+    // 播客的小标题是整行大写 —— `PUTTING IT TOGETHER` —— 里面 8 个字母的
+    // `TOGETHER` 满足"连续 ≥2 个大写"，于是被当成缩写抽出来，
+    // 还被问了一句「第一次听到「TOGETHER」。这个词的写法对吗？」
+    // 真缩写没有超过 5 个字母的（CEO/CFO/KPI/OKR/SLA/SDK/HR/AI 全在 4 以内），
+    // 而"被大写强调的普通词"可以有任意长度 —— 长度就是这两者的分界。
+    constexpr size_t kMaxAcronymLen = 5;
+    if (all_upper && !any_lower && w.size() <= kMaxAcronymLen) return Ev::StrongShape;
     if (internal_upper)          return Ev::StrongShape;      // R2: EnglishPod
 
     // 【含撇号的一律不当"普通首字母大写"】I'm / It's / That's 全是收缩式，
@@ -153,6 +162,39 @@ Ev classify_token(const Token& t) {
     if (t.sentence_initial) return Ev::None;
 
     return Ev::WeakCap;                                       // R1，需要佐证
+}
+
+// 整段都是大写吗？—— 是的话这段是**标题行**，里面的大写一个都不算证据。
+//
+// 【真实来源】用户真跑会话 #13，段 98 是播客的小标题 `PUTTING IT TOGETHER`。
+// 整行大写是**排版**，不是专名的形状：同一个词在正文里就是普通小写词。
+// 所以标题行里"某词大写"这件事提供的信息量是**零**，应当整段作废，
+// 而不是逐个词去猜哪个像专名。
+//
+// 要求 ≥2 个词：单个词的段（`OKAY`）可能真的是在喊一个名字，
+// 或者就是个缩写，信息不足，不据此整段作废 —— 交给别的判据处理。
+bool is_all_caps_heading(const std::string& s) {
+    int words = 0, upper_words = 0;
+    size_t i = 0;
+    while (i < s.size()) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        const bool alpha = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        if (!alpha) { ++i; continue; }
+        const size_t b = i;
+        while (i < s.size()) {
+            const unsigned char d = static_cast<unsigned char>(s[i]);
+            if ((d >= 'A' && d <= 'Z') || (d >= 'a' && d <= 'z') || d == '\'') ++i;
+            else break;
+        }
+        const std::string word = s.substr(b, i - b);
+        ++words;
+        bool all_upper = true;
+        for (const unsigned char d : word) {
+            if (d >= 'a' && d <= 'z') { all_upper = false; break; }
+        }
+        if (all_upper) ++upper_words;
+    }
+    return words >= 2 && upper_words == words;
 }
 
 // 一颗 token 是不是"全小写出现的普通词"。
@@ -717,10 +759,13 @@ std::vector<ExtractedCandidate> extract_candidates(const std::vector<Segment>& s
     };
     std::map<std::string, KeyStat> stats;
     for (const auto& seg : segs) {
+        // 标题行整段作废（见 is_all_caps_heading）—— 它在"大写"这件事上零信息。
+        const bool heading = is_all_caps_heading(seg.src_text);
         for (const auto& t : tokenize(seg.src_text)) {
             const std::string key = normalize_key(t.text);
             if (key.empty()) continue;
             if (looks_lowercase_word(t)) { stats[key].lower_seen += 1; continue; }
+            if (heading) continue;
             switch (classify_token(t)) {
             case Ev::StrongShape: stats[key].strong = true; break;
             case Ev::WeakCap:     stats[key].cap_noninit += 1; break;

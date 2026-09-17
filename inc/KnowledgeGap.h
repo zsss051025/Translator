@@ -22,9 +22,10 @@
 
 namespace knowledge {
 
-// 五条规则
+// 六条规则
 enum class GapRule {
     ValueChanged,            // 旧值 ≠ 新值：与已有 Confirmed 值冲突（§6.6 第四条）
+    ConflictingSpellings,    // 同一个实体的两种写法（Erica / Erika）—— 见下面 struct 的说明
     InconsistentRendering,   // 译法不一致：同一个键的值变过多次（§6.6 第一条）
     HighFreqUnconfirmed,     // 高频未确认：hits >= 3 却还是 candidate（§6.6 第二条）
     NewlySeen,               // 本场第一次见到的专名（§6.4① 自动抽取的出口）
@@ -44,6 +45,29 @@ struct GapQuestion {
     int         hits       = 0;
     double      confidence = -1.0;
     std::string old_value;        // 仅 ValueChanged 有意义
+
+    // **同一个实体的其它写法**（仅 ConflictingSpellings 非空）。
+    //
+    // 【为什么需要这个字段 —— 用户真跑会话 #13 暴露的问题】
+    // 库里本来有 `Erica`（会话 #43 听到的，3 次），这一场 Whisper 听成了 `Erika`。
+    // 旧代码把它们**当成两条互不相干的知识**，于是问了两个独立的问题：
+    //     3. 已经听到 3 次「Erica」，一直没确认过。它是对的说法吗？   → 用户跳过
+    //     4. 第一次听到「Erika」。这个词的写法对吗？                  → 用户按了 y
+    // 两个回答互相矛盾，而用户**没有任何办法知道**这两个写法指的是同一个人 ——
+    // 因为两个问题都没提到对方。结果 `Erika` 成了 confirmed，
+    // 直接进了下一场的 `initial_prompt`（实测：`initial_prompt = "Marco, Erika"`。
+    // 播客主持人叫 Erica，Erika 是听错的）。
+    //
+    // 【判断】正确答案是**我们自己已经握在手里了**：库里有两条只差一个字母的记录，
+    // 本来就是"疑似同一个实体"。这种情况下把判断推给用户之前，
+    // 必须先把冲突摆出来 —— 否则用户只能瞎猜，而且猜错会被记成约束。
+    // 所以：合并成一个问题、一次给出全部选项。
+    struct Alt {
+        long long   knowledge_id = 0;
+        std::string value;
+        int         hits = 0;
+    };
+    std::vector<Alt> alternatives;
 
     // 面向用户的一句话（含"回车跳过"的暗示，由 2.4 渲染时补选项）
     std::string question;
