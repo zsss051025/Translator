@@ -9,6 +9,7 @@ struct AppConfig {
     std::string whisper_model;      // Whisper GGML 模型路径
     std::string hunyuan_model;      // 混元 GGUF 模型路径
     std::string db_path;            // 翻译记录 SQLite 路径
+    bool        db_path_explicit = false;  // 用户是否显式给了 --db（见下面 run_selftest 的用法）
     std::string deepseek_api_key;   // 可为空，选择云端后端时才要求非空
     bool        list_only = false;  // --help / --list：只打印配置后退出
     bool        selftest  = false;  // --selftest：不加载模型，只验证数据层通路

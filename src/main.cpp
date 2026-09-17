@@ -1037,6 +1037,56 @@ static int run_test_window(const AppConfig& cfg) {
 static int run_selftest(const AppConfig& cfg) {
     std::cout << "[SelfTest] 数据层自检开始（不需要模型）" << std::endl;
 
+    // 自检会**真的往库里写会话**（它要验落库往返）。所以没显式给 --db 时，
+    // 自己开一个临时库、跑完删掉 —— 绝不往用户的默认 `translations.db` 里塞假会话。
+    //
+    // 【为什么必须有这道闸】默认库路径是相对于**当前目录**的 `translations.db`。
+    // 用户从 exe 所在目录（`build\RelWithDebInfo\`）跑一次 `--selftest`，
+    // 历史库里就多出几场 `engine=SelfTest` 的假会话：它们会出现在"最近会话"里，
+    // 将来还会被 agent 的 `list_sessions` / 交付物当成真会话读进去。
+    // 这个坑实测踩过 —— 在项目根目录跑了几次不带 --db 的 `--selftest`，
+    // 根目录就留下一个只装着 11 场自检会话的 `translations.db`。
+    //
+    // 显式给了 --db 时照旧（`--selftest --db t.db` 是文档里的用法，
+    // 也是"让新版程序打开某个库一次以补齐触发器/迁移"的入口，那条路径必须保留）。
+    bool scratch_db = !cfg.db_path_explicit;
+    AppConfig scfg = cfg;
+    if (scratch_db) {
+        std::error_code ec;
+        const auto tmp = std::filesystem::temp_directory_path(ec);
+        const auto dir = ec ? std::filesystem::path(".") : tmp;
+        scfg.db_path = (dir / "at_selftest_scratch.db").string();
+        // 上次崩溃可能留下残骸；先删，否则自检结果会被旧数据影响
+        std::error_code rmec;
+        std::filesystem::remove(scfg.db_path, rmec);
+        std::cout << "[SelfTest] 未指定 --db，使用一次性临时库: " << scfg.db_path
+                  << "\n           （不会碰你的 translations.db；要验指定库请加 --db <路径>）"
+                  << std::endl;
+    } else {
+        std::cout << "[SelfTest] 使用数据库: " << scfg.db_path << std::endl;
+    }
+
+    // 收尾时删掉临时库。必须在 SessionStore 关掉**之后**删 ——
+    // Windows 下文件被 sqlite 打开着是删不掉的。
+    struct ScratchCleanup {
+        bool active = false;
+        std::string path;
+        ~ScratchCleanup() {
+            if (!active) return;
+            SessionStore::instance().close();
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+            if (ec) {
+                std::cerr << "[SelfTest] 临时库删除失败（不影响自检结论）: "
+                          << path << " —— " << ec.message() << std::endl;
+            } else {
+                std::cout << "[SelfTest] 已删除一次性临时库: " << path << std::endl;
+            }
+        }
+    } cleanup;
+    cleanup.active = scratch_db;
+    cleanup.path   = scfg.db_path;
+
     // ---- 1) 重叠去重逻辑 ----
     // 用例全部取自真实会话日志。
     struct DedupCase { const char* prev; const char* cur; const char* want; };
@@ -1767,7 +1817,7 @@ static int run_selftest(const AppConfig& cfg) {
     }
 
     auto& store = SessionStore::instance();
-    if (!store.init(cfg.db_path)) {
+    if (!store.init(scfg.db_path)) {
         std::cerr << "[SelfTest] init 失败" << std::endl;
         return 1;
     }

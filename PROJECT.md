@@ -439,7 +439,7 @@ cd C:\dev\projects\AudioTranslator\build\RelWithDebInfo
 
 | 命令 | 验什么 | 期望 |
 |---|---|---|
-| `--selftest --db t.db` | **纯逻辑**：清洗、去重、术语、行动项校验、WAV 解析、知识落库+FTS 往返、缺口检测 | 全部通过（不需要模型，秒级） |
+| `--selftest [--db <库>]` | **纯逻辑**：清洗、去重、术语、行动项校验、WAV 解析、知识落库+FTS 往返、缺口检测 | 全部通过（不需要模型，秒级）。**不给 `--db` 时用 %TEMP% 下的一次性库并跑完删掉** —— 自检会真的写会话，绝不能污染你的默认库 |
 | `--test-window` | 悬浮窗外观、滚动、滚轮回看、拉伸 | 6 句示例 + 40 秒停留 |
 | **`--wav <file>`** | **整条管线端到端**（不打开音频设备、零交互） | 识别→翻译→落库→交付物，退出码 0 |
 | **`--gaps --db t.db`** | 库里的待确认知识 → 该问用户什么（§6.7） | 按优先级列出问题，最多 5 个 |
@@ -474,6 +474,14 @@ cd C:\dev\projects\AudioTranslator\build\RelWithDebInfo
 
 也可以用来看**迁移**是否生效：拿一个改动前建的旧库跑一遍
 `Translator.exe --selftest --db <旧库>`，四张表应自动出现（建表语句全是 `IF NOT EXISTS`）。
+
+> ⚠️ **这个用法必须显式带 `--db`，而且它会在那个库里写几场自检会话** ——
+> 这是有意的（"让新版程序打开某个库一次以补齐触发器/迁移"就靠它）。
+> 反过来，**不给 `--db` 时自检不碰任何已有库**：它在 `%TEMP%` 下开一次性库、跑完删掉。
+> 为什么要这么分：默认库路径是**相对当前目录**的 `translations.db`，
+> 用户从 exe 所在目录跑一次不带 `--db` 的 `--selftest`，
+> 历史库里就会多出几场 `engine=SelfTest` 的假会话，被 `list_sessions` / 交付物当成真会话读进去。
+> "用户指了库"和"用了默认值"是两件事，所以 `AppConfig` 里有个 `db_path_explicit` 区分它们。
 判断依据：库里会多出 `knowledge_fts_config` / `_data` / `_docsize` / `_idx`
 —— **那是 SQLite 给 FTS5 虚表自己建的影子表，出现它们就说明是真 FTS5**。
 

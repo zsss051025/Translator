@@ -89,7 +89,7 @@ AppConfig AppConfig::from(int argc, char** argv) {
         };
         if (arg == "--whisper")            next(cfg.whisper_model);
         else if (arg == "--hunyuan")       next(cfg.hunyuan_model);
-        else if (arg == "--db")            next(cfg.db_path);
+        else if (arg == "--db")          { next(cfg.db_path); cfg.db_path_explicit = true; }
         else if (arg == "--out")           next(cfg.deliverable_dir);
         else if (arg == "--api-key")       next(cfg.deepseek_api_key);
         else if (arg == "--help" || arg == "-h" || arg == "--list") cfg.list_only = true;

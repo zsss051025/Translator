@@ -254,6 +254,10 @@
 | 09-17 | 2.6c **测具用了真实数据的形状，就会被真实数据绊倒** | `verify_memory.py` 的 FTS 探针写的是 `("term","englishpod")` —— 库里真有了 englishpod 之后，INSERT 撞 `UNIQUE(kind,key)`，脚本自己崩，而真正要验的"触发器维护索引"根本没跑到。→ 探针必须用**不可能碰撞的合成键**（同 `__selftest_` 的思路） |
 | 09-17 | 2.6c **FTS 探针不能用带下划线的词** | 换合成键后第二次假失败：`__verify_fts_a__` 被 unicode61 分词器按 `_` 切开，索引里只有 `verify`/`fts`/`a`，`MATCH 'verifyftsa'` 当然找不到。**用 `fts5vocab` 看过真实 token 表才确认**，没靠猜 |
 | 09-17 | 2.6c **清理只能降级，不能删** | 清理污染库时选择 `status='archived'` 而不是 `DELETE`：archived 已经不进提示/约束（§6.5 红线），效果等价，但**可逆、可复查**。`tools/knowledge_audit.py` 强制这条（脚本里没有 delete 分支） |
+| 09-17 | **`--selftest` 不指定 `--db` 会往默认库写假会话** | 默认库是**相对当前目录**的 `translations.db`，而自检要验落库往返、所以真的写会话。两个事实叠起来就是陷阱：从 exe 所在目录（`build\RelWithDebInfo\`）跑一次不带 `--db` 的 `--selftest`，**历史库里就多出几场 `engine=SelfTest` 的假会话**，它们会出现在"最近会话"里，将来还会被 agent 的 `list_sessions` / 交付物当成真会话读进去。我在项目根目录跑了几次，就留下一个只装着 11 场自检会话的 `translations.db`。**已修**：没显式给 `--db` 时自检自己开临时库（`%TEMP%`），跑完删掉；显式给了就照旧（那是"让新版程序打开某库一次以补触发器/迁移"的入口，必须保留） |
+| 09-17 | **我给用户的命令少了一个参数，代价是他的库被写脏** | 我在交付说明里写 `--selftest`，文档里写的是 `--selftest --db t.db`。**从文档里抄命令，不要凭记忆重写** —— 少一个参数的后果不是"命令失败"，是**静默往用户的真实数据里写东西**。这次真正被写脏的只是一个新建的根目录 `translations.db`（历史库没被碰），但性质上不该靠运气 |
+| 09-17 | **`--db` 是不是用户给的，本身就是个信号** | 修上面那个坑时发现：光有默认值不够，必须知道"用户到底指没指库"。于是 `AppConfig.db_path_explicit`。**别用一个值同时表达"默认"和"用户明确要求"** —— 需要区分时再加一个标志，而不是去猜路径长得像不像默认值 |
+| 09-17 | **修复前的候选会在下次真跑时变成蠢问题** | 用户真实库里 11 条 candidate 全是修复前抽取器留的，虽然红线守住了（0 条 confirmed，从没进过提示词），但下次会话会问「已经听到 5 次「Froze」，它是对的说法吗？」。**"不影响行为"不等于"不用清理"** —— 提问是稀缺资源，一个蠢问题就在消耗用户对记忆的信任 |
 | 09-17 | 2.6b **中文会议原本"学不到任何知识"** | 抽取器的英文规则靠**首字母大写**，中文没有大小写 → 中文会议里「张伟负责下周的报价」**一个候选都抽不出来** → 知识库不长 → 没问题可问 → 三条腿没输入 → **"越用越懂你"在中文场景下完全不成立**。而中文会议正是这产品的主场。已补 R6（姓氏+佐证）/R7（后缀） |
 | 09-17 | 2.6b **`strcmp` 用在前缀判断上** | 判断"人名后面跟的是不是动词"时，传进去的是**后面剩下的整串**（"负责下周的报价"），而我用了 `strcmp` **全等** → 只有动词正好落在串尾才匹配。后果：「张伟负责下周的报价」里的**张伟完全抽不到**，而「那边的**反馈**」里的假人名「边的」**反而被抽到**（反馈正好在串尾）。**批量用例才抓得出来，单个用例很可能刚好避开** |
 | 09-17 | 2.6b **"人名里不能含虚词"要从第 2 个字查起** | 「那边**的**反馈」→ 边是姓氏、反馈是佐证动词 → 抽出假人名「边的」。但第 1 个字不能查：「于」本身是常见姓氏，一查就会把「于伟」这类真名字挡掉 |
@@ -312,7 +316,10 @@ cd C:\dev\projects\AudioTranslator
 cmd /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"" >nul 2>&1 && set VCPKG_ROOT=C:\dev\vcpkg && cmake --build build --config RelWithDebInfo --target Translator"
 
 # 2. L1 自检：必须 33 组全过
-.\build\RelWithDebInfo\Translator.exe --selftest --db t.db
+#    ⚠️ 不给 --db 时自检自己开 %TEMP% 下的一次性库并跑完删掉（不会碰你的 translations.db）。
+#       要验**指定的库**（或让它补触发器/迁移）就显式加 --db。
+.\build\RelWithDebInfo\Translator.exe --selftest
+.\build\RelWithDebInfo\Translator.exe --selftest --db build\RelWithDebInfo\t.db
 
 # 2a. **长期记忆有没有真的生效**（2.6c 起）—— 不加载模型，秒级
 .\build\RelWithDebInfo\Translator.exe --terms --db build\RelWithDebInfo\t.db
