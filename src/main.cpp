@@ -3398,6 +3398,31 @@ static int run_selftest(const AppConfig& cfg) {
                 }
             }
 
+            // ⑤c 开工语：**让复用看得见**（真实数据暴露的问题 —— 复用是静默的）
+            {
+                interaction::ReuseBrief b;
+                const std::string s = interaction::reuse_intro(b);
+                if (s.empty()) {
+                    ix_ok = false; iwhy = "没有知识时开工语是空的（用户分不清'没记忆功能'和'记忆是空的'）";
+                } else if (s.find(u8"从零开始") == std::string::npos) {
+                    ix_ok = false; iwhy = "空库的开工语没说清'从零开始'";
+                }
+
+                b.items.push_back({"EnglishPod", u8"指的是这个英语博客的名字"});
+                b.items.push_back({"不会念这个词", ""});
+                b.background_only = 2;
+                const std::string s2 = interaction::reuse_intro(b);
+                if (s2.find("EnglishPod") == std::string::npos) {
+                    ix_ok = false; iwhy = "开工语里没有列出学到的词";
+                } else if (s2.find(u8"这个英语博客的名字") == std::string::npos) {
+                    ix_ok = false; iwhy = "开工语没带上用户教过的含义";
+                } else if (s2.find(u8"带着之前学到的 2 条") == std::string::npos) {
+                    ix_ok = false; iwhy = "开工语没报条数";
+                } else if (s2.find(u8"不参与识别") == std::string::npos) {
+                    ix_ok = false; iwhy = "开工语没说清背景知识不参与识别";
+                }
+            }
+
             // ⑥ **内部状态一个字都不许出现**（这一组最重要的一条）
             //
             // 把内部才会有的说法全列出来，任何一种出现在**任何**一条文案里都算失败。
@@ -3446,8 +3471,12 @@ static int run_selftest(const AppConfig& cfg) {
                 }
                 // 开场和收尾也一样要过这一关
                 for (const char* bad : kForbidden) {
+                    interaction::ReuseBrief rb;
+                    rb.items.push_back({"X", "Y"});
                     if (interaction::intro(3).find(bad) != std::string::npos ||
                         interaction::intro(1).find(bad) != std::string::npos ||
+                        interaction::reuse_intro(rb).find(bad) != std::string::npos ||
+                        interaction::reuse_intro(interaction::ReuseBrief{}).find(bad) != std::string::npos ||
                         interaction::summary(2, 3, 0).find(bad) != std::string::npos ||
                         interaction::no_input_note().find(bad) != std::string::npos) {
                         ix_ok = false;
@@ -3855,6 +3884,36 @@ int main(int argc, char** argv) {
     // --glossary 保留：它是"我知道我要说什么、先手工喂给你"的显式入口，仍然有用。
     ConstraintInputs kb;
     const std::vector<std::string> glossary = build_glossary(cfg, &kb);
+    // 把**给用户看的那句话**放在最前面，然后才是内部计数、最后是实际送进引擎的字符串。
+    //
+    // 【顺序是刻意的，从"人"到"机器"】用户先要知道"它记不记得我"，
+    // 再（如果想深究）看条数，最后才是那串 initial_prompt。
+    //
+    // 【为什么必须有第一句 —— 真实数据暴露的】用户跑完三场演示后，
+    // "第二次知道"这一拍在屏幕上**完全看不见**：系统确实把上一场的词带进了
+    // 本场的识别提示，但没有任何一句话说出来。而"越用越懂你"的全部说服力
+    // 就在这一句上 —— 一个不说的机制，对使用者来说等于不存在。
+    if (kb.store_ready) {
+        interaction::ReuseBrief brief;
+        // 词条来自 kb.terms（能进识别/翻译的），含义从库里按展示形取。
+        // 这里只做**组装**，措辞在 Interaction 层（它不认识 KnowledgeItem）。
+        for (const auto& t : kb.terms) {
+            interaction::KnownItem it;
+            it.name = t;
+            KnowledgeItem row;
+            // 用展示形当键去查（normalize 后匹配）：kb.terms 里存的正是展示形
+            if (SessionStore::instance().long_term_memory_ready() &&
+                KnowledgeStore::instance().get("term", knowledge::normalize_key(t), &row)) {
+                it.meaning = row.definition;
+            } else if (KnowledgeStore::instance().get("person", knowledge::normalize_key(t), &row)) {
+                it.meaning = row.definition;
+            }
+            brief.items.push_back(std::move(it));
+        }
+        brief.background_only = kb.confirmed_total > kb.terms.size()
+                                    ? kb.confirmed_total - kb.terms.size() : 0;
+        std::cout << "\n[复用] " << interaction::reuse_intro(brief) << std::endl;
+    }
     if (kb.store_ready) {
         std::cout << "[知识库] confirmed 条目 " << kb.confirmed_total << " 条，"
                   << "其中可用作识别提示/翻译约束的词条 " << kb.terms.size() << " 条";

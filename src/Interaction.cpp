@@ -265,4 +265,35 @@ std::string no_input_note() {
     return u8"（先到这儿，剩下的以后再说）";
 }
 
+std::string reuse_intro(const ReuseBrief& b) {
+    // 【"另有 N 条"不许说死原因】confirmed_total > terms 有两种来源：
+    //   ① 事实/决定类（整句话，本来就只作背景）
+    //   ② 同一个词的两条记录（比如 person 和 term 各一条）被按值去重了
+    // 我第一版写成"另有 N 条**事实/决定类**"，在 ② 的情况下就是错的
+    // （实测 demo.db：多出来的那条是重复的「是的」，不是事实类）。
+    // 所以只说它**不参与识别**这个事实，不解释为什么。
+    const std::string bg_note =
+        b.background_only > 0
+            ? u8"\n      （另有 " + std::to_string(b.background_only) +
+              u8" 条只用于整理纪要，不参与识别）"
+            : std::string();
+
+    if (b.items.empty()) {
+        // 第一场演示的起点就是这一句。**不能返回空串** ——
+        // "我现在什么都不记得"是要让用户知道的信息（否则他分不清
+        // "系统没有记忆功能"和"系统有记忆但现在还是空的"）。
+        return u8"我这边还没有关于你的任何记录，这一场从零开始听。" + bg_note;
+    }
+
+    std::string s = u8"开工之前先说一句：我带着之前学到的 " +
+                    std::to_string(b.items.size()) + u8" 条知识。\n";
+    for (const auto& it : b.items) {
+        s += u8"        · " + it.name;
+        if (!it.meaning.empty()) s += u8" —— " + it.meaning;
+        s += u8"\n";
+    }
+    s += u8"      （识别时会偏向这些词，翻译时统一写法）" + bg_note;
+    return s;
+}
+
 }  // namespace interaction
