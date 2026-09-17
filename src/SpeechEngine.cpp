@@ -82,7 +82,23 @@ void SpeechEngine::set_language_policy(const std::string& source_lang, int reche
 	std::lock_guard<std::mutex> lock(lang_mutex_);
 	requested_lang_   = source_lang.empty() ? "auto" : source_lang;
 	lang_recheck_sec_ = recheck_sec > 0 ? recheck_sec : 120;
-	current_lang_.clear();                          // 策略变了，重新检测
+
+	// 【用户指定了语言，那它就是当前源语言 —— 不能只是清空等检测】
+	//
+	// 【现象】`--lang en --target en`（源==目标，本该跳过翻译）实际走了翻译，
+	// 而且**把内容改了**：实测 jfk.wav 的 `Ask not!` 被"译"成 `Do not ask!`，
+	// `what your country...` 被改成 `What your country...`；落库 engine 是 Hunyuan
+	// 而不是 passthrough。
+	//
+	// 【原因】三处串起来才看得出来：
+	//   ① requested_lang_ != "auto" → should_detect_language() 永远返回 false
+	//   ② update_detected_language() 只在 lang_arg == "auto" 时才被调用
+	//   ⇒ current_lang_ **永远是空的** ⇒ get_language() 返回 ""
+	//   ⇒ 主循环里那条"源语言 == 目标语言就跳过翻译"的守卫永远不触发。
+	//
+	// 【判断】指定了就是指定了 —— 直接把它当当前源语言。
+	// auto 模式下仍然保持为空，等 whisper 检测（那条路本来就能正常写上）。
+	current_lang_ = (requested_lang_ == "auto") ? std::string() : requested_lang_;
 	last_detect_ = std::chrono::steady_clock::time_point{};
 }
 
