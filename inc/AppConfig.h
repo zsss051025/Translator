@@ -44,6 +44,21 @@ struct AppConfig {
     // 不加就是**只读**的排查模式（反复跑不改变库状态）。
     bool        extract_apply = false;
 
+    // ---- Agent 工具层（§7 步骤 5.1）----
+    //
+    // --tools                 只打印已注册的工具、description 和 JSON Schema
+    // --tools <名字>           真跑一次那个工具
+    // --tools <名字> --args '<json>'   带参数跑
+    //
+    // 【为什么必须有这个命令】Agent 出问题时，"模型不会用工具"和"工具本身坏了"
+    // 在日志里长得一模一样（都表现为"最后没给出有用答案"）。这个命令把两者分开：
+    // 打印 schema 能看出描述写歪了没有；跑一次能看出工具在真实数据上返回什么。
+    // 而且**命令行和 Agent 走的是同一个 ToolRegistry::call** ——
+    // 不给自己留第二条路径（这个项目因为"诊断工具和真实路径不一致"栽过三次）。
+    bool        tools_list_only = false;
+    std::string tools_name;
+    std::string tools_args;
+
     // --ask / --no-ask：会话结束时的确认交互（§6.7 / §7 步骤 2.4）。
     //
     // 三态，而不是一个 bool：

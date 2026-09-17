@@ -107,6 +107,15 @@ AppConfig AppConfig::from(int argc, char** argv) {
             catch (...) { cfg.extract_session = -1; }
         }
         else if (arg == "--apply")         cfg.extract_apply = true;
+        else if (arg == "--tools") {
+            // 后面跟不跟名字都合法：单独出现 = 只打印
+            cfg.tools_list_only = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                cfg.tools_name      = argv[++i];
+                cfg.tools_list_only = false;
+            }
+        }
+        else if (arg == "--args")          next(cfg.tools_args);
         else if (arg == "--ask")           cfg.ask_mode = AppConfig::AskMode::Always;
         else if (arg == "--no-ask")        cfg.ask_mode = AppConfig::AskMode::Never;
         else if (arg == "--translator")    next(cfg.translator);

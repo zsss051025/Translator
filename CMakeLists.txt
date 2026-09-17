@@ -42,6 +42,7 @@ add_executable(Translator
 	src/ConfirmGaps.cpp
 	src/KnowledgeExtract.cpp
 	src/Utf8.cpp
+	src/AgentTool.cpp
 	src/DeliverableWriter.cpp
 	src/LlmSummarizer.cpp
 	src/CaBundle.cpp
@@ -59,6 +60,7 @@ add_executable(Translator
 	inc/ConfirmGaps.h
 	inc/KnowledgeExtract.h
 	inc/Utf8.h
+	inc/AgentTool.h
 	inc/DeliverableWriter.h
 	inc/LlmSummarizer.h
 	inc/CaBundle.h

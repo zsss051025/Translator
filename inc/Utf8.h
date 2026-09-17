@@ -57,4 +57,13 @@ bool is_valid(const std::string& s);
 // 合法输入**原样返回**（逐字节相同），所以可以放心地放在热路径上。
 std::string sanitize(const std::string& s, size_t* replaced = nullptr);
 
+// 按**字节上限**截断，但**退到字符边界**，保证结果仍是合法 UTF-8。
+// 截断时在末尾追加 marker（默认 "…（已截断）"）。
+//
+// 【为什么需要它】Agent 的工具结果要进模型上下文，必须限长；
+// 而"截断"正是最容易切在字符中间的操作 ——
+// 这个项目已经因为按字节切而产出过**整份非法 UTF-8 的交付物**（见本文件开头）。
+std::string truncate(const std::string& s, size_t max_bytes,
+                     const std::string& marker = "\xE2\x80\xA6\xEF\xBC\x88\xE5\xB7\xB2\xE6\x88\xAA\xE6\x96\xAD\xEF\xBC\x89");
+
 }  // namespace utf8

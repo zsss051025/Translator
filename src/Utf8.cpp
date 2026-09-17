@@ -90,4 +90,23 @@ std::string sanitize(const std::string& s, size_t* replaced) {
     return out;
 }
 
+std::string truncate(const std::string& s, size_t max_bytes, const std::string& marker) {
+    // 先净化再截断 —— 反过来会先切坏、再"净化"出一堆 U+FFFD
+    size_t fixed = 0;
+    const std::string clean = sanitize(s, &fixed);
+    if (clean.size() <= max_bytes) return clean;
+
+    // 预算不够时宁可少给内容，也别让 marker 把上限撑爆
+    const bool room = max_bytes > marker.size();
+    const size_t keep = room ? (max_bytes - marker.size()) : max_bytes;
+
+    // 退到字符边界：UTF-8 的续字节长这样 10xxxxxx，一直退到不是续字节为止
+    size_t cut = keep;
+    while (cut > 0 && (static_cast<unsigned char>(clean[cut]) & 0xC0) == 0x80) --cut;
+
+    std::string out = clean.substr(0, cut);
+    if (room) out += marker;
+    return out;
+}
+
 }  // namespace utf8

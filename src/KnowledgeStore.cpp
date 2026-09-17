@@ -197,7 +197,14 @@ std::string fts_query_from_user_text(const std::string& raw) {
         if (!out.empty()) out += " AND ";
         out += '"';
         out += tok;
-        out += '"';
+        // 【为什么每个词都加 `*`（前缀匹配）】FTS5 默认是**整词**匹配：
+        // 查 "eric" 查不到 "Erica"。而打这个查询的通常是**人随手打的半截词**，
+        // 或者**Agent 从用户话里截出来的词** —— 整词匹配会让它们得到
+        // "库里没有这条知识"这个**错误结论**，而"查不到"和"库里没有"
+        // 在调用方看起来一模一样。
+        // 实测：`"eric"` → 0 条；`"eric"*` → 命中 Erica。
+        // （用例见 tools/agent_tools_check.py 的 search_knowledge）
+        out += "\"*";
         tok.clear();
     };
 

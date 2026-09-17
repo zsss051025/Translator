@@ -19,6 +19,7 @@
 #include "ConfirmGaps.h"
 #include "KnowledgeExtract.h"
 #include "Utf8.h"
+#include "AgentTool.h"
 #include "DeliverableWriter.h"
 #include "LlmSummarizer.h"
 #include "SubtitleWindow.h"
@@ -31,6 +32,24 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>   // 确认交互的自检用 istringstream 喂脚本化回答
+
+#include "json.hpp"  // Agent 工具层的自检要判断"结果是不是合法 JSON"
+
+// 一段文本是不是**语法上合法的 JSON**。
+//
+// 【为什么自检要单独验这个】Agent 的工具结果会被塞进模型上下文，
+// 模型要按字段读。一个拼歪的 JSON（少个引号、中文被 ensure_ascii 转义丢了）
+// 在 C++ 里看不出任何异常 —— 只有解析时才炸，而那时问题已经到模型那边了。
+// 所以"能解析"必须当成断言，而不是等它出问题。
+static bool json_ok(const std::string& s) {
+    if (s.empty()) return false;
+    try {
+        (void)nlohmann::json::parse(s);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
 
 // 仅对 ASCII 做小写化（中文不受影响）。
 // 用途：黑名单匹配必须大小写不敏感——原实现用 result.find() 是敏感的，
@@ -648,6 +667,64 @@ static int run_extract(const AppConfig& cfg) {
     confirm_gaps_at_session_end(cfg, sid);
     store.close();
     return 0;
+}
+
+// --tools [名字] [--args '<json>']：看工具层，或者手动跑一个工具。
+//
+// 【为什么这是一个必需的命令，而不是"顺手加的"】
+// Agent 出问题时，"是模型不会用工具"和"工具本身坏了"是两回事，
+// 而它们在日志里长得一模一样（都表现为"最后没给出有用答案"）。
+// 有了它就能把两者分开：
+//   ① 只打印 → 确认**模型看到的工具定义**长什么样（description/schema 写歪了，模型就不会调）
+//   ② 带 --args 跑 → 确认**工具本身**在真实数据上返回什么
+// （这个项目因为"诊断工具和真实路径不一致"栽过三次，所以这里刻意只走一条路径：
+//   命令行调用和 Agent 调用都走同一个 ToolRegistry::call）
+static int run_tools(const AppConfig& cfg) {
+    agent::ToolRegistry reg;
+    agent::register_readonly_tools(reg);
+
+    agent::ToolContext ctx;
+    ctx.deliverable_root = cfg.deliverable_dir;
+
+    if (cfg.tools_list_only) {
+        std::cout << "[Tools] 已注册 " << reg.size() << " 个工具（5.1 全部只读）：" << std::endl;
+        for (const auto& n : reg.names()) {
+            const agent::Tool* t = reg.find(n);
+            std::cout << "  · " << n << std::endl;
+            std::cout << "      " << t->description << std::endl;
+            std::cout << "      params: " << t->params_schema << std::endl;
+        }
+        std::cout << "\n[Tools] function calling 用的 tools 数组（" 
+                  << reg.tools_json().size() << " 字节）：" << std::endl;
+        std::cout << reg.tools_json() << std::endl;
+        return 0;
+    }
+
+    // 指定了工具名 → 真跑一次。
+    //
+    // ⚠️ **刻意不在这里预检查"工具存在吗"**。
+    // 第一版这里加了一句 `if (reg.find(name) == nullptr) { 报错并 return 1; }`，
+    // 结果是 `ToolRegistry::call()` 里那段"未知工具就把它能用的工具列表回给模型"的
+    // 逻辑**从命令行永远走不到** —— 于是命令行和 Agent 走了两条不同的路。
+    // 这个项目因为"诊断工具和真实路径不一致"栽过三次（见 §8.8），
+    // 而这次是在同一个文件的注释里刚警告完就又犯了一次。
+    // 判断依据：**这里只负责打开库和打印，所有分支判断都留在 call() 里。**
+    if (!SessionStore::instance().init(cfg.db_path)) {
+        std::cerr << "[Tools] 打不开数据库: " << cfg.db_path << std::endl;
+        return 1;
+    }
+
+    std::cout << "[Tools] 调用 " << cfg.tools_name
+              << "  args=" << (cfg.tools_args.empty() ? "{}" : cfg.tools_args) << std::endl;
+    const auto r = reg.call(cfg.tools_name, cfg.tools_args, ctx);
+    if (!r.ok) {
+        std::cerr << "[Tools] 失败：" << r.error << std::endl;
+    } else {
+        std::cout << "[Tools] 摘要：" << r.audit << std::endl;
+    }
+    std::cout << r.content << std::endl;
+    SessionStore::instance().close();
+    return r.ok ? 0 : 1;
 }
 
 // --export <id>：命令行方式生成交付物
@@ -1725,19 +1802,23 @@ static int run_selftest(const AppConfig& cfg) {
         // 这一组专门钉住"打标点不会让查询报错"—— 搜索框崩掉是最没面子的一类 bug。
         struct QueryCase { const char* in; const char* want; };
         const QueryCase qc[] = {
-            {"phoenix",            "\"phoenix\""},
-            {"Q4, 2024",           "\"Q4\" AND \"2024\""},
+            // 【每个词后面都带 `*`】FTS5 默认整词匹配，"eric" 查不到 "Erica"。
+            // 而输入这个查询的通常是人打的半截词、或 Agent 从用户话里截的词 ——
+            // 整词匹配会让他们得到"库里没这条知识"这个错误结论。
+            // 实测：`"eric"` → 0 条；`"eric"*` → 命中 Erica。
+            {"phoenix",            "\"phoenix\"*"},
+            {"Q4, 2024",           "\"Q4\"* AND \"2024\"*"},
             // 这三个是操作符，必须被中性化，否则 MATCH 直接语法错
-            {"AND",                "\"AND\""},
-            {"-foo",               "\"foo\""},
-            {"a\"b",               "\"a\" AND \"b\""},
-            {"(unclosed",          "\"unclosed\""},
+            {"AND",                "\"AND\"*"},
+            {"-foo",               "\"foo\"*"},
+            {"a\"b",               "\"a\"* AND \"b\"*"},
+            {"(unclosed",          "\"unclosed\"*"},
             // 纯标点 → 空串（调用方据此返回空结果，不发查询）
             {"???",                ""},
             {"   ",                ""},
             // 中文必须整字保留，不能被当标点切碎
-            {u8"埃里卡",           u8"\"埃里卡\""},
-            {u8"埃里卡，你好",     u8"\"埃里卡\" AND \"你好\""},
+            {u8"埃里卡",           u8"\"埃里卡\"*"},
+            {u8"埃里卡，你好",     u8"\"埃里卡\"* AND \"你好\"*"},
         };
         bool q_ok = true;
         int  q_pass = 0;
@@ -2186,6 +2267,166 @@ static int run_selftest(const AppConfig& cfg) {
                               << (z_ok ? "✅ 通过" : "❌ 失败") << std::endl;
                     if (!z_ok) {
                         std::cerr << "    " << whyz << std::endl;
+                        return 1;
+                    }
+                }
+
+                // ---- ⑩ Agent 工具层（§7 步骤 5.1）----
+                //
+                // 【这一组守的是什么】工具层是 Agent 唯一能"动手"的地方。
+                // 它出问题有两种表现，而且在日志里长得一样（"最后没给出有用答案"）：
+                //   ① 模型不会用 —— schema/description 拼歪了，模型根本不会调用
+                //   2 工具本身坏了 —— 参数解析、限长、错误路径
+                // 所以这里把两边都钉住：schema 必须能被解析、每个工具必须真跑通、
+                // **出错必须变成"回一句话"而不是异常**（模型会猜错名字、会吐半截 JSON，
+                // 这两件事在循环里一定会发生，不能让整个任务崩掉）。
+                {
+                    bool a_ok = true;
+                    std::string whya;
+                    agent::ToolRegistry reg;
+                    agent::register_readonly_tools(reg);
+
+                    // ① 注册清单
+                    const char* must_have[] = {"search_knowledge", "knowledge_history",
+                                               "list_sessions", "get_session",
+                                               "get_session_report"};
+                    if (reg.size() != 5) {
+                        a_ok = false;
+                        whya = "应注册 5 个工具，实际 " + std::to_string(reg.size());
+                    }
+                    for (const char* n : must_have) {
+                        if (!a_ok) break;
+                        if (reg.find(n) == nullptr) {
+                            a_ok = false;
+                            whya = std::string("缺少工具：") + n;
+                        }
+                    }
+
+                    // ② 重名 / 空名 / 无实现必须被拒（宁可注册失败，也不能让
+                    //    "调用哪个"取决于注册顺序 —— 那是不可复现的行为）
+                    if (a_ok) {
+                        std::string e;
+                        if (reg.add({"search_knowledge", "dup", "{}", nullptr}, &e)) {
+                            a_ok = false; whya = "重名工具应被拒绝";
+                        }
+                        if (a_ok && reg.add({"", "empty", "{}", [](auto, auto, auto) {
+                                return agent::ToolResult{}; }}, &e)) {
+                            a_ok = false; whya = "空名工具应被拒绝";
+                        }
+                        if (a_ok && reg.add({"no_impl", "x", "{}", nullptr}, &e)) {
+                            a_ok = false; whya = "没有实现的工具应被拒绝";
+                        }
+                    }
+
+                    // ③ function calling 用的 tools 数组必须合法、字段齐全
+                    if (a_ok) {
+                        const std::string tj = reg.tools_json();
+                        if (!utf8::is_valid(tj)) { a_ok = false; whya = "tools_json 不是合法 UTF-8"; }
+                        else {
+                            if (!json_ok(tj)) { a_ok = false; whya = "tools_json 不是合法 JSON"; }
+                        }
+                        if (a_ok) {
+                            for (const auto& n : reg.names()) {
+                                const auto* t = reg.find(n);
+                                if (t->description.empty() || t->params_schema.empty()) {
+                                    a_ok = false;
+                                    whya = "工具 " + n + " 缺 description 或 params_schema";
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // ④ 出错路径：未知工具必须把"能用的工具"回给模型
+                    agent::ToolContext ctx;
+                    ctx.deliverable_root = cfg.deliverable_dir;
+                    if (a_ok) {
+                        const auto r = reg.call("definitely_not_a_tool", "{}", ctx);
+                        if (r.ok) { a_ok = false; whya = "未知工具应返回失败"; }
+                        else if (r.content.find("available_tools") == std::string::npos ||
+                                 r.content.find("search_knowledge") == std::string::npos) {
+                            a_ok = false;
+                            whya = "未知工具时没把可用工具列表回给模型（模型就无从改口）";
+                        }
+                    }
+                    // ⑤ 参数不是合法 JSON（模型吐半截 JSON 是常态）
+                    if (a_ok) {
+                        const auto r = reg.call("get_session", "{\"session_id\":", ctx);
+                        if (r.ok) { a_ok = false; whya = "坏参数应返回失败"; }
+                        else if (r.error.find("JSON") == std::string::npos) {
+                            a_ok = false; whya = "坏参数应明确说'不是合法 JSON'";
+                        }
+                    }
+
+                    // ⑥ 每个只读工具在**真实库**上跑通，且结果是合法 JSON
+                    //
+                    // 【必须自己造数据】第一版直接查 "erica" —— 那等于**依赖库里已经有知识**，
+                    // 换个空库跑就红。项目自己的规矩是"断言必须与真实数据隔离"（§8.8⑬）：
+                    // 用 `__selftest_` 前缀插一条探针，跑完按前缀清掉。
+                    if (a_ok) {
+                        KnowledgeItem tmp;
+                        tmp.kind        = "person";
+                        tmp.key         = "__selftest_tool_probe";
+                        tmp.value       = "EricaToolProbe";
+                        tmp.status      = "candidate";
+                        tmp.confidence  = 0.8;
+                        tmp.source_text = u8"自检造的探针（工具层用例）";
+                        std::string e;
+                        if (KnowledgeStore::instance().upsert(tmp, &e) <= 0) {
+                            a_ok = false;
+                            whya = "工具层用例的探针知识写不进去：" + e;
+                        }
+                    }
+                    if (a_ok) {
+                        const std::string sid_s = std::to_string(sid);   // 自检会话，一定存在
+                        struct Tc { const char* name; std::string args; };
+                        const Tc tcs[] = {
+                            {"search_knowledge",   "{\"query\":\"EricaToolProbe\"}"},
+                            {"knowledge_history",  "{\"key\":\"__selftest_tool_probe\"}"},
+                            {"list_sessions",      "{\"days\":3650,\"limit\":3}"},
+                            {"get_session",        "{\"session_id\":" + sid_s + ",\"max_segments\":2}"},
+                            {"get_session_report", "{\"session_id\":0}"},
+                        };
+                        for (const auto& c : tcs) {
+                            if (!a_ok) break;
+                            const auto r = reg.call(c.name, c.args, ctx);
+                            // get_session_report 对"没生成过纪要的会话"**应当**失败 —— 那是对的
+                            if (!r.ok && std::string(c.name) != "get_session_report") {
+                                a_ok = false;
+                                whya = std::string(c.name) + " 在真实库上跑失败：" + r.error;
+                                break;
+                            }
+                            if (!utf8::is_valid(r.content)) {
+                                a_ok = false; whya = std::string(c.name) + " 的结果不是合法 UTF-8";
+                                break;
+                            }
+                            if (!json_ok(r.content)) {
+                                a_ok = false; whya = std::string(c.name) + " 的结果不是合法 JSON";
+                                break;
+                            }
+                        }
+                        // 自检自己造的数据自己擦
+                        KnowledgeStore::instance().purge_key_prefix("__selftest_tool_");
+                    }
+
+                    // ⑦ 限长必须真的生效（不生效就会一次撑爆模型上下文）
+                    if (a_ok) {
+                        const std::string base = "{\"session_id\":" + std::to_string(sid);
+                        const auto r = reg.call("get_session", base + ",\"max_segments\":1}", ctx);
+                        if (r.ok && r.content.size() > 13000) {
+                            a_ok = false; whya = "工具结果超过硬上限";
+                        }
+                        // 参数越界要被夹住，而不是照单全收
+                        const auto r2 = reg.call("get_session", base + ",\"max_segments\":99999}", ctx);
+                        if (r2.ok && r2.content.size() > 13000) {
+                            a_ok = false; whya = "max_segments 越界没有被夹住";
+                        }
+                    }
+
+                    std::cout << "[SelfTest] Agent 工具层（注册/schema/真跑/错误路径/限长）: "
+                              << (a_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+                    if (!a_ok) {
+                        std::cerr << "    " << whya << std::endl;
                         return 1;
                     }
                 }
@@ -2761,6 +3002,7 @@ int main(int argc, char** argv) {
     if (cfg.test_window)  return run_test_window(cfg);
     if (cfg.show_gaps)    return run_show_gaps(cfg);
     if (cfg.extract_session >= 0) return run_extract(cfg);
+    if (cfg.tools_list_only || !cfg.tools_name.empty()) return run_tools(cfg);
     if (!cfg.dump_prompt.empty()) return run_dump_prompt(cfg);
     if (cfg.export_session >= 0) return run_export(cfg);
 
