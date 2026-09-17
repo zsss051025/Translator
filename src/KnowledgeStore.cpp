@@ -434,24 +434,14 @@ long long KnowledgeStore::upsert(const KnowledgeItem& item, std::string* err,
         sqlite3_finalize(st);
     }
 
-    // 只在调用方**给了**含义时才动 definition 那一列。
+    // 【2.8 之后这里不再写 definition】含义**只有用户能提供**，
+    // 唯一入口是 `set_definition()`。
     //
-    // 【为什么单独一条 UPDATE、而不是塞进上面两条】含义描述的是**这个实体**，
-    // 不是"这一次的写法"：值变了（Erika → Erica）含义照样成立，不该被清掉；
-    // 而调用方不给含义时（绝大多数写入路径）也绝不能把它覆盖成空 ——
-    // 那等于"用户教过的东西被下一次自动抽取抹掉"，而且**用户看不出来**。
-    auto write_definition = [&](long long id) {
-        if (item.definition.empty()) return;
-        sqlite3_stmt* st = nullptr;
-        if (sqlite3_prepare_v2(db, "UPDATE knowledge SET definition = ?, updated_at = ? WHERE id = ?;",
-                               -1, &st, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text (st, 1, item.definition.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text (st, 2, ts.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(st, 3, id);
-            sqlite3_step(st);
-            sqlite3_finalize(st);
-        }
-    };
+    // 原本这里有一个 `write_definition` lambda，但它现在没有调用者：
+    // 问含义那条路径已经改成不经过 upsert 了（upsert 会顺手 hits+1，
+    // 而"用户答了一句它指什么"不是又听到一次）。
+    // 留着它等于**两条都能写含义的路**，而这个项目已经因为"同一件事有多条路"
+    // 栽过三次。所以直接删掉，让"含义只能从用户来"变成结构保证。
 
     // 会话内的出现次数由调用方给（抽取器知道"这个名字这场听到了几次"）。
     //
@@ -516,7 +506,6 @@ long long KnowledgeStore::upsert(const KnowledgeItem& item, std::string* err,
             sqlite3_step(st);
             sqlite3_finalize(st);
         }
-        write_definition(old.id);
         return old.id;
     }
 
@@ -579,7 +568,6 @@ long long KnowledgeStore::upsert(const KnowledgeItem& item, std::string* err,
         }
     }
     // 全文索引跟着改：由 knowledge 上的 AFTER UPDATE 触发器负责，这里不写任何 FTS 语句。
-    write_definition(old.id);
     return old.id;
 }
 
@@ -640,6 +628,29 @@ bool KnowledgeStore::set_definition(const std::string& kind, const std::string& 
     if (ss.db_ == nullptr) { set_err(u8"库未打开"); return false; }
 
     const std::string nk = knowledge::normalize_key(key);
+
+    // **先读旧含义**，再改。
+    //
+    // 【为什么不能一条 SQL 搞定】我第一版把"读旧值"和"写历史"合成一条
+    // `INSERT ... SELECT COALESCE(definition,'')`, 而它跑在 UPDATE **之后** ——
+    // 于是历史里的 old_value 存的是**新值**，时间线上看起来"含义从来没变过"。
+    // 这种错不会报错、不会被自检发现，只会让"你凭什么这么说"这条承诺悄悄失效。
+    std::string old_definition;
+    {
+        sqlite3_stmt* rs = nullptr;
+        if (sqlite3_prepare_v2(ss.db_, "SELECT COALESCE(definition,'') FROM knowledge "
+                                       "WHERE kind = ? AND key = ?;",
+                               -1, &rs, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(rs, 1, kind.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(rs, 2, nk.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(rs) == SQLITE_ROW) {
+                const unsigned char* p = sqlite3_column_text(rs, 0);
+                if (p) old_definition = reinterpret_cast<const char*>(p);
+            }
+            sqlite3_finalize(rs);
+        }
+    }
+
     sqlite3_stmt* st = nullptr;
     const char* sql = "UPDATE knowledge SET definition = ?, updated_at = ? "
                       "WHERE kind = ? AND key = ?;";
@@ -664,6 +675,39 @@ bool KnowledgeStore::set_definition(const std::string& kind, const std::string& 
         set_err(u8"库里没有这条知识，含义无处附着");
         return false;
     }
+
+    // 读回旧含义，然后**记一条历史**。
+    //
+    // 【为什么含义必须进历史】`knowledge_history` 是"每条知识都要能回答
+    // '你凭什么这么说'"这条承诺的落地，而"用户教会了系统一个概念"是其中
+    // **价值最高的一次变化** —— 它不进历史的话，演示和复盘时那条时间线里
+    // 就看不见这一步（表现为"库里突然有个 definition，不知道谁写的"）。
+    //
+    // 【reason 为什么单独起一个名字】不能用 user_edited / model_extracted：
+    // `distinct_values()` 会数历史里出现过多少个**不同的 new_value**，
+    // 用它判"同一个键的写法变过好几次"。含义不是"写法"，
+    // 记成同一个 reason 会让"译法不一致"这条规则凭空误报。
+    // 所以既有专门 reason，`distinct_values()` 也显式跳过它。
+    {
+        sqlite3_stmt* hs = nullptr;
+        const char* sqlh =
+            "INSERT INTO knowledge_history"
+            "(knowledge_id,old_value,new_value,changed_at,source_session,source_seq,"
+            " source_text,reason) "
+            "SELECT id, ?, ?, ?, NULL, NULL, ?, 'definition_defined' "
+            "FROM knowledge WHERE kind = ? AND key = ?;";
+        if (sqlite3_prepare_v2(ss.db_, sqlh, -1, &hs, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(hs, 1, old_definition.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(hs, 2, definition.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(hs, 3, ts.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(hs, 4, u8"用户在会话结束确认时给出含义", -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(hs, 5, kind.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(hs, 6, nk.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(hs);
+            sqlite3_finalize(hs);
+        }
+    }
+
     // FTS 索引由 knowledge 上的 AFTER UPDATE 触发器自动跟上，这里不写任何 FTS 语句。
     return true;
 }

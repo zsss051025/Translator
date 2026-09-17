@@ -450,6 +450,7 @@ cd C:\dev\projects\AudioTranslator\build\RelWithDebInfo
 | **`python tools\knowledge_audit.py --db <db>`** | **库的卫生审计**：独立 sqlite3 读原始行，标出可疑条目 + 同 key 多 kind + FTS 漂移 | 列出 confirmed/candidate/archived 计数与逐条内容；可疑项给出可直接复制的 `--archive` 命令 |
 | **`python tools\knowledge_audit.py --db <db> --archive <key>... [--apply]`** | 把假条目**降级**为 archived（默认 dry-run） | 打印将改动的行；`--apply` 后报剩余 confirmed 数。**脚本里没有 delete 分支** |
 | **`python tools\extract_case_probe.py --db <db> --session <id> [词...]`** | **抽取判据的取证工具**：把一组词在本场的每一次出现连同大小写、段首/非句首列出来 | §6.4① 那张"三条判据各自必需"的表就是它的输出。**改抽取规则之前先跑它** |
+| **`python tools\loop_evidence.py --db <db> [--last N]`** | **闭环证据**：把多场会话按顺序摆出来 —— 每场抽出什么候选、之后库里变了什么（`knowledge_history` 时间戳）、到那一刻下次开会能带上哪些词 | **演示"第一次不知道 → 教它 → 第二次知道"时唯一能拿出证据的命令**。它只排库里的原始行、不重新推断；抽取那一步调**同一个 exe**，避免出现第二份规则实现 |
 | **`python tools\agent_tools_check.py`** | **工具层回归**（跨进程边界，验模型实际拿到的那串 JSON） | schema 可解析 / 每个工具真跑通 / 限长生效 / 三种错误路径都回话不崩 |
 | **`--ask` / `--no-ask`** | 会话结束的确认交互是否启用（不指定 = 看情况，见 §6.7） | `[确认] 跳过（<原因>）` 或真的问出来 |
 | **`python tools\ab_translation_constraint.py`** | **§6.5 红线的行为级回归**：真句子 + 真模型 | ① 基线逐字复现历史失败 ② candidate 与基线**逐字相同** ③ confirmed 把译文纠正成 `Erica`/`Marco` |
@@ -1112,7 +1113,21 @@ knowledge_history(
   id, knowledge_id, old_value, new_value, changed_at,
   source_session, source_seq, source_text,
   reason               -- user_confirmed | model_extracted | user_edited
+                       -- | value_changed_demoted | superseded_by_spelling
+                       -- | definition_defined   ← 2.8：用户教了含义
 );
+```
+
+> ⚠️ **`definition_defined` 必须被"译法不一致"那条规则排除。**
+> 那条规则数的是"同一个键出现过多少个**不同的值**"，而含义不是写法。
+> 不排除的话，教完含义下一场会问用户
+> 「「EnglishPod」的写法变过好几次，固定成哪一种？」—— 他完全不知道在说什么。
+> 所以 `distinct_values()` 里显式 `continue`（有专门的自检用例 ⑲）。
+
+> **为什么含义也要进历史**：`knowledge_history` 是"每条知识都要能回答'你凭什么这么说'"
+> 这条承诺的落地，而"用户教会了系统一个概念"是其中**价值最高的一次变化**。
+> 不进历史的话，复盘时那条时间线里看不见这一步 ——
+> 表现为"库里突然有个 definition，不知道谁写的"。
 
 -- 行动项（跨会话追踪）
 actions(
@@ -1236,6 +1251,7 @@ Erika 是谁？                 → 查 kind=person, key=erika
 | **2.6d** | **提问质量**：写法冲突合并成一问（`Erica`/`Erika`）、R3 全大写收紧（`TOGETHER`）、措辞改成人话 | L1 + **L3** | 2.6c | ✅ |
 | **2.7** | **含义入库**：`knowledge.definition` + 「它指什么」规则 + 进摘要背景/检索（闭环的最后一环） | L1 + **L3** | 2.6d | ✅ |
 | **2.8** | **独立交互层**：文案搬出检测逻辑、类型化提问、回执说清"以后怎么用"、内部状态不外泄 | L1 + **L3** | 2.7 | ✅ |
+| **2.8b** | 含义进 `knowledge_history`（时间线里看得见"用户教了含义"）+ `tools/loop_evidence.py`（闭环证据） | L1 + **L3** | 2.8 | ✅ |
 | 2.7 | `--ask` 检索（§6.9）四类问法 | L1 + L2 | 2.2 | |
 | 2.8 | Action 跨会话追踪 `Todo / Doing / Done`（§6.8） | L1 | 2.2 | |
 

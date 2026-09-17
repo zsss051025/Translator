@@ -3446,6 +3446,42 @@ static int run_selftest(const AppConfig& cfg) {
             if (!ix_ok) { std::cerr << "    " << iwhy << std::endl; return 1; }
         }
 
+        // ⑲ **教含义的那条历史不能被当成"值变化过"**
+        //
+        // 2.8 把"用户教了含义"也记进了 knowledge_history（否则时间线里看不见这一步，
+        // 表现为"库里突然有个 definition，不知道谁写的"）。
+        // 但 `distinct_values()` 是数"出现过多少个不同的值"来判
+        // 「译法不一致」的 —— 含义不是写法，必须排除。
+        // 不排除的话，教完含义下一场就会问用户
+        // 「「EnglishPod」的写法变过好几次，固定成哪一种？」—— 他完全不知道在说什么。
+        {
+            std::vector<KnowledgeWithHistory> v = {
+                mk(500, "candidate", "EnglishPod", 1, 0.9, 0, ""),
+            };
+            add_hist(v[0], "EnglishPod", u8"英语播客节目", "definition_defined");
+            const auto q = knowledge::detect_gaps(v);
+            for (const auto& x : q) {
+                if (x.rule == GapRule::InconsistentRendering) {
+                    gap_ok = false;
+                    why = "教含义的历史被当成了「值变化过好几次」";
+                }
+            }
+            // 但真正的值变化仍然要触发（别把规则修死）
+            std::vector<KnowledgeWithHistory> v2 = {
+                mk(501, "candidate", "EnglishPod", 1, 0.9, 0, u8"已有含义"),
+            };
+            add_hist(v2[0], "EnglishPod", "English Pod", "model_extracted");
+            add_hist(v2[0], "English Pod", "EnglishPod", "model_extracted");
+            const auto q2 = knowledge::detect_gaps(v2);
+            bool found = false;
+            for (const auto& x : q2) {
+                if (x.rule == GapRule::InconsistentRendering) found = true;
+            }
+            if (!found) {
+                gap_ok = false; why = "真正的多次值变化反而没被识别";
+            }
+        }
+
         // 【这里刻意不写"共 N 例"】原来写死了 `"✅ 11 例通过"`，
         // 而加用例的人（我）不会记得回来改数字 —— 本轮加了 ⑫⑬⑭ 三条之后，
         // 它照样打"11 例通过"，**在骗人**。手写计数就是这个下场。

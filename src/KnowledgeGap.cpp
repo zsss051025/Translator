@@ -44,9 +44,17 @@ int priority_of(GapRule r) {
 namespace {
 
 // 历史里出现过多少个**不同**的值（含当前值之外的历史值）
+//
+// ⚠️ **必须跳过 `definition_defined`**：含义不是"写法"。
+// 2.8 把"用户教了含义"也记进了 knowledge_history（否则时间线里看不见这一步），
+// 如果不在这里排除，一句含义就会被当成一个"不同的值" ——
+// 于是"译法不一致"（同一个键的值变过好几次）会凭空误报，
+// 而那条问题会问用户"「EnglishPod」的写法变过好几次，固定成哪一种？" ——
+// 用户完全不知道它在说什么。
 size_t distinct_values(const std::vector<KnowledgeStore::HistoryRow>& hist) {
     std::vector<std::string> vals;
     for (const auto& h : hist) {
+        if (h.reason == "definition_defined") continue;
         if (!h.new_value.empty() &&
             std::find(vals.begin(), vals.end(), h.new_value) == vals.end()) {
             vals.push_back(h.new_value);
