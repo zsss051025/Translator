@@ -126,6 +126,24 @@ Answer interpret_answer(const std::string& raw) {
     constexpr size_t kMaxValueLen = 60;
     if (t.size() > kMaxValueLen) return a;
 
+    // 【为什么必须要求"含字母或汉字"】真实事故（会话 #46/#47）：
+    // 用户在某个问题上答了 `1`，于是库里多出一条
+    //     term  preview = 1   status=confirmed
+    // —— 一个值是纯数字的"专名"。它随后进了识别提示和翻译约束
+    // （`constraint_terms` 只检查长度上限，没有下限）。
+    //
+    // 而"用数字回答"是很自然的习惯（有人会按"1/2/3"来选项）。
+    // 专名不可能是纯数字或纯符号，所以这里直接判成 Skip —— 不猜他的意思。
+    {
+        bool has_word_char = false;
+        for (const unsigned char c : t) {
+            if ((c >= '0' && c <= '9') || c == ' ' || c == '\t') continue;
+            has_word_char = true;      // 任何非数字非空白的字节都算（含 UTF-8 汉字/全角字符）
+            break;
+        }
+        if (!has_word_char) return a;
+    }
+
     a.kind  = AnswerKind::NewValue;
     a.value = t;
     return a;

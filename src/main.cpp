@@ -242,6 +242,30 @@ static ConstraintInputs load_constraints_from_knowledge() {
     return ci;
 }
 
+// 术语清单的**唯一装配点**。
+//
+// 这段"知识库 confirmed + --glossary 文件、按归一化键去重合并"的逻辑
+// 原本在三个地方各写了一遍（主路径 / run_dump_prompt / 别处）。
+// 而本项目"诊断工具和真实路径走散"已经踩过三次（见 run_dump_prompt 的注释），
+// 每一次都是因为同一段逻辑存在第二份拷贝。只要还有第二份，第四次就是时间问题。
+//
+// out_kb 可以为 nullptr；传入时会带回知识库侧的统计（条数/背景），
+// 让调用方不必为了拿统计而再查一次库（再查一次就可能查出不同的结果）。
+static std::vector<std::string> build_glossary(const AppConfig& cfg, ConstraintInputs* out_kb) {
+    const auto kb = load_constraints_from_knowledge();
+    if (out_kb) *out_kb = kb;
+
+    std::vector<std::string> glossary = kb.terms;
+    for (const auto& t : load_glossary_terms(cfg.glossary_path)) {
+        bool dup = false;
+        for (const auto& e : glossary) {
+            if (knowledge::normalize_key(e) == knowledge::normalize_key(t)) { dup = true; break; }
+        }
+        if (!dup) glossary.push_back(t);
+    }
+    return glossary;
+}
+
 
 // --export <session_id>：把指定会话导出为交付物
 // （纪要 markdown / 行动项 csv / 单文件网页 / 双语字幕）
@@ -820,6 +844,62 @@ static int run_demo_session(const AppConfig& cfg) {
 
 // --dump-prompt <文本>：只加载混元模型，打印 prompt 与 tokenize 结果后退出。
 // 用途：不用声卡就能验证特殊 token（<｜hy_User｜> 等）是否被正确识别。
+// --terms：不加载任何模型，打印"这次启动会把什么喂给识别和翻译"，然后退出。
+//
+// 存在的理由（这是它区别于"我读了一遍代码"的地方）：
+// §6.5 红线的可观测面就是**那串 initial_prompt**。以前只有真跑一场会、
+// 在启动日志里翻 `[识别提示]` 那一行才能看到它 —— 要录音、要等 Whisper 加载
+// 上百秒，验一次的成本高到没人会验。所以库被污染了没人发现，
+// 直到用户自己看日志问"这些词哪来的"。
+//
+// 这条命令几秒钟给同一个答案，而且走的是同一个 build_glossary()，
+// 不可能出现"诊断看到的和真跑时不一样"。
+static int run_dump_terms(const AppConfig& cfg) {
+    SessionStore::instance().init(cfg.db_path);
+
+    ConstraintInputs kb;
+    const std::vector<std::string> glossary = build_glossary(cfg, &kb);
+
+    std::cout << "库: " << cfg.db_path << std::endl;
+    if (!kb.store_ready) {
+        std::cout << "知识库未就绪（库不存在 / 未建表 / FTS5 未编入）。" << std::endl;
+    } else {
+        std::cout << "confirmed: " << kb.confirmed_total << " 条"
+                  << "（其中可作识别提示/翻译约束 " << kb.terms.size() << " 条，"
+                  << "摘要背景 " << kb.background.size() << " 条）" << std::endl;
+    }
+
+    std::cout << "\n--- ① 识别提示（Whisper initial_prompt）---" << std::endl;
+    const std::string prompt = terms_to_prompt(glossary);
+    if (prompt.empty()) {
+        std::cout << "(空) —— 引擎不会收到任何 initial_prompt" << std::endl;
+    } else {
+        std::cout << prompt << std::endl;
+    }
+
+    std::cout << "\n--- ② 翻译约束（逐条下发）---" << std::endl;
+    if (glossary.empty()) {
+        std::cout << "(空)" << std::endl;
+    } else {
+        for (size_t i = 0; i < glossary.size(); ++i) {
+            std::cout << "  [" << (i + 1) << "] " << glossary[i] << std::endl;
+        }
+    }
+
+    std::cout << "\n--- ③ 摘要背景（进 user 内容，不参与约束）---" << std::endl;
+    if (kb.background.empty()) {
+        std::cout << "(空)" << std::endl;
+    } else {
+        for (const auto& b : kb.background) std::cout << "  " << b << std::endl;
+    }
+
+    // 结论行：给脚本一个可以 grep 的锚点（人看的是上面，脚本看的是这行）
+    std::cout << "\n[terms] prompt_chars=" << prompt.size()
+              << " glossary=" << glossary.size()
+              << " background=" << kb.background.size() << std::endl;
+    return 0;
+}
+
 static int run_dump_prompt(const AppConfig& cfg) {
     HunyuanTranslator hy(cfg.hunyuan_model);
     if (!hy.init()) {
@@ -837,17 +917,10 @@ static int run_dump_prompt(const AppConfig& cfg) {
     //      因为文件路径是空的，prompt 里干干净净，看起来完全正常。
     // 【判断】以后凡是往翻译 prompt 里加东西，都要回来确认这里也加上了。
     //
-    // 现在直接复用主路径那个"三条腿"的取数函数，两边不可能再走散。
+    // 现在直接复用**唯一**的装配函数，两边不可能再走散。
     SessionStore::instance().init(cfg.db_path);   // 知识库要先打开
-    const auto kb = load_constraints_from_knowledge();
-    std::vector<std::string> glossary = kb.terms;
-    for (const auto& t : load_glossary_terms(cfg.glossary_path)) {
-        bool dup = false;
-        for (const auto& e : glossary) {
-            if (knowledge::normalize_key(e) == knowledge::normalize_key(t)) { dup = true; break; }
-        }
-        if (!dup) glossary.push_back(t);
-    }
+    ConstraintInputs kb;
+    const std::vector<std::string> glossary = build_glossary(cfg, &kb);
     hy.set_glossary(glossary);
     std::cout << "[Dump] 翻译约束共 " << glossary.size() << " 条"
               << "（知识库 confirmed " << kb.terms.size()
@@ -1986,6 +2059,55 @@ static int run_selftest(const AppConfig& cfg) {
                 }
             }
 
+            // ---- 同一 key 两种 kind 不得在背景里出现两次 ----
+            //
+            // 【真实来源】2026-xx 清理污染库时 `--terms` 打出来的是：
+            //     - Marco（人名）
+            //     - Marco（术语）
+            // 因为条目身份是 (kind,key)：`Marco` 一场会话抽成 person，
+            // 另一场用户确认成 term，就成了两行。
+            // 存储层这样设计没错，但背景是给模型看的**陈述**，
+            // 同一个名字说两遍、还给了两个互相矛盾的标签，是纯噪声。
+            {
+                using knowledge::background_lines;
+                KnowledgeItem a;
+                a.kind = "person"; a.key = "marco"; a.value = "Marco";
+                a.status = "confirmed"; a.hits = 3;
+                KnowledgeItem b;
+                b.kind = "term";   b.key = "marco"; b.value = "Marco";
+                b.status = "confirmed"; b.hits = 1;
+                KnowledgeItem c;
+                c.kind = "term";   c.key = "tv";    c.value = "TV";
+                c.status = "confirmed"; c.hits = 2;
+
+                const auto lines = background_lines({a, b, c}, 32);
+                bool ok = true;
+                std::string why;
+                int marco = 0;
+                for (const auto& l : lines) {
+                    if (l.find("Marco") != std::string::npos) marco += 1;
+                }
+                if (marco != 1) {
+                    ok = false;
+                    why = "同一个 key 的两种 kind 在背景里出现了 " +
+                          std::to_string(marco) + " 次，应为 1 次";
+                } else if (lines.size() != 2) {
+                    ok = false;
+                    why = "背景行数应为 2（Marco + TV），实际 " +
+                          std::to_string(lines.size());
+                } else if (lines[0].find(u8"人名") == std::string::npos) {
+                    // hits 降序：保留的应是证据更强的 person 那一行
+                    ok = false;
+                    why = "应保留 hits 更高的 person 行，实际: " + lines[0];
+                }
+                std::cout << "[SelfTest] 背景去重（同 key 两种 kind 只出一行）: "
+                          << (ok ? "✅ 通过" : "❌ 失败") << std::endl;
+                if (!ok) {
+                    std::cerr << "    " << why << std::endl;
+                    return 1;
+                }
+            }
+
             // ---- 2.6 抽取器：从转录里认出专名候选 ----
             //
             // 【这一组的用例全部来自真实数据，不是我编的】
@@ -2267,6 +2389,115 @@ static int run_selftest(const AppConfig& cfg) {
                               << (z_ok ? "✅ 通过" : "❌ 失败") << std::endl;
                     if (!z_ok) {
                         std::cerr << "    " << whyz << std::endl;
+                        return 1;
+                    }
+                }
+
+                // ---- ⑨b 真实数据抽取回归：会话 #47 的假阳性 ----
+                //
+                // 【这一组是整组里最值钱的】它用的**不是手写语料** ——
+                // 是用户真实录的一场 EnglishPod 播客（53 段）里的原文。
+                // 光靠 R1（首字母大写 + 非句首）时，这一场抽出了 8 个假阳性：
+                //   down(6) Keep(4) Midnight movies(3) Speaking Learners Exactly preview
+                // 全是普通词 —— 大写只是因为被当作**词汇标题**写（`Keep It Down.`）、
+                // 标题式大写（`Speaking of Movies`）、或者称呼语（`Hello English Learners`）。
+                //
+                // 而 4 个真专名（Erica / EnglishPod / Marco / TV）**必须同时保住** ——
+                // 所以两个方向都要断言，只测一边等于没测。
+                {
+                    using namespace knowledge;
+                    bool r_ok = true;
+                    std::string whyr;
+
+                    struct RCase {
+                        const char* name;
+                        std::vector<const char*> segs;
+                        std::vector<const char*> must_have;
+                        std::vector<const char*> must_not_have;
+                    };
+                    const RCase cases[] = {
+                        {
+                            u8"#47 真实播客关键句",
+                            {
+                                u8"Hello English Learners and welcome to EnglishPod.",
+                                u8"My name is Marco. And I'm Erica.",
+                                u8"Erica. Today we are really excited, right?",
+                                u8"that you hear in movies and TV shows.",
+                                u8"Yeah, Speaking of Movies,",
+                                u8"at the movies. Exactly.",
+                                u8"So Erica, what is it when someone is inconsistent?",
+                                u8"Keep It Down.",
+                                u8"examples on how we use Keep It Downs.",
+                                u8"Keep it down so we can understand.",
+                                u8"do you mind keeping it down?",
+                                u8"It's After Midnight.",
+                                u8"preview.",
+                            },
+                            {"erica", "marco", "englishpod", "tv"},
+                            {"down", "downs", "keep", "midnight", "movies",
+                             "speaking", "learners", "exactly", "preview"},
+                        },
+                        {
+                            u8"#43 真实播客关键句",
+                            {
+                                u8"EnglishPod. My name is Marco. And I'm Erica.",
+                                u8"How are you, Erica? Marco, I'm doing really well.",
+                                u8"you hear in movies and TV shows",
+                            },
+                            {"erica", "marco", "englishpod", "tv"},
+                            {"movies", "doing", "really"},
+                        },
+                        {
+                            u8"jfk.wav（每句首词都大写，但一个专名都没有）",
+                            {
+                                u8"Ask not what your country can do for you",
+                                u8"What your country can do for you",
+                                u8"And so my fellow Americans",
+                            },
+                            {},
+                            {"ask", "what", "and", "country", "americans"},
+                        },
+                    };
+
+                    for (const auto& c : cases) {
+                        if (!r_ok) break;
+                        std::vector<Segment> segs;
+                        int seq = 1;
+                        for (const char* t : c.segs) {
+                            Segment s;
+                            s.seq        = seq++;
+                            s.src_text   = t;
+                            s.confidence = 0.8;
+                            segs.push_back(s);
+                        }
+                        const auto got = extract_candidates(segs, 1);
+                        auto has = [&](const char* k) {
+                            const std::string nk = normalize_key(k);
+                            for (const auto& g : got) if (g.key == nk) return true;
+                            return false;
+                        };
+                        for (const char* k : c.must_have) {
+                            if (!has(k)) {
+                                r_ok = false;
+                                whyr = std::string(c.name) + u8"：该抽到却漏了「" + k + u8"」";
+                                break;
+                            }
+                        }
+                        if (!r_ok) break;
+                        for (const char* k : c.must_not_have) {
+                            if (has(k)) {
+                                r_ok = false;
+                                whyr = std::string(c.name) + u8"：不该抽到却抽了「" + k
+                                       + u8"」—— 假阳性会进识别提示和翻译约束";
+                                break;
+                            }
+                        }
+                    }
+
+                    std::cout << "[SelfTest] 真实数据抽取回归（#47 八个假阳性 / #43 四个真名 / jfk 零）: "
+                              << (r_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+                    if (!r_ok) {
+                        std::cerr << "    " << whyr << std::endl;
                         return 1;
                     }
                 }
@@ -3003,6 +3234,7 @@ int main(int argc, char** argv) {
     if (cfg.show_gaps)    return run_show_gaps(cfg);
     if (cfg.extract_session >= 0) return run_extract(cfg);
     if (cfg.tools_list_only || !cfg.tools_name.empty()) return run_tools(cfg);
+    if (cfg.dump_terms) return run_dump_terms(cfg);
     if (!cfg.dump_prompt.empty()) return run_dump_prompt(cfg);
     if (cfg.export_session >= 0) return run_export(cfg);
 
@@ -3045,18 +3277,8 @@ int main(int argc, char** argv) {
     // 2.5 之前这里只读文件 —— 也就是说用户确认过的知识一个字都影响不到识别和翻译，
     // 第二句承诺（用得越久越懂你）没有落点。
     // --glossary 保留：它是"我知道我要说什么、先手工喂给你"的显式入口，仍然有用。
-    const auto kb = load_constraints_from_knowledge();
-    std::vector<std::string> glossary = kb.terms;
-    {
-        const auto from_file = load_glossary_terms(cfg.glossary_path);
-        for (const auto& t : from_file) {
-            bool dup = false;
-            for (const auto& e : glossary) {
-                if (knowledge::normalize_key(e) == knowledge::normalize_key(t)) { dup = true; break; }
-            }
-            if (!dup) glossary.push_back(t);
-        }
-    }
+    ConstraintInputs kb;
+    const std::vector<std::string> glossary = build_glossary(cfg, &kb);
     if (kb.store_ready) {
         std::cout << "[知识库] confirmed 条目 " << kb.confirmed_total << " 条，"
                   << "其中可用作识别提示/翻译约束的词条 " << kb.terms.size() << " 条";

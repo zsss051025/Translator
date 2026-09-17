@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <functional>   // 报告动词的佐证回调
 #include <map>
 #include <string>
 #include <vector>
@@ -101,18 +102,29 @@ std::vector<Token> tokenize(const std::string& s) {
     return out;
 }
 
-// R1~R3 的**证据**判定：这个词有没有"它是专名"的证据。
+// 一颗 token 提供的"证据类型"
+enum class Ev {
+    None,      // 不提供任何证据
+    WeakCap,   // 只是"首字母大写 + 不在句首" —— 这个信号**太弱**，需要再佐证
+    StrongShape,  // 形状本身就是强信号：CamelCase / 全大写缩写
+};
+
+// R1~R3 判定一颗 token 是哪种证据。
 //
-// 注意这里回答的是**是不是专名**，不是**出现几次** —— 两件事必须分开：
-// 句首的 Marco 本身不构成证据（可能只是语法大写），但一旦 "Marco" 在别处
-// 以非句首位置出现过，它在句首的那些出现**也应当计入次数**。
-// 第一版把两件事混在一起，结果 `Marco`（第 2 段出现在问号后）只算 1 次。
-bool has_name_evidence(const Token& t) {
+// 【为什么要把"弱证据"单独分出来 —— 真实数据给的教训】
+// 会话 #47（真实播客，53 段）里，只靠"首字母大写 + 非句首"抽出了 8 个假阳性：
+//     down(6) Keep(4) Midnight movies(3) Speaking Learners Exactly preview
+// 它们全是普通词，大写只是因为**被当作词汇标题写**（`Keep It Down.`）、
+// 或者标题式大写（`Speaking of Movies`）、或者称呼语（`Hello English Learners`）。
+//
+// 而英文里"句中的普通词被大写"太常见了 —— 所以 **R1 单独用一定会滥**。
+// 和中文 R6 一样：弱证据必须再有一条佐证才算数（见 qualifies()）。
+Ev classify_token(const Token& t) {
     const std::string& w = t.text;
-    if (w.size() < 2 || w.size() > 40) return false;
+    if (w.size() < 2 || w.size() > 40) return Ev::None;
 
     const unsigned char first = static_cast<unsigned char>(w[0]);
-    if (first < 'A' || first > 'Z') return false;            // 首字母必须大写
+    if (first < 'A' || first > 'Z') return Ev::None;          // 首字母必须大写
 
     bool all_upper = true, any_lower = false, internal_upper = false, has_apos = false;
     for (size_t i = 0; i < w.size(); ++i) {
@@ -127,28 +139,41 @@ bool has_name_evidence(const Token& t) {
         else if (c >= 'A' && c <= 'Z') { if (i > 0) internal_upper = true; }
         else if (c >= '0' && c <= '9') { all_upper = false; }
     }
-    if (is_never_name(lower_ascii(w))) return false;
+    if (is_never_name(lower_ascii(w))) return Ev::None;
 
-    const bool is_acronym = all_upper && !any_lower;                 // R3: API / CRM / TV
-    if (is_acronym) return true;
-    // R2: 词中间还有大写（EnglishPod）—— 强信号，句首也算
-    if (internal_upper) return true;
+    if (all_upper && !any_lower) return Ev::StrongShape;      // R3: API / CRM / TV
+    if (internal_upper)          return Ev::StrongShape;      // R2: EnglishPod
 
-    // 【含撇号的一律不当"普通首字母大写"】I'm / It's / That's / Don't 全是收缩式，
-    // 实测里 `I'm` 被当成了专名并报了 hits=4。
-    // 只有"词中间有大写"（O'Brien 的 B）才放行 —— 那才是名字的形状。
-    // 注意：这个判断必须放在 R2 之后，否则 O'Brien 会被一起挡掉。
-    if (has_apos) return false;
+    // 【含撇号的一律不当"普通首字母大写"】I'm / It's / That's 全是收缩式，
+    // 实测 `I'm` 被当成过专名。只有"词中间有大写"（O'Brien 的 B）才放行 ——
+    // 那才是名字的形状。这个判断必须在 R2 之后。
+    if (has_apos) return Ev::None;
 
-    // R1: 普通首字母大写 —— **句首不算证据**
-    return !t.sentence_initial;
+    // 句首大写是**语法**不是证据 —— 但也不算"小写出现"（那两件事不能混）
+    if (t.sentence_initial) return Ev::None;
+
+    return Ev::WeakCap;                                       // R1，需要佐证
+}
+
+// 一颗 token 是不是"全小写出现的普通词"。
+//
+// 【这条判据为什么有说服力】真专名在一场会话里不会又大写又小写：
+//   实测 #47：`down` 大写 2 次、**小写 4 次**；`movies` 大写 1 次、**小写 2 次**
+//   —— 这两个直接靠这条就挡掉了，不需要任何词表。
+bool looks_lowercase_word(const Token& t) {
+    const std::string& w = t.text;
+    if (w.size() < 2 || w.size() > 40) return false;
+    const unsigned char c = static_cast<unsigned char>(w[0]);
+    return c >= 'a' && c <= 'z';
 }
 
 // R5：把 "my name is X" / "我叫X" 这类模式里的 X 找出来。
 //
-// 【为什么砍掉了 "I'm X" / "我是X"】实测在真实转录上它们全是假阳性：
-// "I'm doing really well" → doing、"I'm really excited" → really。
-// 英文里 "I'm <形容词/动词ing>" 比 "I'm <人名>" 常见得多。
+// 【"I'm X" 加回来了，而且这次是安全的】当初砍掉它是因为实测抽出
+// `doing` / `really`（"I'm doing really well"）。后来加了"后面那个词必须
+// 首字母大写"这道闸，于是 "I'm doing" 自动被挡、"I'm Erica" 保留 ——
+// 而 Erica 这种"只出现在句首"的名字正需要它（#47 里 Erica 的非句首出现只有 2 次，
+// 靠频率门槛刚好够，但没有余量）。
 // 中文同理："我是说" / "他是对的" 都不是介绍名字。
 // 留下的都是**专门用来介绍名字**的句式。
 //
@@ -159,7 +184,11 @@ bool has_name_evidence(const Token& t) {
 template <typename Fn>
 void for_each_person_name(const std::vector<Segment>& segs, Fn fn) {
     static const char* kAsciiPat[] = {
-        "my name is ", "my name's ", "this is ", "these are ", "meet ",
+        // 【"i'm " 回来了，但这次安全了】当初删掉它是因为实测抽出 `doing`/`really`
+        // （"I'm doing really well"）。后来加了"后面那个词必须首字母大写"这道闸
+        // （见下面的 c0 >= 'A' && c0 <= 'Z'），于是 "I'm doing" 自动被挡、
+        // "I'm Erica" 保留 —— 而 Erica 这种"只出现在句首"的名字正需要它。
+        "my name is ", "my name's ", "this is ", "these are ", "meet ", "i'm ",
     };
     static const char* kCjkPat[] = {
         u8"我叫", u8"名字是", u8"他叫", u8"她叫", u8"这位是",
@@ -481,6 +510,49 @@ struct CjkHit {
     bool        needs_repeat = false;
 };
 
+// 英文侧的第二类佐证：**报告动词** —— `Kelvin said` / `Marco asked`。
+//
+// 这是中文侧「张伟说」的英文对应物，用途也一样：给"首字母大写"这条弱证据补一条硬证据。
+// 真实的会议录音里，人名第一次出现往往就是这样带出来的。
+//
+// 【为什么不做成 for_each_person_name 的一部分】那个函数是"取模式后面的词"，
+// 这个是"取动词**前面**的词"，方向相反，混在一起会很难读。
+void for_each_reporter_name(const std::vector<Segment>& segs,
+                            const std::function<void(const std::string&, const Segment&, size_t)>& fn) {
+    static const char* kVerbs[] = {
+        "said", "says", "asked", "told", "mentioned", "explained",
+        "confirmed", "reported", "noted", "added", "agreed", "suggested",
+    };
+    for (const auto& seg : segs) {
+        const auto toks = tokenize(seg.src_text);
+        for (size_t i = 1; i < toks.size(); ++i) {
+            const std::string low = lower_ascii(toks[i].text);
+            bool is_verb = false;
+            for (const char* v : kVerbs) if (low == v) { is_verb = true; break; }
+            if (!is_verb) continue;
+            // 动词前面那个词必须是"专名形状"：首字母大写且不是停用词
+            const Token& prev = toks[i - 1];
+            if (prev.text.size() < 2 || prev.text.size() > 40) continue;
+            const unsigned char c0 = static_cast<unsigned char>(prev.text[0]);
+            if (c0 < 'A' || c0 > 'Z') continue;
+            if (is_never_name(lower_ascii(prev.text))) continue;
+            fn(prev.text, seg, prev.offset);
+        }
+    }
+}
+
+// 收集所有"有佐证句式的键"
+std::vector<std::string> person_pattern_keys(const std::vector<Segment>& segs) {
+    std::vector<std::string> keys;
+    auto add = [&](const std::string& w) {
+        const std::string k = normalize_key(w);
+        if (!k.empty() && std::find(keys.begin(), keys.end(), k) == keys.end()) keys.push_back(k);
+    };
+    for_each_person_name(segs, [&](const std::string& n, const Segment&, size_t) { add(n); });
+    for_each_reporter_name(segs, [&](const std::string& n, const Segment&, size_t) { add(n); });
+    return keys;
+}
+
 // 在**一段文本**里找中文专名候选。
 //
 // 逐条汉字串处理：`cjk_runs` 已经把标点当边界切好了，
@@ -625,17 +697,65 @@ std::vector<ExtractedCandidate> extract_candidates(const std::vector<Segment>& s
     //
     // 证据与计数必须分开：句首的 Marco 不构成证据（可能只是语法大写），
     // 但 "Marco" 一旦在别处以非句首位置出现过，它在句首的那次**也该计入次数**。
-    std::vector<std::string> name_keys;
+    //
+    // 【为什么"弱证据"要两条新判据 —— 真实数据给的教训】
+    // 会话 #47（真实播客 53 段）只靠 R1 抽出 8 个假阳性：
+    //     down(6) Keep(4) Midnight movies(3) Speaking Learners Exactly
+    // 全是普通词，大写只是因为被当作**词汇标题**写（`Keep It Down.`）、
+    // 标题式大写（`Speaking of Movies`）、或者称呼语（`Hello English Learners`）。
+    // 英文里"句中普通词被大写"太常见了，**R1 单独用一定会滥**。
+    //
+    // 现在的判据（不需要词表）：
+    //   ① 形状强（CamelCase / 缩写）→ 直接算数
+    //   ② 命中佐证句式（my name is X / I'm X / X said…）→ 算数
+    //   ③ 否则必须"大写且非句首"出现 **≥2 次**，而且**本场没有小写出现过**
+    //      —— 真专名不会又大写又小写：实测 `down` 大写 2 / 小写 4、`movies` 大写 1 / 小写 2
+    struct KeyStat {
+        int  cap_noninit = 0;   // 首字母大写且非句首
+        int  lower_seen  = 0;   // 全小写出现（可能是同一个普通词）
+        bool strong      = false;// CamelCase / 缩写
+    };
+    std::map<std::string, KeyStat> stats;
     for (const auto& seg : segs) {
         for (const auto& t : tokenize(seg.src_text)) {
-            if (!has_name_evidence(t)) continue;
             const std::string key = normalize_key(t.text);
             if (key.empty()) continue;
-            if (std::find(name_keys.begin(), name_keys.end(), key) == name_keys.end()) {
-                name_keys.push_back(key);
+            if (looks_lowercase_word(t)) { stats[key].lower_seen += 1; continue; }
+            switch (classify_token(t)) {
+            case Ev::StrongShape: stats[key].strong = true; break;
+            case Ev::WeakCap:     stats[key].cap_noninit += 1; break;
+            case Ev::None:        break;
             }
         }
     }
+
+    // 佐证句式的键（人名句式 + 报告动词）
+    std::vector<std::string> corroborated;
+    for (const auto& name : person_pattern_keys(segs)) {
+        const std::string k = normalize_key(name);
+        if (!k.empty() && std::find(corroborated.begin(), corroborated.end(), k) == corroborated.end()) {
+            corroborated.push_back(k);
+        }
+    }
+
+    constexpr int kMinCapOccurrences = 2;   // 见上面 ③ 的说明
+    std::vector<std::string> name_keys;
+    for (const auto& kv : stats) {
+        const auto& k = kv.first;
+        const auto& st = kv.second;
+        const bool ok = st.strong
+                     || std::find(corroborated.begin(), corroborated.end(), k) != corroborated.end()
+                     || (st.cap_noninit >= kMinCapOccurrences && st.lower_seen == 0);
+        if (ok) name_keys.push_back(k);
+    }
+
+    // 统计这些词的**全部**出现 —— 证据和计数是两件事。
+    //
+    // ⚠️ 这里**不能**再加 `classify_token(t) == Ev::None` 的过滤。
+    // 我加过一次，自检立刻报「Marco 出现次数应为 2」——
+    // 因为 `Marco` 在第 2 段的问号后（句首）那次被跳过了。
+    // 一旦某个键被判定为专名，它的**每一次出现都该计入 hits**（含句首那几次），
+    // 否则界面上会显示"已经听到 1 次"，而实际听到 2 次 —— **给用户看的数字错了**。
     for (const auto& seg : segs) {
         for (const auto& t : tokenize(seg.src_text)) {
             const std::string key = normalize_key(t.text);

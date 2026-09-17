@@ -320,8 +320,26 @@ std::vector<std::string> background_lines(const std::vector<KnowledgeItem>& item
                      });
 
     std::vector<std::string> out;
+    std::vector<std::string> seen_keys;
     for (const auto* k : sorted) {
         if (out.size() >= max_lines) break;
+        // 去重：同一个 key 可能存成不同 kind 两行。
+        //
+        // 【为什么会有两行】条目身份是 (kind, key)，所以 `Marco` 可以是
+        // 一场会话抽出来的 `person`，又是另一场用户确认时的 `term`。
+        // 这在存储层是对的（kind 确实是身份的一部分），但**下游必须收敛**：
+        // 摘要背景里出现「Marco（人名）」和「Marco（术语）」两行，
+        // 对模型是自相矛盾的噪声，对人看起来像库坏了。
+        //
+        // hits 已降序排过，所以保留的是证据更强的那一行。
+        const std::string dk = k->key.empty() ? lower_copy(k->value)
+                                              : lower_copy(k->key);
+        bool dup = false;
+        for (const auto& e : seen_keys) {
+            if (e == dk) { dup = true; break; }
+        }
+        if (dup) continue;
+        seen_keys.push_back(dk);
         out.push_back("- " + k->value + u8"（" + kind_label_zh(k->kind) + u8"）");
     }
     return out;

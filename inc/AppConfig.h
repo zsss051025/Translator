@@ -101,6 +101,14 @@ struct AppConfig {
     // 用于验证特殊 token 是否被正确识别（不需要声卡）。
     std::string dump_prompt;
 
+    // --terms：不加载任何模型，只打印"这次启动会把什么喂给识别和翻译"。
+    //
+    // 存在的理由：知识库里的东西到底有没有进提示词，是 §6.5 红线的**可观测面**。
+    // 以前只能靠真跑一场会、在启动日志里找 `[识别提示]` 那一行来确认 ——
+    // 要录音、要等 Whisper 加载 100 秒，验一次成本太高，于是没人验。
+    // 这条命令几秒钟给同一个答案。
+    bool dump_terms = false;
+
     // --glossary <文件>：术语表（每行一个词/短语，# 为注释）。
     // 内容会作为 initial_prompt 喂给 Whisper，让专有名词识别更稳定。
     std::string glossary_path;

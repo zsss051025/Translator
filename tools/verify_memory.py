@@ -112,11 +112,24 @@ def functional_fts5_check(conn):
 
     conn.execute("BEGIN")
     try:
+        # 探针键必须是**不可能与真实数据碰撞**的合成键。
+        #
+        # 这里原来用的是 ("person","erika") / ("term","englishpod") —— 看着像真数据，
+        # 于是只要库里真的有了 englishpod（会话 #43 之后就有了），
+        # INSERT 就撞 UNIQUE(kind,key)，脚本自己崩掉，
+        # 而真正要验的"触发器有没有维护索引"根本没跑到。
+        # 测具用了真实数据的形状，就会被真实数据绊倒。
+        #
+        # ⚠️ 而且必须是**单一 token**：第二版我写成 `__verify_fts_a__`，
+        # FTS 的 unicode61 分词器把 `_` 当下划线切开，
+        # 索引里存的是 verify / fts / a 三个词，
+        # 于是 MATCH 'verifyftsa' 什么都找不到，脚本又报了一次假失败。
+        # （用 fts5vocab 看过真实 token 表才确认，见 tools/_scratch_fts_tokens.py 的思路）
         rows = [
-            ("person", "erika", "Erika", "confirmed", 3,
-             "Hello, I'm Erika. How are you, Erika?"),
-            ("term", "englishpod", "EnglishPod", "candidate", 1,
-             "Welcome to EnglishPod. My name is Marco."),
+            ("__probe__", "zzprobeftsalpha", "Zzprobeftsalpha", "confirmed", 3,
+             "Hello, I'm Zzprobeftsalpha. How are you?"),
+            ("__probe__", "zzprobeftsbeta", "Zzprobeftsbeta", "candidate", 1,
+             "Welcome to Zzprobeftsbeta."),
         ]
         for kind, key, value, status, hits, src in rows:
             conn.execute(
@@ -129,20 +142,20 @@ def functional_fts5_check(conn):
 
         hit = conn.execute(
             "SELECT key, value FROM knowledge_fts WHERE knowledge_fts MATCH ? ORDER BY key",
-            ("erika",),
+            ("zzprobeftsalpha",),
         ).fetchall()
-        print("    插入后 MATCH 'erika' -> " + repr(hit))
-        if [h[0] for h in hit] != ["erika"]:
+        print("    插入后 MATCH 'zzprobeftsalpha' -> " + repr(hit))
+        if [h[0] for h in hit] != ["zzprobeftsalpha"]:
             print("[失败] 触发器没把新行写进索引")
             return False
 
         # 删除也必须同步，否则索引里留着已删的行 —— 检索结果会带上幽灵
-        conn.execute("DELETE FROM knowledge WHERE key = 'erika'")
+        conn.execute("DELETE FROM knowledge WHERE key = 'zzprobeftsalpha'")
         after = conn.execute(
             "SELECT key FROM knowledge_fts WHERE knowledge_fts MATCH ?",
-            ("erika",),
+            ("zzprobeftsalpha",),
         ).fetchall()
-        print("    删除后 MATCH 'erika' -> " + repr(after))
+        print("    删除后 MATCH 'zzprobeftsalpha' -> " + repr(after))
         if after:
             print("[失败] 删除没有同步到索引（检索会返回已删除的记录）")
             return False
