@@ -3332,9 +3332,9 @@ static int run_selftest(const AppConfig& cfg) {
                 Prompt p = mkp(Kind::AskTermMeaning, "CO-RE");
                 const std::string s = interaction::question(p);
                 if (s.find("CO-RE") == std::string::npos ||
-                    s.find(u8"技术术语") == std::string::npos ||
+                    s.find(u8"概念") == std::string::npos ||
                     s.find(u8"指什么") == std::string::npos) {
-                    ix_ok = false; iwhy = "术语问题没同时问到'是不是术语'和'它指什么'";
+                    ix_ok = false; iwhy = "术语问题没同时问到'是不是重要概念'和'它指什么'";
                 }
             }
 
