@@ -24,8 +24,12 @@ const char* familiarity_phrase(Familiarity f) {
 const char* entity_word(Kind k) {
     switch (k) {
     case Kind::ConfirmPersonName:
+    case Kind::AskPersonIdentity:
     case Kind::SuggestCorrectSpelling: return u8"人名";
-    case Kind::ConfirmProjectName:     return u8"项目名";
+    case Kind::ConfirmProjectName:
+    case Kind::AskProjectPurpose:      return u8"项目";
+    case Kind::ConfirmProductName:
+    case Kind::AskProductPurpose:      return u8"产品";
     case Kind::ConfirmTerm:
     case Kind::AskTermMeaning:
     case Kind::UpdateChangedValue:
@@ -132,6 +136,47 @@ std::string question(const Prompt& p) {
         return std::string(familiarity_phrase(p.familiarity)) + u8" " + p.subject +
                u8"。它是你们项目中的一个重要概念吗？如果是，它具体指什么？";
 
+    // ---- 按类型问对的问题（2026-09-19）------------------------------------
+    //
+    // 用户的需求原话：「陌生的人的花名例如 penny → 问我这似乎是一个人名，
+    // **具体是什么身份**；陌生的产品名类似询问；新的项目名字也询问」
+    //
+    // 【关键认识】这四问是**同一件事**（学一个说明）在四种类型上的不同问法。
+    // 所以规则层只决定"该问谁"，措辞在这里按类型分岔 —— 这正是把文案搬进
+    // 独立交互层的回报：加一种类型只动这个文件，检测规则一行不改。
+    //
+    // 【为什么人名不能问"它指什么"】我原来在规则层写"'Erica 指什么'是个
+    // 没有意义的问题（人名不需要定义）"—— 那个判断是错的。
+    // 人名要问的不是"含义"，而是"**他是谁**"（身份/角色）。
+    // 项目要问"做什么的"，产品要问"做什么用的"。都是学说明，只是问对了角度。
+    case Kind::AskPersonIdentity:
+        if (!p.suggested.empty()) {
+            return std::string(familiarity_phrase(p.familiarity)) + u8" " + p.subject +
+                   u8"。这看起来是个人名 —— " + p.suggested + u8"？对吗？";
+        }
+        return std::string(familiarity_phrase(p.familiarity)) + u8" " + p.subject +
+               u8"。这看起来是个人名 —— 他是谁？";
+
+    case Kind::AskProjectPurpose:
+        if (!p.suggested.empty()) {
+            return std::string(familiarity_phrase(p.familiarity)) + u8" " + p.subject +
+                   u8"。我猜这个项目是「" + p.suggested + u8"」。对吗？";
+        }
+        return std::string(familiarity_phrase(p.familiarity)) + u8" " + p.subject +
+               u8"。这是你们的一个项目吗？它是做什么的？";
+
+    case Kind::AskProductPurpose:
+        if (!p.suggested.empty()) {
+            return std::string(familiarity_phrase(p.familiarity)) + u8" " + p.subject +
+                   u8"。我猜它是「" + p.suggested + u8"」。对吗？";
+        }
+        return std::string(familiarity_phrase(p.familiarity)) + u8" " + p.subject +
+               u8"。这是你们的产品或者内部工具吗？它是做什么用的？";
+
+    case Kind::ConfirmProductName:
+        return std::string(familiarity_phrase(p.familiarity)) + u8" " + p.subject +
+               u8"。这是个产品名吗？以后我会按这个名字来记。";
+
     // 值变化。**必须把"我原来记的是什么"摆出来** ——
     // 否则用户不知道自己在同意什么。这正是"我学习"的证据所在。
     //
@@ -177,12 +222,16 @@ std::string hint(const Prompt& p) {
     case Kind::ConfirmPersonName:
     case Kind::ConfirmTerm:
     case Kind::ConfirmProjectName:
+    case Kind::ConfirmProductName:
         return u8"（对就按 y；不对就直接输入正确的写法；回车先跳过）";
 
-    // 这条要用户**打一句话**，所以要说清"直接说它的意思就行"，
-    // 并且给"只想让我记住这个词"的出口（那时的回答是确认、不是含义）。
+    // 这一族都要用户**打一句话**，所以要说清"直接说就行"，
+    // 并且给"只想让我记住这个名字"的出口（那时的回答是确认、不是说明）。
     case Kind::AskTermMeaning:
-        return u8"（直接输入它的意思；只想让我记住这个词就按 y；回车先跳过）";
+    case Kind::AskPersonIdentity:
+    case Kind::AskProjectPurpose:
+    case Kind::AskProductPurpose:
+        return u8"（直接输入就行；只想让我记住这个名字就按 y；回车先跳过）";
 
     case Kind::UpdateChangedValue:
         return u8"（y = 更新成新的；n = 保持原来的；也可以直接输入正确的值；回车先跳过）";
@@ -233,6 +282,7 @@ std::string acknowledgment(const Prompt& p, Outcome o) {
             return u8"好的，我记住了 " + p.subject +
                    u8"。以后再遇到这个人名，我会按这个写法处理。";
         case Kind::ConfirmProjectName:
+        case Kind::ConfirmProductName:
             return u8"好的，我记住了" + quoted(p.subject) +
                    u8"。以后纪要里我会按这个名字来写。";
         case Kind::ConfirmTerm:
@@ -242,6 +292,16 @@ std::string acknowledgment(const Prompt& p, Outcome o) {
             // 答 y 但没说含义：不许编一句出来，也不假装记了含义
             return u8"好，我记住了" + quoted(p.subject) +
                    u8"这个术语。它指什么我还不清楚，下次有机会再问你。";
+        case Kind::AskPersonIdentity:
+            // 答 y 但没说身份：同上，**绝不编**（"Penny 是财务"编出来会污染纪要）
+            return u8"好，我记住了" + quoted(p.subject) +
+                   u8"这个名字。他是谁我还不清楚，下次有机会再问你。";
+        case Kind::AskProjectPurpose:
+            return u8"好，我记住了" + quoted(p.subject) +
+                   u8"这个项目。它是做什么的我还不清楚，下次有机会再问你。";
+        case Kind::AskProductPurpose:
+            return u8"好，我记住了" + quoted(p.subject) +
+                   u8"这个名字。它是做什么用的我还不清楚，下次有机会再问你。";
         case Kind::UpdateChangedValue:
             return u8"好，我更新了：" + quoted(p.subject) + u8"现在是" +
                    quoted(p.current) + u8"。之前记的" + quoted(p.previous) +

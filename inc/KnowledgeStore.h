@@ -177,6 +177,22 @@ public:
     bool set_definition(const std::string& kind, const std::string& key,
                         const std::string& definition, std::string* err = nullptr);
 
+    // 改一条知识的 **kind**（类型标签）。
+    //
+    // 【为什么需要它】抽取器只能区分"人名句式 → person"和"其它大写词 → term"，
+    // 所以产品名 / 项目名一律落进 `term`，于是被问「这是技术术语吗」—— 明显错配。
+    // 类型由**分诊层的模型判断**给出（它看得到那句话），判断出来后要让标签跟上。
+    //
+    // 【边界：它只改标签，不动任何"可信度"】kind 影响的是
+    //   ① `kind_label_zh` 显示 ② 走哪条问法 ③ `is_name_like_kind`（四种名字类都过）
+    // 它**不碰** status / hits / confidence —— 所以模型判错了，代价只是
+    // "标签和问法有点怪"，不会污染任何约束。
+    //
+    // `(new_kind, key)` 已存在时**不动**并返回 false：kind 是条目身份的一部分，
+    // 顶掉另一行会造成不可预期的合并。
+    bool set_kind(const std::string& kind, const std::string& key,
+                  const std::string& new_kind, std::string* err = nullptr);
+
     // 按状态列条目。status 为空表示不过滤。
     std::vector<KnowledgeItem> list(const std::string& status = "", int limit = 200) const;
 

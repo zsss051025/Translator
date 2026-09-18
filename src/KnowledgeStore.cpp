@@ -14,9 +14,21 @@
 namespace {
 
 // 允许的 kind / status —— 与 knowledge 表的注释、PROJECT.md §6.8 保持一致
+//
+// 【2026-09-19 新增 "product"】用户提的需求：
+//   「出现陌生的人的花名例如 penny，那它就会问我这似乎是一个人名，具体是什么身份；
+//     出现一个陌生的产品名也会类似询问；新的项目名字也会询问」
+//
+// "产品名"原来只能落进 `term`，于是被问「这是你们项目里的一个重要概念吗」——
+// 对一个产品名来说这是明显的错配（用户会觉得系统在胡乱归类）。
+// 单独给它一个 kind，问法才能是「这是你们的产品吗？它是做什么的？」
+//
+// ⚠️ 抽取器目前**不产** product（也不产 project，见 KnowledgeExtract 的说明）——
+// 它靠**分诊层的模型判断**产出（模型看那句话，判断这是个什么人名/产品/项目）。
+// 所以在 2.10 之前，`project` 这个 kind 一直是死代码，这一轮才真正被用起来。
 const std::vector<std::string>& kinds() {
     static const std::vector<std::string> v = {
-        "term", "fact", "decision", "person", "project",
+        "term", "fact", "decision", "person", "project", "product",
     };
     return v;
 }
@@ -262,13 +274,14 @@ bool is_name_like_kind(const std::string& kind) {
     // 值短、是"名字"的那些。
     // fact / decision 的值是句子，进 initial_prompt 会诱发提示回显（见 SpeechEngine
     // 的 looks_like_prompt_echo），进翻译术语约束毫无意义 —— 它们只当摘要背景。
-    return kind == "term" || kind == "person" || kind == "project";
+    return kind == "term" || kind == "person" || kind == "project" || kind == "product";
 }
 
 std::string kind_label_zh(const std::string& kind) {
     if (kind == "term")     return u8"术语";
     if (kind == "person")   return u8"人名";
     if (kind == "project")  return u8"项目";
+    if (kind == "product")  return u8"产品";
     if (kind == "fact")     return u8"事实";
     if (kind == "decision") return u8"决定";
     return kind;   // 未知 kind 原样带出，不要静默吞掉（能看出来才好排查）
@@ -709,6 +722,85 @@ bool KnowledgeStore::set_definition(const std::string& kind, const std::string& 
     }
 
     // FTS 索引由 knowledge 上的 AFTER UPDATE 触发器自动跟上，这里不写任何 FTS 语句。
+    return true;
+}
+
+bool KnowledgeStore::set_kind(const std::string& kind, const std::string& key,
+                              const std::string& new_kind, std::string* err) {
+    auto set_err = [&](const std::string& m) { if (err) *err = m; };
+    if (!knowledge::is_valid_kind(new_kind)) {
+        set_err(u8"非法的目标类型: " + new_kind);
+        return false;
+    }
+    if (kind == new_kind) return false;      // 没变化，不算一次改动
+
+    SessionStore& ss = SessionStore::instance();
+    std::lock_guard<std::mutex> lock(ss.mutex_);
+    if (ss.db_ == nullptr) { set_err(u8"库未打开"); return false; }
+
+    const std::string nk = knowledge::normalize_key(key);
+
+    // **先确认目标身份没被占**。kind 是条目身份 `(kind,key)` 的一部分，
+    // 直接 UPDATE 会撞 UNIQUE 索引（报错），或者更坏 —— 把另一行顶掉。
+    {
+        sqlite3_stmt* cs = nullptr;
+        if (sqlite3_prepare_v2(ss.db_, "SELECT 1 FROM knowledge WHERE kind = ? AND key = ?;",
+                               -1, &cs, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(cs, 1, new_kind.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(cs, 2, nk.c_str(), -1, SQLITE_TRANSIENT);
+            const bool taken = (sqlite3_step(cs) == SQLITE_ROW);
+            sqlite3_finalize(cs);
+            if (taken) {
+                set_err(u8"目标类型下已有同名条目，不动（避免顶掉另一行）");
+                return false;
+            }
+        }
+    }
+
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(ss.db_,
+                           "UPDATE knowledge SET kind = ?, updated_at = ? "
+                           "WHERE kind = ? AND key = ?;",
+                           -1, &st, nullptr) != SQLITE_OK) {
+        set_err(std::string("准备失败: ") + sqlite3_errmsg(ss.db_));
+        return false;
+    }
+    const std::string ts = SessionStore::now_string();
+    sqlite3_bind_text (st, 1, new_kind.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (st, 2, ts.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (st, 3, kind.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (st, 4, nk.c_str(), -1, SQLITE_TRANSIENT);
+    const int rc = sqlite3_step(st);
+    const int changed = sqlite3_changes(ss.db_);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE || changed == 0) {
+        set_err(u8"库里没有这条知识，或类型没改成功");
+        return false;
+    }
+
+    // 【为什么也记历史】"这条被重新归类了"是一次**判断上的变化**，
+    // 复盘时应该看得见（否则库里突然从 term 变成 person，不知道谁改的）。
+    // reason 用 `kind_reclassified`；`distinct_values()` 同样要跳过它
+    //（否则类型变化会被当成"值变过好几次"，误报「译法不一致」）。
+    {
+        sqlite3_stmt* hs = nullptr;
+        const char* sqlh =
+            "INSERT INTO knowledge_history"
+            "(knowledge_id,old_value,new_value,changed_at,source_session,source_seq,"
+            " source_text,reason) "
+            "SELECT id, ?, ?, ?, NULL, NULL, ?, 'kind_reclassified' "
+            "FROM knowledge WHERE kind = ? AND key = ?;";
+        if (sqlite3_prepare_v2(ss.db_, sqlh, -1, &hs, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(hs, 1, kind.c_str(),     -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(hs, 2, new_kind.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(hs, 3, ts.c_str(),       -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(hs, 4, u8"分诊层按上下文重新判定类型", -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(hs, 5, new_kind.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(hs, 6, nk.c_str(),       -1, SQLITE_TRANSIENT);
+            sqlite3_step(hs);
+            sqlite3_finalize(hs);
+        }
+    }
     return true;
 }
 

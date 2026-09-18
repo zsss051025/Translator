@@ -47,16 +47,18 @@ namespace {
 
 // 历史里出现过多少个**不同**的值（含当前值之外的历史值）
 //
-// ⚠️ **必须跳过 `definition_defined`**：含义不是"写法"。
-// 2.8 把"用户教了含义"也记进了 knowledge_history（否则时间线里看不见这一步），
-// 如果不在这里排除，一句含义就会被当成一个"不同的值" ——
-// 于是"译法不一致"（同一个键的值变过好几次）会凭空误报，
-// 而那条问题会问用户"「EnglishPod」的写法变过好几次，固定成哪一种？" ——
-// 用户完全不知道它在说什么。
+// ⚠️ **必须跳过两个"不是写法变化"的 reason**：
+//   · `definition_defined` —— 用户教了含义。含义不是"写法"。
+//   · `kind_reclassified`  —— 类型被分诊层重新判定。类型名更不是"写法"。
+// 2.8 起"用户教了含义"也记进 knowledge_history（否则时间线里看不见这一步），
+// 不排除的话一句含义就会被当成一个"不同的值"，于是「译法不一致」
+// 会凭空误报 —— 问用户「「EnglishPod」的写法变过好几次，固定成哪一种？」，
+// 而他完全不知道它在说什么。
 size_t distinct_values(const std::vector<KnowledgeStore::HistoryRow>& hist) {
     std::vector<std::string> vals;
     for (const auto& h : hist) {
         if (h.reason == "definition_defined") continue;
+        if (h.reason == "kind_reclassified") continue;
         if (!h.new_value.empty() &&
             std::find(vals.begin(), vals.end(), h.new_value) == vals.end()) {
             vals.push_back(h.new_value);
@@ -267,28 +269,32 @@ std::vector<GapQuestion> detect_gaps(const std::vector<KnowledgeWithHistory>& en
         } else if (k.status == "candidate" && distinct_values(e.history) >= 2) {
             q.rule     = GapRule::InconsistentRendering;
             hit = true;
-        } else if (k.kind == "term" && k.definition.empty() &&
+        } else if (is_name_like_kind(k.kind) && k.definition.empty() &&
                    (k.status == "confirmed" || k.hits >= 1)) {
-            // ③ 术语还没有**含义** → 问"它指什么"。
+            // ③ 这条"名字"还没有**说明** → 问它是什么。
             //
-            // 【为什么排在高频未确认**之前**】因为这一问本来就是**一问两用** ——
-            // 需求原话就是这么写的：
-            //     「它是你们项目中的一个重要技术概念吗？如果是，它具体指什么？」
-            // 用户答"是，指 Compile Once – Run Everywhere"这一句，
-            // 同时完成了**确认**（它值得记）和**学含义**（它是什么）。
-            // 排在高频后面的话，一个 hits=3 的术语会先被问"我打算把它记成术语，对吗？"，
-            // 用户按个 y 就结束了 —— 我们拿到了"确认"却永远拿不到"含义"，
-            // 而含义才是闭环里唯一真正让系统"懂"点什么的东西。
+            // 【2026-09-19：从"只问 term"放开到四种名字类】
+            // 用户的需求原话：
+            //     「出现陌生的人的花名例如 penny，那它就会问我这似乎是一个人名，
+            //       具体是什么身份；出现一个陌生的产品名也会类似询问；
+            //       新的项目名字也会询问」
             //
-            // 【为什么只问 term，不问 person】"Erica 指什么"是个没有意义的问题
-            // （人名不需要定义）。机构/项目名勉强可以问，但那更像闲聊，
-            // 而提问是稀缺资源 —— 先只做"技术术语"这一类最明确有价值的。
+            // 原来这里写的是 `k.kind == "term"`，注释还振振有词地说
+            // "'Erica 指什么'是个没有意义的问题（人名不需要定义）"——
+            // **那个判断是错的**：人名要问的不是"它指什么"，而是"**他是谁**"
+            // （身份/角色）。项目名要问"它是做什么的"，产品名要问"它是做什么用的"。
+            // 同一件事（学一个说明），只是**问法按类型变**——那正是交互层的活。
+            //
+            // 而"问法按类型变"这件事**本来就是分开的**：规则只决定"该问谁"，
+            // 措辞由 Interaction 层按 kind 生成。所以这里只需要放开条件。
+            //
+            // 【为什么排在高频未确认**之前**】这一问本来就是**一问两用** ——
+            // 用户答一句，同时完成**确认**（它值得记）和**学说明**（它是什么）。
+            // 排在高频后面的话，hits=3 的词会先被问"我打算把它记下来当术语用，对吗？"，
+            // 用户按个 y 就结束了 —— 我们拿到了"确认"却永远拿不到"说明"。
             //
             // 【没有它 `knowledge.definition` 永远是空的】
             // 这是 §6.4③（含义复用）唯一的入口。
-            //
-            // 【为什么每场只问 1 个】见 kMaxDefinitionAsksPerSession：
-            // 用户要打一整句话，问三个他就不答了。
             if (def_asked < kMaxDefinitionAsksPerSession) {
                 q.rule = GapRule::AskDefinition;
                 hit = true;
@@ -329,6 +335,9 @@ std::vector<GapQuestion> detect_gaps(const std::vector<KnowledgeWithHistory>& en
         q.value        = k.value;
         q.hits         = k.hits;
         q.confidence   = k.confidence;
+        // 原话 —— 分诊层判断"这是什么类型/是不是通用词"必须看它。
+        // 用户的花名 `Penny` 单看词会被当成"便士"，只看那句话才知道是人名。
+        q.evidence     = k.source_text;
         out.push_back(std::move(q));
     }
 

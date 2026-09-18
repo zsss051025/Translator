@@ -54,8 +54,12 @@ const char* kGeneralAcronyms[] = {
     "ai", "ml", "nlp", "llm",
     // 地名/国家缩写
     "us", "uk", "eu", "un", "cn", "usa",
-    // 时间
-    "am", "pm",
+    // 【刻意**不**收 am / pm】2026-09-19 从自检脚手架里发现的：
+    //   我原来把 am/pm 当"时间"（上午/下午）收进来了。但**在会议语境里**
+    //   `PM` 几乎总是 **Product Manager / Project Manager**、`AM` 是 Account Manager ——
+    //   也就是"人 / 角色"，恰恰是最该问的那一类。
+    //   实测：一场写着"我们的 PM Penny 对过了"的会，`PM` 被**静默挡掉**、一次都没问。
+    //   取舍：误问一次"PM 是重要概念吗"的代价 << 漏掉一个关键角色词的代价。
 };
 
 std::unordered_set<std::string> build_set() {

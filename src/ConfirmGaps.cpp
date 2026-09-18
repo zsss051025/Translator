@@ -258,6 +258,9 @@ bool is_person_kind(const std::string& kind) { return kind == "person"; }
 bool is_project_kind(const std::string& kind) {
     return kind == "project";
 }
+bool is_product_kind(const std::string& kind) {
+    return kind == "product";
+}
 
 }  // namespace
 
@@ -284,7 +287,13 @@ interaction::Prompt to_prompt(const GapQuestion& q) {
         break;
 
     case GapRule::AskDefinition:
-        p.kind = interaction::Kind::AskTermMeaning;
+        // **按类型路由**（2026-09-19）：同一件事（学一个说明），
+        // 人名问身份、项目问用途、产品问定位、术语问含义。
+        // 规则层只决定"该问谁"，这里只做类型搬运，措辞全在 Interaction 里。
+        if      (q.kind == "person")  p.kind = interaction::Kind::AskPersonIdentity;
+        else if (q.kind == "project") p.kind = interaction::Kind::AskProjectPurpose;
+        else if (q.kind == "product") p.kind = interaction::Kind::AskProductPurpose;
+        else                          p.kind = interaction::Kind::AskTermMeaning;
         // 把别人猜的含义交给交互层 —— 有它问题就变成确认题（"我猜是指 X。对吗？"）。
         // **它只是问法**：写不写库由 apply_answer 决定（用户认了才写）。
         p.suggested = q.suggested_meaning;
@@ -298,10 +307,11 @@ interaction::Prompt to_prompt(const GapQuestion& q) {
     case GapRule::NewlySeen:
         // 同一个内部规则会因为**知识类型**给出完全不同的问法 ——
         // 这正是"按类型生成自然的问题"的落点，也是解耦的价值：
-        // 规则侧只有两条，用户侧看到的是三种不同的问法。
-        if (is_person_kind(q.kind))        p.kind = interaction::Kind::ConfirmPersonName;
-        else if (is_project_kind(q.kind))  p.kind = interaction::Kind::ConfirmProjectName;
-        else                               p.kind = interaction::Kind::ConfirmTerm;
+        // 规则侧只有两条，用户侧看到的是四种不同的问法。
+        if (is_person_kind(q.kind))         p.kind = interaction::Kind::ConfirmPersonName;
+        else if (is_project_kind(q.kind))   p.kind = interaction::Kind::ConfirmProjectName;
+        else if (is_product_kind(q.kind))   p.kind = interaction::Kind::ConfirmProductName;
+        else                                p.kind = interaction::Kind::ConfirmTerm;
         break;
     }
     return p;

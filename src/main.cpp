@@ -576,10 +576,16 @@ static void confirm_gaps_at_session_end(const AppConfig& cfg, long long session_
         }
 
         size_t skipped = 0;
+        size_t reclassified = 0;
         for (const auto& q : raw_questions) {
-            // 证据：拿候选的展示形当上下文。人名/项目名的判断不依赖长上下文，
-            // 而**绝不发整场转录** —— 这是这一层和"摘要上云"最大的区别。
-            const std::string evidence = q.value;
+            // **证据 = 它在转录里的那句原话**（2026-09-19 修正）。
+            //
+            // 原来这里传的是 `q.value`（词本身），我还在注释里写"人名/项目名的判断
+            // 不依赖长上下文" —— **那句是错的**，后果是**静默挡掉用户最想被问的那类词**：
+            //     用户的花名 `Penny`，孤立看是英文单词"便士" → 模型判"通用词" → 不问。
+            // 而「我们的 PM Penny 说…」里的 `Penny` 一眼就是人名。
+            // 这一步是"按类型问对的问题"能不能成立的前提。
+            const std::string evidence = q.evidence.empty() ? q.value : q.evidence;
 
             const auto d = triage::decide(q.value, q.kind, evidence, judge);
 
@@ -589,8 +595,11 @@ static void confirm_gaps_at_session_end(const AppConfig& cfg, long long session_
             std::cout << "[分诊] 「" << q.value << "」"
                       << (d.verdict == triage::Verdict::Skip ? u8"不问" : u8"问")
                       << u8" —— " << d.reason << u8"（" << d.source << u8"）";
+            if (!d.kind.empty() && d.kind != q.kind) {
+                std::cout << u8"  类型: " << q.kind << u8" → " << d.kind;
+            }
             if (!d.primer.empty()) {
-                std::cout << u8"  猜测: " << d.primer;
+                std::cout << u8"  猜: " << d.primer;
             }
             std::cout << std::endl;
 
@@ -598,14 +607,33 @@ static void confirm_gaps_at_session_end(const AppConfig& cfg, long long session_
                 ++skipped;
                 continue;
             }
-            // 引子挂到问题上 → 交互层会把"它指什么"变成"我猜是指 X。对吗？"
+
             GapQuestion q2 = q;
+
+            // 模型判出了更准的类型 → 改标签 + 问题按新类型走。
+            //
+            // 【为什么敢改】kind 只影响：① 显示用的 label ② 走哪条问法
+            // ③ `is_name_like_kind`（person/project/product/term 四种都过）。
+            // 它**不碰** status / hits / confidence —— 所以判错了代价只是
+            // "标签和问法有点怪"，不会污染任何约束（见 KnowledgeStore::set_kind）。
+            if (!d.kind.empty() && d.kind != q2.kind) {
+                std::string ke;
+                if (KnowledgeStore::instance().set_kind(q2.kind, q2.key, d.kind, &ke)) {
+                    q2.kind = d.kind;
+                    ++reclassified;
+                } else {
+                    std::cout << u8"      （类型没改： " << ke << u8"）" << std::endl;
+                }
+            }
+
+            // 引子挂到问题上 → 交互层会把"它指什么"变成"我猜…。对吗？"
             q2.suggested_meaning = d.primer;
             questions.push_back(std::move(q2));
         }
         std::cout << "[分诊] " << raw_questions.size() << u8" 个候选 → 问 "
-                  << questions.size() << u8" 个（挡掉 " << skipped
-                  << u8" 个）。判据：" << judge_state << std::endl;
+                  << questions.size() << u8" 个（挡掉 " << skipped;
+        if (reclassified > 0) std::cout << u8"，重判类型 " << reclassified << u8" 个";
+        std::cout << u8"）。判据：" << judge_state << std::endl;
     }
 
     if (questions.empty()) {
@@ -3676,8 +3704,12 @@ static int run_selftest(const AppConfig& cfg) {
                 {"marko", true},    {"englishpod", true},
                 {"carspacked", true}, {"wgbh", true},   {"samuel", true},
                 {"co-re", true},    {"phoenix", true},  {"凤凰项目", true},
-                // ---- 刻意**不**收的那一类：含义随公司变，问了有价值 ----
+                // ---- 刻意**不**收的一类：含义随组织而变的缩写 ----
                 {"okr", true},      {"kpi", true},      {"mvp", true},
+                // 会议里的**角色**缩写。pm/am 曾经被我当"时间"收进通用表，
+                // 结果"我们的 PM Penny"里的 PM 被静默挡掉（详见 CommonWords.cpp）
+                {"pm", true},       {"am", true},       {"po", true},
+                {"em", true},       {"tl", true},
             };
             bool w_ok = true;
             std::string wwhy;
@@ -3944,6 +3976,94 @@ static int run_selftest(const AppConfig& cfg) {
                 ksx.purge_key_prefix(PK);
             }
 
+            // ⑨ **按类型换问法**（2026-09-19，用户明确要的效果）
+            //
+            // 【为什么这条必须离线可验】它靠真 Key 那一次跑是能看见的，
+            // 但"能看见"不等于"有回归保护" —— 下次谁改了 kind 的路由，
+            // 没有人会发现问法退回了"这是重要概念吗"。
+            //
+            // 用户的需求原话：「陌生的人的花名例如 penny → 问我这似乎是一个人名，
+            // **具体是什么身份**；陌生的产品名类似询问；新的项目名字也询问」
+            {
+                struct RouteCase {
+                    const char* kind;        // 候选的 kind
+                    const char* must_contain; // 问句里必须出现
+                };
+                const RouteCase rc[] = {
+                    {"person",  u8"人名"},      // 问身份
+                    {"project", u8"项目"},      // 问用途
+                    {"product", u8"产品"},      // 问定位
+                    {"term",    u8"概念"},      // 问含义
+                };
+                for (const auto& c : rc) {
+                    knowledge::GapQuestion gq;
+                    gq.rule         = GapRule::AskDefinition;
+                    gq.knowledge_id = 1;
+                    gq.kind         = c.kind;
+                    gq.key          = "x";
+                    gq.value        = "Penny";
+                    const auto pr = knowledge::to_prompt(gq);
+                    const std::string qtext = interaction::question(pr);
+                    if (qtext.find(c.must_contain) == std::string::npos) {
+                        t_ok = false;
+                        twhy = std::string("kind=") + c.kind +
+                               u8" 的问法没问到点子上（应含「" + c.must_contain +
+                               u8"」），实际: " + qtext;
+                        break;
+                    }
+                }
+                // 人名那一问必须问**身份**，不能退化成问"含义"
+                if (t_ok) {
+                    knowledge::GapQuestion gq;
+                    gq.rule = GapRule::AskDefinition;
+                    gq.knowledge_id = 1;
+                    gq.kind = "person";
+                    gq.key = "x";
+                    gq.value = "Penny";
+                    const std::string qtext =
+                        interaction::question(knowledge::to_prompt(gq));
+                    if (qtext.find(u8"他是谁") == std::string::npos) {
+                        t_ok = false;
+                        twhy = u8"人名那一问没问「他是谁」—— 那正是用户要的效果";
+                    }
+                }
+                // 产品那一问不能退化成"技术术语"
+                if (t_ok) {
+                    knowledge::GapQuestion gq;
+                    gq.rule = GapRule::AskDefinition;
+                    gq.knowledge_id = 1;
+                    gq.kind = "product";
+                    gq.key = "x";
+                    gq.value = "Gecko";
+                    const std::string qtext =
+                        interaction::question(knowledge::to_prompt(gq));
+                    if (qtext.find(u8"技术术语") != std::string::npos) {
+                        t_ok = false;
+                        twhy = u8"产品名被问成了「技术术语」—— 用户会觉得系统在胡乱归类";
+                    }
+                }
+                // person / project / product 都必须是"名字类"（否则进不了三条腿）
+                if (t_ok) {
+                    for (const char* k : {"person", "project", "product", "term"}) {
+                        if (!knowledge::is_name_like_kind(k)) {
+                            t_ok = false;
+                            twhy = std::string(k) + u8" 不被当成名字类 —— 它进不了识别提示";
+                            break;
+                        }
+                    }
+                }
+                // 四种类型都必须是**合法 kind**（否则写库会被拒）
+                if (t_ok) {
+                    for (const char* k : {"person", "project", "product", "term"}) {
+                        if (!knowledge::is_valid_kind(k)) {
+                            t_ok = false;
+                            twhy = std::string("kind 白名单里没有 ") + k;
+                            break;
+                        }
+                    }
+                }
+            }
+
             std::cout << "[SelfTest] 候选分诊（本地表优先/模型判决/引子/失败降级/不写库）: "
                       << (t_ok ? "✅ 通过" : "❌ 失败") << std::endl;
             if (!t_ok) { std::cerr << "    " << twhy << std::endl; return 1; }
@@ -4100,6 +4220,12 @@ static int run_selftest(const AppConfig& cfg) {
                 it.status      = status;
                 it.confidence  = conf;
                 it.source_text = u8"自检造的候选";
+                // 【占位说明，和 mk() 同一招、同一个理由】2026-09-19 起
+                // "这条名字还没有说明"对**四种名字类**都会触发（原来只对 term），
+                // 而本组的三条种子全是 `kind=person` —— 不给说明的话它们
+                // 会各自多出一问，本组的断言就从"2 个问题"变成别的数字，
+                // 于是**测的就不是它原本要测的东西了**。
+                it.definition  = u8"（用例占位说明）";
                 std::string e;
                 const long long id = ks.upsert(it, &e);
                 // hits 直接写到位（走 SQL，不改库的语义）
