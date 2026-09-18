@@ -493,6 +493,36 @@ bool is_function_char(uint32_t cp) {
     return false;
 }
 
+// ---- R7 左扫专用的**额外**停止字：常见"报告 / 言语"动词 --------------------
+//
+// 【真实 bug，2026-09-19 用中文脚手架查出来的】
+//   「他说凤凰项目的接口文档要重写，所以我又确认了一遍。」——**一个候选都抽不出来**。
+//   而同一句话写成「凤凰项目的接口文档要重写。」就能抽到。
+//
+//   根因：R7 从后缀「项目」往左扫，走到 `凰 → 凤 → **说**`（不在虚词表里）
+//   `→ 他`（在）才停。于是拼出 **「说凤凰项目」** —— 一个 5 字的怪名字。
+//   而「项目」是**弱后缀**（要有出现次数门槛），那个怪名字只出现一次 →
+//   被丢弃，**真正的「凤凰项目」也就跟着一起没了**。
+//
+// 【为什么不能把动词塞进 `is_function_char`】
+//   那个函数还被 R6 的 `name_tail_has_function_char` 用着
+//   （判"人名里不能含虚词"，比如「那边的反馈」抽出假人名「边的」）。
+//   动词不是虚词 —— 混进同一张表会让 R6 的语义变味，而且下次没人说得清
+//   那张表到底是"虚词表"还是"停用字表"。
+//
+// 【取舍：只收"不可能作为名字首字"的】会议里「X说 / X提到 某项目」极其常见，
+//   而以这几个字**开头**的项目名几乎不存在。刻意**不收** 想 / 看 / 认 / 写 / 读 / 测
+//   ——「联想」「看板项目」「认知项目」这类都会以它们开头，收了就是误伤。
+bool is_report_verb_char(uint32_t cp) {
+    static const char* kVerb = u8"说讲问答称叫找提";
+    for (size_t i = 0; i < std::strlen(kVerb);) {
+        const size_t len = utf8_len_of(static_cast<unsigned char>(kVerb[i]));
+        if (utf8_cp(kVerb, i, len) == cp) return true;
+        i += len;
+    }
+    return false;
+}
+
 // 后缀左边的开头如果是这些，说明是泛指而不是专名："这个项目""那个系统"。
 bool is_generic_prefix(const char* p) {
     static const char* kBad[] = {
@@ -629,10 +659,15 @@ std::vector<CjkHit> find_cjk_names(const std::string& s) {
                     bool weak = false;
                     if (!is_org_suffix_start(suf.c_str(), &weak)) continue;
 
-                    // 从后缀往左扫，碰到虚词就停；只取 2~4 个字
+                    // 从后缀往左扫，碰到虚词**或报告动词**就停；只取 2~4 个字
+                    //
+                    // 报告动词那一半是 2026-09-19 补的：没有它，
+                    // 「他说凤凰项目…」会拼出「说凤凰项目」（见 is_report_verb_char）。
                     size_t left = 0;
                     while (left < 4 && left < k) {
-                        if (is_function_char(run[k - left - 1].cp)) break;
+                        const uint32_t prev = run[k - left - 1].cp;
+                        if (is_function_char(prev)) break;
+                        if (is_report_verb_char(prev)) break;
                         ++left;
                     }
                     if (left < 2) break;    // 前面不够 2 个字，不是名字
