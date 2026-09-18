@@ -7,6 +7,10 @@
 struct sqlite3;        // 前向声明——头文件里不暴露 sqlite3 的结构
 struct sqlite3_stmt;
 
+// 判断缓存（triage_verdicts 表）复用的是同一个连接，见下面的 friend 说明。
+// 只有前向声明 —— 这里不 include TriageCache.h，避免和它互相依赖。
+namespace triage { class TriageCache; }
+
 // 一条翻译记录（一场会话里的一句话）
 struct Segment {
     long long   id = 0;
@@ -107,6 +111,17 @@ private:
     // 同一文件开两个连接要自己处理锁竞争，而它们本来就是一体的数据。
     // 用 friend 而不是暴露 raw handle —— 后者会让业务代码也能拿到连接去乱写。
     friend class KnowledgeStore;
+
+    // 判断缓存同理（triage_verdicts 表）。它是**独立的第三张表**：
+    // 存的是"以前判过该不该问"，一张判决流水，不是知识。
+    // 刻意不复用 KnowledgeStore 的连接管理，也不让它走知识库的入口 ——
+    // 判决和知识混在一起，红线就说不清了。
+    //
+    // ⚠️ `friend` 必须写**完整限定名**：只写 `friend class TriageCache;`
+    //    声明的是全局的 `::TriageCache`，而真正的类在 `triage::` 里 ——
+    //    于是编译期一路 C2248，报的还是"无法访问 private 成员"，
+    //    看不出是 friend 写错了命名空间（这个坑当场踩了一次，记在这里）。
+    friend class triage::TriageCache;
 
     bool ensure_schema();           // 建表 + 预编译语句
 

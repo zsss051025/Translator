@@ -349,6 +349,38 @@ std::vector<GapQuestion> detect_gaps(const std::vector<KnowledgeWithHistory>& en
                          return a.hits > b.hits;
                      });
 
+    // ---- 同一个 key 只问一次 ----
+    //
+    // 【为什么这里还要去重，明明写入侧已经不再造重复行了】
+    // 2.12 的修复（`save_candidates` 先 `find_by_key` 沿用已有 kind）只能防**将来**：
+    // 已经存在的库里就是有同一实体两行 —— 真实库里 `Erika` 有 person 和 term 两行，
+    // 那是修复之前攒下来的。不回填的话，那台机器上的用户**每次**都会看到
+    // 同一个东西被问两遍，而"被问两遍"正是我们最不想给人的印象
+    // （用户会觉得这东西不认识自己，而它其实认识）。
+    //
+    // 排在排序之后：`out` 已经是优先级序，所以保留的是**优先级最高**的那条 ——
+    // 比如 `ConflictingSpellings`（合并拼写冲突）会压过普通的 `NewlySeen`，
+    // 那正是我们想要的那一条。
+    //
+    // ⚠️ 去重的是**提问**，不是数据。库里那两行仍然在（§6.5 不允许我们
+    //    悄悄删掉用户的记录）—— 下游 `constraint_terms` / `background_lines`
+    //    本来就按 key 收敛，所以它们不会重复进提示或背景。
+    {
+        std::vector<GapQuestion> uniq;
+        uniq.reserve(out.size());
+        for (auto& q : out) {
+            const std::string kk = q.key.empty() ? knowledge::normalize_key(q.value) : q.key;
+            bool dup = false;
+            for (const auto& u : uniq) {
+                const std::string uk =
+                    u.key.empty() ? knowledge::normalize_key(u.value) : u.key;
+                if (uk == kk) { dup = true; break; }
+            }
+            if (!dup) uniq.push_back(std::move(q));
+        }
+        out.swap(uniq);
+    }
+
     if (out.size() > max_questions) out.resize(max_questions);
     return out;
 }

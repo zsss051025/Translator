@@ -77,7 +77,8 @@ const char* kSystemPrompt =
 Decision decide(const std::string& value,
                 const std::string& kind,
                 const std::string& evidence,
-                const Judge& judge) {
+                const Judge& judge,
+                const Cache& cache) {
     Decision d;
 
     // ---- 第 ① 层：本地通用词表（确定性、离线、零延迟）----
@@ -85,6 +86,10 @@ Decision decide(const std::string& value,
     // 放在最前面不是"优化"，是**顺序即语义**：这一层的结论不依赖任何外部状态，
     // 所以它永远一致。让不确定的判断先去问模型，会让同一句话在不同时间
     // 得到不同结论 —— 那种不可复现比"多问一次"糟得多。
+    //
+    // 同理，它也排在缓存**前面**：本地表的答案是确定的，而缓存是"以前的模型判决"。
+    // 让一个可能过时的缓存去覆盖本地表的确定结论，等于把确定性换成了历史偶然。
+    // （而且本地表命中时根本不需要读缓存，省一次查询。）
     if (commonwords::is_general(value)) {
         d.verdict = Verdict::Skip;
         d.source  = "common_words";
@@ -92,11 +97,31 @@ Decision decide(const std::string& value,
         return d;
     }
 
+    // ---- 第 ② 层：判断缓存（离线、零延迟）----
+    //
+    // 命中就**不再联网**。这一层是"越用越省、断网也能用"的落点：
+    // 第一次遇到某个普通词问一次模型，之后永远本地解决。
+    if (cache) {
+        CachedVerdict cv;
+        if (cache.lookup(value, &cv)) {
+            d.verdict = cv.verdict;
+            d.source  = "cache";
+            // 【理由里必须能看出来这是缓存的旧结论】否则看日志的人会以为
+            // 模型刚刚又判了一次 —— 那会让人误以为网络是通的。
+            d.reason  = cv.why.empty()
+                            ? u8"判断缓存命中（以前判过，未再联网）"
+                            : (u8"判断缓存命中（" + cv.why + u8"）");
+            d.kind    = cv.kind;
+            d.primer  = cv.primer;
+            return d;
+        }
+    }
+
     // ---- 第 ③ 层：模型判断（judge 为空 = 这一层不存在）----
     if (!judge) {
         d.verdict = Verdict::Ask;
         d.source  = "fallback";
-        d.reason  = u8"没有可用的判断器（本地表也没命中）→ 默认问";
+        d.reason  = u8"没有可用的判断器（本地表与缓存都没命中）→ 默认问";
         return d;
     }
 
@@ -112,6 +137,12 @@ Decision decide(const std::string& value,
         d.verdict = Verdict::Ask;
         d.source  = "fallback";
         d.reason  = u8"模型判断失败（网络/超时/解析）→ 默认问";
+        // ⚠️ **这里刻意不写缓存，而且这个 return 就在写缓存那段之前 —— 顺序本身就是闸。**
+        //
+        // 反例的具体后果：某次网络抖动 → 模型调用失败 → 若把这次失败当判决存下来，
+        // 那个词**以后永远不再被问**，而用户看不到任何报错。
+        // 所以「判断失败」和「模型说不问」必须在这里就分开，不能靠调用方记得判断。
+        // 自检 ⑩(c) 专门守这一条（故意破坏它，自检必须报错）。
         return d;
     }
 
@@ -120,6 +151,20 @@ Decision decide(const std::string& value,
     // 但如果它说"不通用"而**本地表明确收录了**，那走到这里不可能 ——
     // 上面已经返回了。所以这里只做搬运。
     from_model.source = "model";
+
+    // ---- 落缓存：**唯一的写入口，条件写死在这里** ----
+    //
+    // 两个条件缺一不可，且都在这一处判定：
+    //   · `Skip` —— 只有"不问"值得缓存（Ask 由 KnowledgeGap 的"问过不再问"负责）
+    //   · 能走到这一行，就说明 source 必然是 "model"（上面所有非 model 的分支都 return 了）
+    //
+    // 【为什么把闸放在这里而不是缓存实现里】放在调用方（main）就等于每个调用点
+    // 都要记得判一次；放在缓存实现里，实现就无从知道这个判决是从哪来的。
+    // 放在 decide() 里，它是**编排的一部分**，和"先本地表再缓存再模型"同一个地方，
+    // 也就只有这一处需要理解。
+    if (from_model.verdict == Verdict::Skip && cache && cache.store) {
+        cache.store(value, kind, from_model);
+    }
     return from_model;
 }
 

@@ -135,6 +135,18 @@ struct AppConfig {
     // 这条命令几秒钟给同一个答案。
     bool dump_terms = false;
 
+    // --triage-cache                  看判断缓存里存了什么
+    // --triage-cache --forget <词>     忘掉一个词（判决错了的手动出口）
+    // --triage-cache --clear          清空
+    //
+    // 【为什么必须有个"看"的入口】判断缓存的全部价值是"下次不再联网问同一个词"，
+    // 而它一旦判断错了，症状是**这个词从此再也不被问** —— 用户看不到任何报错，
+    // 只会觉得"系统怎么不学这个"。一个会静默改变行为的缓存，必须能被看见和撤销，
+    // 否则它就是个隐患而不是优化。
+    bool        triage_cache = false;
+    std::string triage_forget;   // 非空 = 忘掉这一个词
+    bool        triage_clear = false;
+
     // --glossary <文件>：术语表（每行一个词/短语，# 为注释）。
     // 内容会作为 initial_prompt 喂给 Whisper，让专有名词识别更稳定。
     std::string glossary_path;

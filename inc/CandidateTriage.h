@@ -34,13 +34,17 @@
 // ---------------------------------------------------------------------------
 //   ① 本地通用词表（CommonWords）—— 确定性、离线、零延迟。命中就**不问**。
 //   ② 判断缓存（库里存过的判决）—— 离线、零延迟。命中就用缓存的结论。
-//   ③ 云端 DeepSeek 判断 —— 覆盖前两层没见过的词。**下一轮实现。**
+//   ③ 云端 DeepSeek 判断 —— 覆盖前两层没见过的词。
 //   兜底：任何一层失败/缺席 → **默认"问"**（保守）。
 //         宁可多问一次，不可因为判断器坏了就**悄悄停止学习** ——
 //         后者用户完全看不出来，前者他按个回车就过去了。
 //
 // ② 的价值不只是省一次调用：**它让判断能力越用越强、对云的依赖越来越低**
 //（常见词很快被缓存，之后完全离线可用）。
+//
+// 【顺序是 ① → ② → ③，这个顺序本身是设计，不是实现细节】
+//   确定性的排在最前：本地表的结论不依赖任何外部状态，缓存是"以前的模型判决"。
+//   让可能过时的缓存去覆盖本地表的确定结论，等于拿确定性换历史偶然。
 
 namespace triage {
 
@@ -95,13 +99,72 @@ using Judge = std::function<bool(const std::string& value,
                                  const std::string& evidence,
                                  Decision* out)>;
 
-// 第 ① 层 + 第 ③ 层的编排（② 缓存在调用方，因为它要碰数据库）。
+// ===========================================================================
+// 第 ② 层：判断缓存
+// ===========================================================================
 //
-// judge 为空 → 只走第 ① 层，其余一律 Ask。
+// 【缓存什么、不缓存什么 —— 这是本层最容易做错的地方】
+//
+// **只缓存「不问」（Verdict::Skip），并且只缓存模型给出的判决。**
+//
+// 为什么只缓存 Skip：
+//   · 它是**绝大多数**。一场会里首字母大写的词，真正值得问的是少数，
+//     剩下每一个都要联网问一次模型 —— 慢、花钱、断网就没法用。
+//   · 它是**跨会话重复**的那一类。通用词和话题词在同类内容里反复出现；
+//     而值得问的专名一旦问过，库里就有条目了，「问过不再问」由
+//     KnowledgeGap 负责 —— 缓存 Ask 等于把同一件事做两遍。
+//   · 缓存 Ask 会把**那一刻的引子冻住**。引子是模型猜的，会话内容变多之后
+//     本来应该越猜越准；冻住它等于让第一次的瞎猜一直用下去。
+//
+// 为什么只缓存 source == "model"：
+//   · 本地词表的判决是**免费**的（一次查表），缓存它省不下任何东西。
+//   · **兜底判决（判断失败）绝对不能缓存** —— 那会把一次网络抖动
+//     固化成「这个词永远不问」，而用户完全看不出来。
+//     这是本层唯一的严重风险，所以它被结构性排除：
+//     `store` 只在 `verdict == Skip && source == "model"` 时被调用，
+//     由 decide() 单点守着，调用方**无从绕过**（store 不对外暴露调用时机）。
+//
+// ⚠️ 缓存的键是**归一化后的词**，不含上下文。所以同一个词在不同语境里角色变了
+//    （`pilot` 普通词 → `Pilot` 产品名）会沿用第一次的判决。
+//    这是**明知故犯的取舍**：要上下文就得每次都问模型，那缓存就没有意义了。
+//    代价由 `--triage-cache --forget <词>` 兜住 —— 宁可留一个明确的手动出口，
+//    也不要一个悄悄变复杂、还说不清行为的启发式。
+struct CachedVerdict {
+    Verdict     verdict = Verdict::Skip;
+    std::string kind;      // 模型当时猜的类型（换问法用）
+    std::string primer;    // 模型当时猜的含义（做引子用）
+    std::string why;       // 模型当时的理由（进审计输出）
+    std::string judged_at;
+};
+
+// 查缓存。返回 false = 没这个键（**没命中不是错误**，继续往下走）。
+// 传进去的是**原样的候选词**，不是归一化键 —— 归一化是缓存层的实现细节，
+// 这样本模块（以及自检里的内存缓存）都不需要知道 KnowledgeStore 怎么归一化。
+using CacheLookup = std::function<bool(const std::string& value, CachedVerdict* out)>;
+
+// 写缓存。**只会被 decide() 在 Skip + model 时调用**（见上）。
+using CacheStore = std::function<void(const std::string& value,
+                                      const std::string& kind,
+                                      const Decision& d)>;
+
+struct Cache {
+    CacheLookup lookup;
+    CacheStore  store;
+
+    // 有 lookup 才算"有缓存"。只给 store 不给 lookup 是无意义的组合，
+    // 显式当作没有 —— 免得出现"一直在写、从来读不到"这种看起来在工作的假象。
+    explicit operator bool() const { return static_cast<bool>(lookup); }
+};
+
+// 第 ① 层 + 第 ② 层 + 第 ③ 层的编排。
+//
+// judge 为空 → 只走第 ①/② 层，其余一律 Ask。
+// cache 为空（`Cache{}`）→ 跳过第 ② 层，行为与 2.10 完全一样。
 Decision decide(const std::string& value,
                 const std::string& kind,
                 const std::string& evidence,
-                const Judge& judge);
+                const Judge& judge,
+                const Cache& cache = Cache{});
 
 // 云端判断器（DeepSeek）。**需要 API Key；没有 Key 或网络失败时返回 false。**
 //

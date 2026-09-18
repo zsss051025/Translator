@@ -1,4 +1,4 @@
-﻿# 集成 vcpkg
+# 集成 vcpkg
 set(CMAKE_TOOLCHAIN_FILE "C:/dev/vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE STRING "")
 
 cmake_minimum_required(VERSION 3.20)
@@ -43,6 +43,7 @@ add_executable(Translator
 	src/Interaction.cpp
 	src/CommonWords.cpp
 	src/CandidateTriage.cpp
+	src/TriageCache.cpp
 	src/ModelLog.cpp
 	src/KnowledgeExtract.cpp
 	src/Utf8.cpp

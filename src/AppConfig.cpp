@@ -128,6 +128,9 @@ AppConfig AppConfig::from(int argc, char** argv) {
         else if (arg == "--target")        next(cfg.target_lang);
         else if (arg == "--dump-prompt")   next(cfg.dump_prompt);
         else if (arg == "--terms")         cfg.dump_terms = true;
+        else if (arg == "--triage-cache")  cfg.triage_cache = true;
+        else if (arg == "--forget")        next(cfg.triage_forget);
+        else if (arg == "--clear")         cfg.triage_clear = true;
         else if (arg == "--glossary")      next(cfg.glossary_path);
         else if (arg == "--summarizer")    next(cfg.summarizer);
         else if (arg == "--llm-model")     next(cfg.llm_model);

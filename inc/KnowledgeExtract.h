@@ -70,6 +70,12 @@ std::vector<ExtractedCandidate> extract_candidates(const std::vector<Segment>& s
 //
 // 已存在的条目会走 upsert 的累加/降级语义（值不同 → 降级 + 写历史），
 // 所以同一场重复跑不会产生垃圾行。
+//
+// ⚠️ 上面那句"不会产生垃圾行"在 2.12 之前**只对 kind 不变的条目成立**：
+//    身份是 (kind, key)，而抽取器给的 kind 是形状猜测，会被分诊层改掉
+//    （term → product），下一次抽取同一个词就又建了一行 —— 同一实体两行、
+//    用户被问两遍、kMaxAsks 各算各的。现在这里会先 `find_by_key()` 认一次旧行
+//    并沿用它的 kind，那句话才算真的成立。详见 KnowledgeStore::find_by_key 的说明。
 int save_candidates(const std::vector<ExtractedCandidate>& cands, std::string* err = nullptr);
 
 }  // namespace knowledge

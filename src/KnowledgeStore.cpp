@@ -629,6 +629,58 @@ bool KnowledgeStore::get(const std::string& kind, const std::string& key,
     return found;
 }
 
+bool KnowledgeStore::find_by_key(const std::string& key, KnowledgeItem* out,
+                                 const std::string& prefer_kind) const {
+    if (out == nullptr) return false;
+    const std::string nk = knowledge::normalize_key(key);
+    if (nk.empty()) return false;
+
+    SessionStore& ss = SessionStore::instance();
+    std::lock_guard<std::mutex> lock(ss.mutex_);
+    if (ss.db_ == nullptr) return false;
+
+    sqlite3_stmt* st = nullptr;
+    // 排序就是"谁是正主"的判定：
+    //   ① 先要 kind 匹配 prefer_kind 的（调用方明确要哪一种时）
+    //   ② 再按 hits 降序 —— 听到次数最多的那条证据最强
+    //   ③ 最后用 id 兜底，保证同分时结果**确定**（不确定的排序会让
+    //      同一个库在两次运行里选不同的行，那种不可复现最难查）
+    const char* sql =
+        "SELECT id,kind,key,value,status,confidence,hits,first_seen_at,updated_at,"
+        "source_session,source_seq,source_text,asked_count,last_asked_at,definition "
+        "FROM knowledge WHERE key = ? "
+        "ORDER BY (kind = ?) DESC, hits DESC, id ASC LIMIT 1;";
+    if (sqlite3_prepare_v2(ss.db_, sql, -1, &st, nullptr) != SQLITE_OK) return false;
+    sqlite3_bind_text(st, 1, nk.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, prefer_kind.c_str(), -1, SQLITE_TRANSIENT);
+
+    bool found = false;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        found = true;
+        auto text = [&](int i) -> std::string {
+            const unsigned char* p = sqlite3_column_text(st, i);
+            return p ? reinterpret_cast<const char*>(p) : "";
+        };
+        out->id             = sqlite3_column_int64(st, 0);
+        out->kind           = text(1);
+        out->key            = text(2);
+        out->value          = text(3);
+        out->status         = text(4);
+        out->confidence     = sqlite3_column_double(st, 5);
+        out->hits           = sqlite3_column_int(st, 6);
+        out->first_seen_at  = text(7);
+        out->updated_at     = text(8);
+        out->source_session = sqlite3_column_int64(st, 9);
+        out->source_seq     = sqlite3_column_int64(st, 10);
+        out->source_text    = text(11);
+        out->asked_count    = sqlite3_column_int(st, 12);
+        out->last_asked_at  = text(13);
+        out->definition     = text(14);
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
 bool KnowledgeStore::set_definition(const std::string& kind, const std::string& key,
                                     const std::string& definition, std::string* err) {
     auto set_err = [&](const std::string& m) { if (err) *err = m; };

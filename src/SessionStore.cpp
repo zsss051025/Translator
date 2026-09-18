@@ -114,7 +114,34 @@ const char* kSchemaCore =
     "  created_at     TEXT NOT NULL,"
     "  updated_at     TEXT NOT NULL"
     ");"
-    "CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status);";
+    "CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status);"
+
+    // 判断缓存（步骤 2.12）。**判决不是知识** —— 所以它单独一张表，
+    // 两头都不挨：不进 knowledge，也不从 knowledge 读。
+    //
+    // 【为什么必须有这张表，而不是每次问模型】
+    // 一场会里首字母大写的词，绝大多数是通用词/话题词，每一个都联网问一次
+    // 意味着：慢、花钱、断网就完全没法用。而同一个词下次还会出现。
+    // 缓存掉这些"不问"的判决之后，第二场开始就基本都是本地的了。
+    //
+    // 【为什么表名是 triage_verdicts 而不是 triage_skips】
+    // 现在**只写 skip**（理由见 CandidateTriage.h：Ask 由 KnowledgeGap 的
+    // 「问过不再问」负责，而且缓存 Ask 会把当时的引子冻住）。
+    // 保留 verdict 列是为了**以后想缓存 Ask 时不用迁移表** ——
+    // 但读的时候只认 skip，写的时候也只写 skip，这是刻意的。
+    "CREATE TABLE IF NOT EXISTS triage_verdicts ("
+    "  key          TEXT PRIMARY KEY,"                 // normalize_key(value)
+    "  value        TEXT NOT NULL,"                   // 原样（显示给人看）
+    "  verdict      TEXT NOT NULL,"                   // 目前恒为 'skip'
+    "  kind         TEXT,"                            // 模型当时猜的类型
+    "  primer       TEXT,"                            // 模型当时猜的含义（引子）
+    "  why          TEXT,"                            // 模型当时的理由
+    "  source       TEXT NOT NULL,"                   // 恒为 'model' —— 只缓存模型判决
+    "  reused       INTEGER NOT NULL DEFAULT 0,"      // 被复用次数（"省了多少次调用"）
+    "  judged_at    TEXT NOT NULL,"
+    "  last_used_at TEXT"
+    ");"
+    "CREATE INDEX IF NOT EXISTS idx_triage_judged ON triage_verdicts(judged_at);";
 
 // FTS5 全文索引（--ask / search_knowledge / 定义检索）。
 //

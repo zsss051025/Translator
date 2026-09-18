@@ -7,6 +7,7 @@
 #include <thread>
 #include <cmath>
 #include <memory>                    // std::unique_ptr
+#include <map>                       // 自检里的内存判断缓存
 
 #include "ITranslator.h"
 #include "HunyuanTranslator.h"
@@ -14,6 +15,7 @@
 #include "audio_capture.h"
 #include "SpeechEngine.h"
 #include "CandidateTriage.h"
+#include "TriageCache.h"
 #include "CommonWords.h"
 #include "ModelLog.h"
 #include "SessionStore.h"
@@ -576,8 +578,17 @@ static void confirm_gaps_at_session_end(const AppConfig& cfg, long long session_
             judge_state = u8"本地通用词表 + 云端判断（DeepSeek）";
         }
 
+        // 第 ② 层：判断缓存（步骤 2.12）。
+        //
+        // `hooks()` 内部自己判断表在不在 —— 老库/库没打开时返回空 Cache，
+        // decide() 会自动跳过这一层，会话照常。
+        // **缓存是可选加速层，它的缺席绝不能影响主流程。**
+        const triage::Cache cache = triage::TriageCache::instance().hooks();
+        if (cache) judge_state += u8" + 判断缓存";
+
         size_t skipped = 0;
         size_t reclassified = 0;
+        size_t from_cache = 0;
         for (const auto& q : raw_questions) {
             // **证据 = 它在转录里的那句原话**（2026-09-19 修正）。
             //
@@ -588,7 +599,8 @@ static void confirm_gaps_at_session_end(const AppConfig& cfg, long long session_
             // 这一步是"按类型问对的问题"能不能成立的前提。
             const std::string evidence = q.evidence.empty() ? q.value : q.evidence;
 
-            const auto d = triage::decide(q.value, q.kind, evidence, judge);
+            const auto d = triage::decide(q.value, q.kind, evidence, judge, cache);
+            if (d.source == "cache") ++from_cache;
 
             // **逐个候选打判决**，不是只报一个总数。
             // 验证"模型到底判了什么"必须能看见每一条 —— 报总数的话，
@@ -634,6 +646,10 @@ static void confirm_gaps_at_session_end(const AppConfig& cfg, long long session_
         std::cout << "[分诊] " << raw_questions.size() << u8" 个候选 → 问 "
                   << questions.size() << u8" 个（挡掉 " << skipped;
         if (reclassified > 0) std::cout << u8"，重判类型 " << reclassified << u8" 个";
+        // 单独报"其中几个是缓存命中的"：这是"第二场开始就不用联网了"的**现场证据**。
+        // 混在"挡掉 N 个"里就看不出来了 —— 而这两件事的意义完全不同：
+        // 一个是"这个判断本来就不必问"，一个是"这个判断这次没联网"。
+        if (from_cache > 0) std::cout << u8"，其中 " << from_cache << u8" 个走缓存（未联网）";
         std::cout << u8"）。判据：" << judge_state << std::endl;
     }
 
@@ -1105,6 +1121,109 @@ static int run_dump_terms(const AppConfig& cfg) {
     std::cout << "\n[terms] prompt_chars=" << prompt.size()
               << " glossary=" << glossary.size()
               << " background=" << kb.background.size() << std::endl;
+    return 0;
+}
+
+// --triage-cache [--forget <词> | --clear]：看 / 撤销判断缓存（步骤 2.12）
+//
+// 【为什么这个命令是判断缓存能不能上线的**前提**，而不是附赠品】
+// 缓存的行为是"某个词以后不再问模型"。它一旦判错，症状是**那个词再也不被问** ——
+// 没有任何报错，用户只会觉得"系统怎么不学这个词"。所以一个会静默改变行为的
+// 缓存，必须配一个能被看见、能被撤销的入口；否则它不是优化，是隐患。
+//
+// 和 `--terms` 一样，这条命令**不加载任何模型**，几秒钟出结果。
+static int run_triage_cache(const AppConfig& cfg) {
+    SessionStore::instance().init(cfg.db_path);
+    auto& tc = triage::TriageCache::instance();
+
+    if (!tc.ready()) {
+        std::cout << "判断缓存不可用（库未打开，或这个库是 2.12 之前建的、"
+                     "没有 triage_verdicts 表）。" << std::endl;
+        std::cout << "【这不是错误】没有缓存时行为退化成："
+                     "本地词表命中就不问，其余一律问模型。" << std::endl;
+        std::cout << "要让老库长出这张表：把库删掉重建，或用任意一次会话启动它都会建表 —— "
+                     "但**已存在的库不会补建**（CREATE TABLE IF NOT EXISTS 对"
+                     "已建好的 schema 是空操作）。" << std::endl;
+        return 1;
+    }
+
+    if (cfg.triage_clear) {
+        const int n = tc.clear();
+        std::cout << "已清空判断缓存：" << n << " 条。" << std::endl;
+        std::cout << "（下次分诊会重新联网判断；判断结论会重新缓存。）" << std::endl;
+        return 0;
+    }
+
+    if (!cfg.triage_forget.empty()) {
+        std::string err;
+        if (tc.forget(cfg.triage_forget, &err)) {
+            std::cout << "已忘掉「" << cfg.triage_forget << "」。"
+                      << "下次遇到它会重新联网判断。" << std::endl;
+            return 0;
+        }
+        std::cerr << "忘掉失败：" << err << std::endl;
+        std::cerr << "用 `--triage-cache` 看看里面到底存了哪些词。" << std::endl;
+        return 1;
+    }
+
+    const auto st = tc.stats();
+    std::cout << "库: " << cfg.db_path << std::endl;
+    std::cout << "判断缓存: " << st.total << " 条，"
+              << "累计复用 " << st.reused << " 次" << std::endl;
+
+    // 【"省了多少次调用"是这一层唯一诚实的量化口径】
+    // 它不是估算出来的，就是命中次数本身 —— 每次命中都少一次联网判断。
+    if (st.reused > 0) {
+        std::cout << "   也就是说：有 " << st.reused
+                  << " 次判断没有联网（这些词以前判过）。" << std::endl;
+    }
+    if (st.stale > 0) {
+        std::cout << "   其中 " << st.stale << " 条超过 90 天没被用过，"
+                     "可以考虑 `--triage-cache --clear`。" << std::endl;
+    }
+
+    const auto rows = tc.list(200);
+    if (rows.empty()) {
+        std::cout << "\n（空的）—— 还没有任何词被模型判过「不必问」。" << std::endl;
+    } else {
+        std::cout << "\n存下来的判决（只存「不问」；「该问」不缓存，"
+                     "由「问过不再问」负责）:" << std::endl;
+        for (const auto& e : rows) {
+            std::cout << "  · " << e.value;
+            if (!e.kind.empty()) std::cout << "（" << e.kind << "）";
+            std::cout << "  判于 " << e.judged_at;
+            if (e.reused > 0) std::cout << "，复用 " << e.reused << " 次";
+            if (!e.why.empty()) std::cout << "\n      理由: " << e.why;
+            std::cout << std::endl;
+        }
+    }
+
+    // 红线核对：判决不是知识，这张表里**一行都不该出现在识别提示/翻译约束里**。
+    // 顺手打出来，因为"缓存有没有偷偷影响约束"是这个模块最值得怀疑的地方。
+    std::cout << "\n--- 红线核对：判断缓存能不能影响识别/翻译 ---" << std::endl;
+    {
+        ConstraintInputs kb;
+        const std::vector<std::string> glossary = build_glossary(cfg, &kb);
+        std::cout << "当前可作识别提示/翻译约束的词条: " << glossary.size() << " 条" << std::endl;
+        bool leaked = false;
+        for (const auto& e : rows) {
+            for (const auto& g : glossary) {
+                if (knowledge::normalize_key(g) == knowledge::normalize_key(e.value)) {
+                    std::cout << "   ⚠️ 缓存里的「" << e.value
+                              << "」出现在约束里 —— 但它必然是**另有来源**"
+                                 "（confirmed 知识），不是从这个缓存来的。" << std::endl;
+                    leaked = true;
+                }
+            }
+        }
+        if (!leaked) {
+            std::cout << "   ✅ 缓存里的 " << rows.size()
+                      << " 个词，一个都没进识别提示/翻译约束（判决不是知识）" << std::endl;
+        }
+    }
+
+    std::cout << "\n[triage-cache] total=" << st.total
+              << " reused=" << st.reused << std::endl;
     return 0;
 }
 
@@ -3177,6 +3296,65 @@ static int run_selftest(const AppConfig& cfg) {
             if (!ks.search(UNIQ).empty()) fail("删除没有同步到 FTS 索引（幽灵记录）");
         }
 
+        // ⑨ **同一实体不能因为 kind 被改过就变成两行**（2.12）
+        //
+        // 【这一条守的是什么】表的身份是 `(kind, key)`，而 kind 是可修正的属性：
+        // 抽取器只会说"首字母大写的词 → term"，分诊层的模型会把它改成
+        // product/person/project（`set_kind`）。改完之后下一次抽取同一个词，
+        // `(kind,key)` 就对不上了 —— upsert 找不到旧行，**又建一行**。
+        // 实测后果（Nimbus，端到端跑出来的）：
+        //     用户在一场里被问了两遍同一个东西；库里两行；kMaxAsks 各算各的。
+        // 修法是写入前先 `find_by_key()` 认旧行并沿用它的 kind。
+        //
+        // 故意**走真实的写入路径**（upsert → set_kind → save_candidates），
+        // 而不是直接构造两行数据 —— 这个 bug 的本质就在"写入路径"上，
+        // 手搓数据反而绕过了它。
+        {
+            const std::string DK = "__selftest_dupshape";
+            ks.purge_key_prefix(DK);
+
+            KnowledgeItem a;
+            a.kind = "term"; a.key = DK; a.value = "ZZDupProbe";
+            a.status = "candidate"; a.confidence = 0.7; a.hits = 3;
+            if (ks.upsert(a) <= 0) fail("重复行用例：初次写入失败");
+
+            // 分诊层把它改成 product（真实路径就是这个）
+            if (!ks.set_kind("term", DK, "product", &last_err))
+                fail(("重复行用例：set_kind 失败 " + last_err).c_str());
+
+            // 下一次抽取：抽取器**仍然**只会给 term（它只会看形状）
+            std::vector<knowledge::ExtractedCandidate> again;
+            knowledge::ExtractedCandidate c;
+            c.kind = "term"; c.key = DK; c.value = "ZZDupProbe";
+            c.confidence = 0.7; c.hits = 2;
+            knowledge::save_candidates(again, nullptr);   // 空集合：不该报错
+            again.push_back(c);
+            knowledge::save_candidates(again, nullptr);
+
+            // ① 必须仍然只有一行（同一个 key 不同 kind 的两行就是 bug）
+            int rows = 0;
+            for (const auto& it : ks.list("", 10000)) {
+                if (knowledge::normalize_key(it.key) == DK) ++rows;
+            }
+            if (rows != 1) {
+                fail(("同一个实体变成了 " + std::to_string(rows) + " 行"
+                      "（kind 被改过之后又按旧 kind 建了新行）").c_str());
+            }
+            // ② 那唯一一行的 kind 必须是**更知情的那个**（分诊改出来的 product），
+            //    不能被抽取器的形状猜测 term 覆盖回去
+            KnowledgeItem got;
+            if (!ks.find_by_key(DK, &got) || got.kind != "product") {
+                fail("沿用 kind 失败：库里已有的 product 被抽取器的 term 盖掉了");
+            }
+            // ③ hits 要**累加到同一行**上，而不是落到新行里（那会让 hits 变小、
+            //    HighFreqUnconfirmed 那条规则永远不触发）
+            if (got.hits != 5) {
+                fail(("hits 没累加到同一行（应为 3+2=5，实际 "
+                      + std::to_string(got.hits) + "）").c_str());
+            }
+            ks.purge_key_prefix(DK);
+        }
+
         last_err.clear();
         const int removed = ks.purge_key_prefix(TPRE);
         if (removed < 1) fail("清理应至少删掉 1 条");
@@ -3590,11 +3768,48 @@ static int run_selftest(const AppConfig& cfg) {
         // 措辞也改了：它约束的是我们的提取器，不是用户。
         // 下面同时断言"正常规模不该被截断"—— 那是这条闸真正该守的东西。
         {
+            // ⚠️ **一条实体只能算一个**：这里原来写的是 20 条 value 全为 `"T"` 的记录，
+            // 也就是**同一个实体的 20 份拷贝**。去重（2.12）一上来就把它们并成 1 条，
+            // 于是"应被截断到 5"当场失败。
+            //
+            // 这不是去重太狠，是**用例本身没意义**：库里不可能真有 20 个都叫 `T`
+            // 的实体 —— 那正是去重要防的东西。要测上限就得给 20 个**不同的**实体。
+            // （`mk()` 这类测试数据踩坑这是第四次了，见下面那段的三条记录。）
             std::vector<KnowledgeWithHistory> v;
-            for (int i = 0; i < 20; ++i) v.push_back(mk(100 + i, "candidate", "T", 9, 0.9));
+            for (int i = 0; i < 20; ++i) {
+                v.push_back(mk(100 + i, "candidate", ("T" + std::to_string(i)).c_str(),
+                               9, 0.9));
+            }
             const auto q = knowledge::detect_gaps(v, 5);
             if (q.size() != 5) { gap_ok = false; why = "问问题数应被截断到 5"; }
             if (!knowledge::detect_gaps(v, 0).empty()) { gap_ok = false; why = "max=0 时应一个问题都不出"; }
+
+            // **同一实体两行 → 只问一次**（2.12）
+            //
+            // 【为什么这条必须有】真实库里 `Erika` 就是 person / term 两行，
+            // 那是"分诊改过 kind、下一次抽取又按老 kind 建了新行"攒下来的。
+            // 不修的话用户**每次**都会看到同一个东西被问两遍 ——
+            // 那给人的印象恰恰是"这东西不认识我"，而它其实认识。
+            {
+                std::vector<KnowledgeWithHistory> dup;
+                KnowledgeWithHistory a = mk(800, "candidate", "Erika", 5, 0.9);
+                KnowledgeWithHistory b = mk(801, "candidate", "Erika", 2, 0.9);
+                b.item.kind = "person";        // 同一个 key，不同 kind
+                a.item.kind = "term";
+                dup.push_back(a);
+                dup.push_back(b);
+                const auto qd = knowledge::detect_gaps(dup);
+                if (qd.size() != 1) {
+                    gap_ok = false;
+                    why = "同一个实体两行时问了 " + std::to_string(qd.size())
+                          + " 次（应该只问 1 次）";
+                } else if (qd[0].hits != 5) {
+                    // 保留的必须是**证据更强**的那条（hits 5 而不是 2）——
+                    // 去重在排序之后做，就是为了这个
+                    gap_ok = false;
+                    why = "去重留下了 hits 较小的那条（应留证据更强的）";
+                }
+            }
 
             // **正常规模（每场几个新名字）绝不能被默认上限截断。**
             // 这条守的是"别再用稀缺性的名义把闸收紧" —— 那次收紧的代价是
@@ -4205,6 +4420,14 @@ static int run_selftest(const AppConfig& cfg) {
             bool t_ok = true;
             std::string twhy;
 
+            // 【缓存那一段的 why 单独放，打印时优先】`twhy` 是**覆盖式**的：
+            // 后面失败的用例会把前面那条理由盖掉。实测过一次：故意把"判断失败"
+            // 写进缓存，报出来的却是后面用例的「要问被写进了缓存」——
+            // **症状指错方向，比不报还费时间**。
+            // 判断缓存是全组唯一会**静默改变行为**的东西（写错了的症状是
+            // "某个词从此再也不被问"，没有任何报错），所以它的理由优先报。
+            std::string cache_why;
+
             // ① 本地通用词表优先级最高：**judge 不该被调用**
             {
                 int calls = 0;
@@ -4493,9 +4716,267 @@ static int run_selftest(const AppConfig& cfg) {
                 }
             }
 
-            std::cout << "[SelfTest] 候选分诊（本地表优先/模型判决/引子/失败降级/不写库）: "
+            // ⑩ **判断缓存**（步骤 2.12）—— 用内存 map 当缓存，验的是**闸**
+            //
+            // 【这一组要证明的不是"缓存能命中"，而是"缓存不会乱命中"】
+            // 命中是显而易见的；真正会出事的是**不该写的时候写了**：
+            // 把一次网络抖动固化成"这个词永远不问"，而用户完全看不出来。
+            // 所以下面四条里有三条是在证明"没写进去"。
+            {
+                // 内存缓存：和 SQLite 版实现同一对回调，但完全不碰数据库 ——
+                // 这正是"可注入回调"这个模式的价值：编排逻辑离线可验。
+                struct MemCache {
+                    std::map<std::string, triage::CachedVerdict> m;
+                    std::vector<std::string> writes;
+                } mc;
+
+                // 【缓存这一组用独立的 why（上面声明的 cache_why）】这段是本组唯一
+                // 涉及"静默改变行为"的用例：缓存写错了，症状是**某个词从此再也不被问**，
+                // 用户看不到任何报错。而 `twhy` 是覆盖式的，后面的失败会盖掉它 ——
+                // 刚刚实测就是这样。所以这里用第一条失败锁定的 `cfail`。
+                auto cfail = [&](const std::string& m) {
+                    t_ok = false;
+                    if (cache_why.empty()) cache_why = m;   // 第一条失败锁定
+                };
+
+                triage::Cache cache;
+                cache.lookup = [&mc](const std::string& v, triage::CachedVerdict* out) {
+                    auto it = mc.m.find(v);
+                    if (it == mc.m.end()) return false;
+                    *out = it->second;
+                    return true;
+                };
+                cache.store = [&mc](const std::string& v, const std::string&,
+                                    const triage::Decision& d) {
+                    mc.writes.push_back(v);
+                    triage::CachedVerdict cv;
+                    cv.verdict = d.verdict;
+                    cv.primer  = d.primer;
+                    cv.why     = d.reason;
+                    mc.m[v] = cv;
+                };
+
+                // (a) 模型判"不问" → 落缓存
+                {
+                    int calls = 0;
+                    auto judge = [&calls](const std::string&, const std::string&,
+                                          const std::string&, Decision* out) {
+                        ++calls;
+                        out->verdict = Verdict::Skip;
+                        out->reason  = u8"通用缩写";
+                        return true;
+                    };
+                    const auto d1 = triage::decide("ZZTestA", "term", "", judge, cache);
+                    if (d1.verdict != Verdict::Skip || d1.source != "model") {
+                        cfail("模型判不问时没挡住");
+                    } else if (mc.writes.size() != 1) {
+                        cfail("模型判「不问」没落缓存（缓存等于没做）");
+                    }
+
+                    // (b) **第二次必须走缓存、且不再调判断器** —— 这才是省下来的那次调用
+                    if (t_ok) {
+                        const auto d2 = triage::decide("ZZTestA", "term", "", judge, cache);
+                        if (d2.source != "cache") {
+                            cfail("第二次没走缓存（source=" + d2.source + "）");
+                        } else if (calls != 1) {
+                            cfail("缓存命中了却还是联网问了一次 —— 白缓存");
+                        } else if (d2.verdict != Verdict::Skip) {
+                            cfail("缓存里的「不问」没被采信");
+                        } else if (d2.reason.find("缓存") == std::string::npos) {
+                            // 看日志的人必须能分辨"模型刚判的"和"缓存里的旧结论"，
+                            // 否则会误以为网络是通的
+                            cfail("缓存命中的理由里看不出这是缓存的旧结论");
+                        }
+                    }
+                }
+
+                // (c) **判断失败绝不能落缓存** —— 本层唯一的严重风险
+                //
+                // 反例的具体后果：某次网络抖动 → 模型调用失败 →
+                // 如果把这次失败当"不问"存下来，那个词**以后永远不再被问**，
+                // 而用户看不到任何报错。所以这条闸必须验。
+                {
+                    const size_t before = mc.writes.size();
+                    auto failing = [](const std::string&, const std::string&,
+                                      const std::string&, Decision*) { return false; };
+                    const auto d = triage::decide("ZZTestB", "term", "", failing, cache);
+                    if (d.verdict != Verdict::Ask) {
+                        cfail("判断失败时没退化成「问」");
+                    } else if (mc.writes.size() != before) {
+                        cfail("判断失败被写进了缓存 —— 那会把一次网络抖动"
+                               "固化成「这个词永远不问」");
+                    }
+                }
+
+                // (d) **模型判"要问"也不落缓存**
+                //     Ask 由 KnowledgeGap 的「问过不再问」负责；缓存它等于同一件事做两遍，
+                //     而且会把那一刻模型猜的引子冻住（以后越猜越准的能力就没了）。
+                {
+                    const size_t before = mc.writes.size();
+                    auto judge = [](const std::string&, const std::string&,
+                                    const std::string&, Decision* out) {
+                        out->verdict = Verdict::Ask;
+                        out->primer  = u8"模型猜的";
+                        return true;
+                    };
+                    const auto d = triage::decide("ZZTestC", "term", "", judge, cache);
+                    if (d.verdict != Verdict::Ask) {
+                        cfail("模型说值得问却被挡了");
+                    } else if (mc.writes.size() != before) {
+                        cfail("「要问」被写进了缓存");
+                    }
+                }
+
+                // (e) **本地词表命中时不读缓存**：本地表的结论是确定的，
+                //     而缓存是"以前的模型判决"。让可能过时的缓存盖住确定结论，
+                //     等于拿确定性换历史偶然。
+                {
+                    auto judge = [](const std::string&, const std::string&,
+                                    const std::string&, Decision* out) {
+                        out->verdict = Verdict::Ask;
+                        return true;
+                    };
+                    // 先让模型把一个词判成"不问"，制造出与本地表冲突的缓存
+                    (void)triage::decide("down", "term", "", judge, cache);
+                    const auto d = triage::decide("down", "term", "", judge, cache);
+                    if (d.source != "common_words") {
+                        cfail("本地通用词表的结论被缓存盖住了（source=" + d.source + "）");
+                    }
+                }
+
+                // (f) 空缓存 / 只给 store 不给 lookup → **必须等于没有缓存**，
+                //     否则会出现"一直在写、从来读不到"这种看起来在工作的假象
+                {
+                    triage::Cache half;
+                    half.store = [](const std::string&, const std::string&,
+                                    const triage::Decision&) {};
+                    if (static_cast<bool>(half)) {
+                        cfail("只给 store 的 Cache 被当成了「有缓存」");
+                    }
+                }
+            }
+
+            std::cout << "[SelfTest] 候选分诊（本地表优先/缓存不误写/模型判决/引子/失败降级/不写库）: "
                       << (t_ok ? "✅ 通过" : "❌ 失败") << std::endl;
-            if (!t_ok) { std::cerr << "    " << twhy << std::endl; return 1; }
+            if (!t_ok) {
+                std::cerr << "    "
+                          << (cache_why.empty() ? twhy : cache_why) << std::endl;
+                return 1;
+            }
+        }
+
+        // ㉒ **判断缓存落库**（步骤 2.12）—— 用**真实的** TriageCache（SQLite）跑
+        //
+        // 【为什么 ⑩ 之外还要再验一遍】⑩ 用的是内存 map，它证明的是**编排**对；
+        // 缓存真正的实现是 SQLite 那张表，而它完全没被碰过。
+        // 这是本项目栽过三次的同一个坑：**验了逻辑没验落点** ——
+        // "编排调用了一个 store 回调"和"那一行真的写进了 triage_verdicts"
+        // 是两件事，中间可以整段是坏的（SQL 拼错、表名错、绑定错）而 ⑩ 照样全绿。
+        //
+        // 这一组走的是**真实实现**：真表、真 SQL、真往返。用的是一次性 scratch 库，
+        // 全程不联网（判断器是脚本化的）。
+        {
+            using triage::Decision;      // ㉑ 的 using 在它自己的块里，这里要重新引入
+            using triage::Verdict;
+            auto& tc = triage::TriageCache::instance();
+            bool c_ok = true;
+            std::string cwhy;
+            const std::string KW = "zzcacheprobe";
+
+            tc.forget(KW, nullptr);        // 先清干净（上一次自检可能留下）
+
+            if (!tc.ready()) {
+                c_ok = false;
+                cwhy = "自检的 scratch 库里没有 triage_verdicts 表 —— "
+                       "schema 没建这张表，线上会静默退化成「没有缓存」";
+            }
+
+            const triage::Cache real = tc.hooks();
+            if (c_ok && !real) {
+                c_ok = false;
+                cwhy = "ready() 说表在，hooks() 却没给出可用缓存";
+            }
+
+            // (a) 走一遍真实编排：模型判"不问" → 应该真的落进表里
+            if (c_ok) {
+                auto skip_judge = [](const std::string&, const std::string&,
+                                     const std::string&, Decision* out) {
+                    out->verdict = Verdict::Skip;
+                    out->reason  = u8"自检：通用缩写";
+                    return true;
+                };
+                (void)triage::decide(KW, "term", "", skip_judge, real);
+                if (tc.list(500).empty()) {
+                    c_ok = false;
+                    cwhy = "走了真实编排，但 triage_verdicts 里一行都没有";
+                }
+            }
+
+            // (b) 换一个**会说"要问"**的判断器：命中缓存就必须仍然是"不问"。
+            //
+            // 这一条才是"缓存真的生效了"的证据：不是"表里有行"，
+            // 而是**这一行改变了后续的判决**。同时它也证明了命中时不联网 ——
+            // 这个判断器一次都不该被调到。
+            if (c_ok) {
+                int calls = 0;
+                auto ask_judge = [&calls](const std::string&, const std::string&,
+                                          const std::string&, Decision* out) {
+                    ++calls;
+                    out->verdict = Verdict::Ask;
+                    return true;
+                };
+                const auto d = triage::decide(KW, "term", "", ask_judge, real);
+                if (d.source != "cache") {
+                    c_ok = false;
+                    cwhy = "第二次没命中缓存（source=" + d.source + "）—— "
+                           "可能是 key 归一化和写入时不一致";
+                } else if (calls != 0) {
+                    c_ok = false;
+                    cwhy = "命中缓存却还是调了判断器（等于没缓存）";
+                } else if (d.verdict != Verdict::Skip) {
+                    c_ok = false; cwhy = "缓存里的「不问」没被采信";
+                }
+                // 复用计数必须真的涨了 —— 它是"省了多少次调用"的唯一口径，
+                // 不涨的话 `--triage-cache` 报出来的数字就是假的
+                if (c_ok) {
+                    int reused = 0;
+                    for (const auto& e : tc.list(500)) {
+                        if (knowledge::normalize_key(e.value) == KW) reused = e.reused;
+                    }
+                    if (reused < 1) {
+                        c_ok = false;
+                        cwhy = "命中了但 reused 没累加 —— --triage-cache 报的"
+                               "「省了多少次调用」会是假的";
+                    }
+                }
+            }
+
+            // (c) 撤销入口必须真的能撤：忘掉之后，同一个词必须重新走判断器
+            if (c_ok) {
+                std::string e;
+                if (!tc.forget(KW, &e)) {
+                    c_ok = false; cwhy = "forget() 失败：" + e;
+                } else {
+                    int calls = 0;
+                    auto skip2 = [&calls](const std::string&, const std::string&,
+                                          const std::string&, Decision* out) {
+                        ++calls;
+                        out->verdict = Verdict::Skip;
+                        return true;
+                    };
+                    (void)triage::decide(KW, "term", "", skip2, real);
+                    if (calls != 1) {
+                        c_ok = false;
+                        cwhy = "forget 之后没有重新判断 —— 撤销入口是假的，"
+                               "判错的词将永远无法恢复";
+                    }
+                }
+                tc.forget(KW, nullptr);    // 收尾，别把探针留在库里
+            }
+
+            std::cout << "[SelfTest] 判断缓存落库（真实 SQLite 往返/命中不联网/撤销/reused）: "
+                      << (c_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+            if (!c_ok) { std::cerr << "    " << cwhy << std::endl; return 1; }
         }
 
         // 【这里刻意不写"共 N 例"】原来写死了 `"✅ 11 例通过"`，
@@ -4811,6 +5292,7 @@ static int run_app(int argc, char** argv) {
     if (!cfg.report_goal.empty()) return run_report(cfg);
     if (!cfg.search_query.empty()) return run_search(cfg);
     if (cfg.dump_terms) return run_dump_terms(cfg);
+    if (cfg.triage_cache) return run_triage_cache(cfg);
     if (!cfg.dump_prompt.empty()) return run_dump_prompt(cfg);
     if (cfg.export_session >= 0) return run_export(cfg);
 

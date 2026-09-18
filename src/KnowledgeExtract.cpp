@@ -948,8 +948,30 @@ std::vector<ExtractedCandidate> extract_candidates(const std::vector<Segment>& s
 int save_candidates(const std::vector<ExtractedCandidate>& cands, std::string* err) {
     int saved = 0;
     for (const auto& c : cands) {
+        // ---- 先按 key 认一次"库里是不是已经有这东西了"（**不看 kind**）----
+        //
+        // 【为什么必须在这一步做】表的身份是 `(kind, key)`，而 kind 是**可修正的属性**：
+        // 这里给的 kind 永远是形状猜测（"首字母大写的词 → term"），
+        // 分诊层的模型看完那句话会把它改成 person/product/project（`set_kind`）。
+        // 改完之后下一次抽取同一个词，(kind,key) 就对不上了 —— upsert 找不到旧行，
+        // **又建一行**。三个后果全都用户可见：
+        //     ① 同一个东西被问两遍（实测：Nimbus 在一场里被问了两次）
+        //     ② 库里同一实体两行（真实库里 `Erika` 就有 person/term 两行）
+        //     ③ `kMaxAsks`（问过不再问）各算各的 —— 上限被悄悄翻倍
+        //
+        // 所以**沿用库里已有的 kind**：它是更知情的那个（模型判的 / 用户确认的）。
+        // 头文件里那句"同一场重复跑不会产生垃圾行"原来只在 kind 不变时成立，
+        // 这一改才真的成立。
+        std::string kind = c.kind;
+        {
+            KnowledgeItem existing;
+            if (KnowledgeStore::instance().find_by_key(c.key, &existing, c.kind)) {
+                if (!existing.kind.empty()) kind = existing.kind;
+            }
+        }
+
         KnowledgeItem item;
-        item.kind           = c.kind;
+        item.kind           = kind;
         item.key            = c.key;
         item.value          = c.value;
         // **一律候选**：§6.4① 自动抽取不需要用户参与，所以它没有资格直接进 Confirmed。

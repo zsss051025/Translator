@@ -165,6 +165,26 @@ public:
 
     bool get(const std::string& kind, const std::string& key, KnowledgeItem* out) const;
 
+    // 按 key 查，**不看 kind**。找到多条同 key 的行时：
+    //   · 先要 kind 等于 `prefer_kind` 的那条（调用方明确知道自己要哪种）
+    //   · 否则要 hits 最大的那条（证据最强的那条算"正主"）
+    //
+    // 【为什么必须有这个函数 —— 它是"同一实体两行"的根治点】
+    // 表的唯一约束是 `UNIQUE(kind, key)`，也就是**身份 = (kind, key)**。
+    // 但 kind 是**可以修正的属性**：抽取器只会说"首字母大写的词 → term"，
+    // 分诊层的模型看得到那句话，会把它改成 person/product/project
+    // （`set_kind`）。改完之后下一次抽取同一个词，(kind,key) 就对不上了 ——
+    // upsert 找不到旧行，于是**又建一行**。后果是三个，全都用户可见：
+    //     ① 同一个东西**被问两遍**（实测：Nimbus 在一场里问了两次）
+    //     ② 库里同一实体两行（真实库里 `Erika` 就有 person/term 两行）
+    //     ③ `kMaxAsks`（问过不再问）**各算各的**，等于把上限翻倍
+    //
+    // 所以写入前要按 key 认一次"这玩意儿是不是已经在库里了"，
+    // 已经有的话**沿用它的 kind** —— 库里的 kind 是更知情的那个
+    // （模型判的 / 用户确认的），而抽取器的 kind 永远只是形状猜测。
+    bool find_by_key(const std::string& key, KnowledgeItem* out,
+                     const std::string& prefer_kind = "") const;
+
     // 只写"含义"这一列，**不动其它任何字段**。
     //
     // 【为什么不能走 upsert】upsert 会顺手把 `hits + 1`（同值分支）。
