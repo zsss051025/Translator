@@ -79,6 +79,50 @@ def knowledge_at(con, sid):
     return rows
 
 
+def terms_from_exe(exe, db):
+    """跑真实的 `--terms`，拿"这台机器现在这次启动会喂什么"。
+
+    【为什么必须调 exe，而不是在这里再算一遍】
+    本文件开头已经写过这条原则（抽取那步调同一个 exe），但 ③ 当初违反了它：
+    自己用 SQL 拼了一个"下一场的 initial_prompt 里会有这些词"，**漏了去重**。
+    于是它打印出 `Marco、EnglishPod、Erika、Erika、VAD` ——
+    而真实路径（`constraint_terms()`，按 value 大小写不敏感去重）只会给出
+    一个 `Erika`。同一个 key 存成 person 和 term 两行时就会这样。
+
+    后果比"显示难看"严重：**这个工具是演示的"可验证面"**。
+    它撒谎的方向恰恰是"看起来库是坏的"，而库其实是好的 ——
+    和 run_dump_prompt 那两次"诊断工具自己撒谎"是同一类事故。
+    所以 ③ 只负责"历史上大概是什么"（近似，明确标注），
+    而"现在真实会喂什么"一律从 exe 拿，见 ③b。
+
+    返回 (terms, background, counts) 或 None（找不到 exe / 跑失败）。
+    """
+    if not exe or not os.path.exists(exe):
+        return None
+    try:
+        out = subprocess.run([exe, "--terms", "--db", db],
+                             capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=120)
+    except Exception:                   # noqa: BLE001
+        return None
+    if out.returncode != 0:
+        return None
+
+    terms, background, counts = [], [], ""
+    grab_next = False
+    for line in (out.stdout or "").splitlines():
+        if grab_next:
+            terms = [t.strip() for t in line.split(",") if t.strip()]
+            grab_next = False
+        elif "① 识别提示" in line:
+            grab_next = True
+        elif line.strip().startswith("- ") and "（" in line:
+            background.append(line.strip()[2:])
+        elif line.startswith("[terms]"):
+            counts = line.strip()
+    return terms, background, counts
+
+
 def history_for(con, sid, next_sid):
     """第 sid 场到下一场之间发生的知识变化（用时间窗归属，精确到时间戳）。"""
     if next_sid is None:
@@ -161,11 +205,58 @@ def main() -> int:
             extra = f"：{definition}" if definition else ""
             print(f"   - {value}（{kind}）{extra}   ← 来自 #{src}")
         if kk:
-            terms = "、".join(v for v, _k, _d, _s in kk)
-            print(f"   下一场的 initial_prompt 里会有这些词：{terms}")
+            # 词条要按 value 去重（同一个 key 可能存成 person/term 两行，
+            # 真实路径 constraint_terms() 就是这么收敛的）。不去重就会打印出
+            # `Erika、Erika`，让好库看起来像坏的 —— 这正是本工具踩过的坑。
+            seen, terms = set(), []
+            for value, _k, _d, _s in kk:
+                low = value.lower()
+                if low in seen:
+                    continue
+                seen.add(low)
+                terms.append(value)
+            print(f"   下一场的 initial_prompt 里会有这些词：{'、'.join(terms)}")
+            print("   ⚠️ 上面这行是**我自己拼的近似**；精确答案看末尾的 ③b。")
 
         # ④ 这一场自己又被问过什么（gaps 是"现在"算的，所以只作提示）
         print()
+
+    # ③b 真实路径：直接问 exe「现在这次启动会喂什么」。
+    #
+    # 这一段存在的唯一理由：③ 是近似重建，而**演示的说服力不能建立在近似上**。
+    # 评审问"你怎么证明第二场真的收到了这个词"，答案必须是
+    # 「不用证明，这是程序自己打印的」。
+    print(SEP)
+    print("③b 真实路径（直接跑 `Translator.exe --terms`，不是重建）")
+    print(SEP)
+    real = terms_from_exe(exe, a.db)
+    if real is None:
+        print("   （没找到 Translator.exe 或它跑失败了 —— 用 --exe 指定）")
+    else:
+        rterms, rbg, rcounts = real
+        print(f"   {rcounts}")
+        print(f"   ① 识别提示（Whisper initial_prompt）："
+              f"{', '.join(rterms) if rterms else '(空)'}")
+        print(f"   ③ 摘要背景 {len(rbg)} 行：")
+        for b in rbg:
+            print(f"      - {b}")
+
+        # 交叉核对：重建 vs 真实。**只在最后一场上比**才有意义 ——
+        # --terms 反映的是"现在"，只有"到最新一场为止"和它是同一个时点。
+        if sessions:
+            last_kk = knowledge_at(con, sessions[-1][0])
+            seen, mine = set(), []
+            for value, _k, _d, _s in last_kk:
+                low = value.lower()
+                if low not in seen:
+                    seen.add(low)
+                    mine.append(value)
+            if mine == rterms:
+                print(f"\n   ✅ 交叉核对：近似重建 == 真实路径（{len(mine)} 个词条）")
+            else:
+                print(f"\n   ⚠️ 交叉核对不一致：重建 {mine} vs 真实 {rterms}")
+                print("      差异通常来自此后的 status 变化或库被外部改动，"
+                      "以 ③b 为准。")
 
     print(SEP)
     print("怎么读这份输出（演示时的讲法）")
@@ -173,9 +264,11 @@ def main() -> int:
     print("  ① 是「输入」：这一场有什么陌生词。")
     print("  ② 是「学习」：用户确认/纠正之后，库里真的变了什么（含学到含义）。")
     print("  ③ 是「复用」：下一场开局就带上的东西 —— 这就是「第二次知道」的证据。")
+    print("  ③b 是**真实路径**：程序自己打印的「现在会喂什么」，不是重建。")
     print()
     print("  ⚠️ ③ 是**近似重建**：库里不存历史快照，status 是「现在」的值。")
     print("     要精确证明「当时就是这样」，看 ② 的时间戳（那是只追加的流水）。")
+    print("     要精确证明「现在真的喂进去了」，看 ③b —— 或启动日志的 [识别提示]。")
     print("  ⚠️ ④ 故意没做：缺口检测依赖「当前」状态，回放它需要给库做快照。")
     print("     真跑演示时，当场看控制台的确认交互即可（那才是真实路径）。")
     return 0
