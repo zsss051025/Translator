@@ -86,6 +86,18 @@ struct GapQuestion {
     // 怎么把它说出口由 Interaction 决定。
     std::string in_use;
 
+    // **别人猜的含义**（目前来自分诊层的模型判断，见 CandidateTriage）。
+    //
+    // 【它在这里干什么】"它指什么"原来是**开放式**问题，用户要打一整句话。
+    // 有了一份猜测，问题就能变成「是指 Compile Once – Run Everywhere 吗？」——
+    // 用户按个 y 或改两个字。**这一下把开放式问题的成本降到接近选择题**，
+    // 而"数量放开"正需要这个前提（见 kMaxQuestionsDefault 的框架说明）。
+    //
+    // ⚠️ **它只是问法的一部分，不是知识。** 用户认了才写库（`apply_answer` 里
+    // AskDefinition 的 Affirm 分支）—— 这正是 §6.5 的方向：
+    // 模型可以提议，用户确认才算数。
+    std::string suggested_meaning;
+
     // 【这里以前有一个 std::string question 字段，装的是拼好的中文句子。】
     //
     // 它被删掉是这一层解耦的关键一步：只要"该问什么"的代码里能拼出面向用户的文案，

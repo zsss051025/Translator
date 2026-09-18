@@ -577,28 +577,35 @@ static void confirm_gaps_at_session_end(const AppConfig& cfg, long long session_
 
         size_t skipped = 0;
         for (const auto& q : raw_questions) {
-            // 证据：拿候选在转录里的出现位置那一段当上下文。
-            // 取不到就传空 —— 空证据不会让判断失败，只是依据少一点。
-            std::string evidence;
-            if (q.kind == "person" || q.kind == "project") {
-                // 人名/项目名的判断更需要上下文，但这里只做最小实现：
-                // 拿展示形本身当证据（模型对专名的判断不依赖长上下文）
-                evidence = q.value;
-            }
+            // 证据：拿候选的展示形当上下文。人名/项目名的判断不依赖长上下文，
+            // 而**绝不发整场转录** —— 这是这一层和"摘要上云"最大的区别。
+            const std::string evidence = q.value;
+
             const auto d = triage::decide(q.value, q.kind, evidence, judge);
+
+            // **逐个候选打判决**，不是只报一个总数。
+            // 验证"模型到底判了什么"必须能看见每一条 —— 报总数的话，
+            // "模型判通用"和"模型调用失败"在输出上长得一模一样。
+            std::cout << "[分诊] 「" << q.value << "」"
+                      << (d.verdict == triage::Verdict::Skip ? u8"不问" : u8"问")
+                      << u8" —— " << d.reason << u8"（" << d.source << u8"）";
+            if (!d.primer.empty()) {
+                std::cout << u8"  猜测: " << d.primer;
+            }
+            std::cout << std::endl;
+
             if (d.verdict == triage::Verdict::Skip) {
                 ++skipped;
-                std::cout << "[分诊] 「" << q.value << "」不问 —— " << d.reason
-                          << "（" << d.source << "）" << std::endl;
                 continue;
             }
-            questions.push_back(q);
+            // 引子挂到问题上 → 交互层会把"它指什么"变成"我猜是指 X。对吗？"
+            GapQuestion q2 = q;
+            q2.suggested_meaning = d.primer;
+            questions.push_back(std::move(q2));
         }
-        if (skipped > 0 || !raw_questions.empty()) {
-            std::cout << "[分诊] " << raw_questions.size() << u8" 个候选 → 问 "
-                      << questions.size() << u8" 个（挡掉 " << skipped
-                      << u8" 个）。判据：" << judge_state << std::endl;
-        }
+        std::cout << "[分诊] " << raw_questions.size() << u8" 个候选 → 问 "
+                  << questions.size() << u8" 个（挡掉 " << skipped
+                  << u8" 个）。判据：" << judge_state << std::endl;
     }
 
     if (questions.empty()) {
@@ -3849,6 +3856,92 @@ static int run_selftest(const AppConfig& cfg) {
                     t_ok = false;
                     twhy = "分诊层往知识库里写了东西 —— §6.5 红线要求模型猜的东西绝不能入库";
                 }
+            }
+
+            // ⑧ **引子 + 用户认可 → 含义落库**；没有引子时**不许编含义**
+            //
+            // 【为什么这条必须离线可验】它碰的是 §6.5 红线附近的东西：
+            // "模型猜的内容"经用户确认后入库。这条路径不能只靠"某次用真 Key
+            // 跑通了"来保证 —— 那不可复现，而且换个人接手就断了。
+            {
+                auto& ksx = KnowledgeStore::instance();
+                const std::string PK = "__selftest_primer_";
+                ksx.purge_key_prefix(PK);
+
+                KnowledgeItem it;
+                it.kind       = "term";
+                it.key        = PK + "core";
+                it.value      = "CO-RE";   // ⚠️ 刻意让 key ≠ normalize_key(value)：
+                                           // 用例要守住"apply_answer 用 q.key，
+                                           // 而不是从展示形反推"这条（曾经真的推错过）
+                it.status     = "candidate";
+                it.confidence = 0.9;
+                std::string e;
+                const long long id = ksx.upsert(it, &e);
+                if (id <= 0) { t_ok = false; twhy = "自检造候选失败"; }
+
+                // --- 有引子：答 y 应该把**引子**写成含义 ---
+                if (t_ok) {
+                    knowledge::GapQuestion gq;
+                    gq.rule               = GapRule::AskDefinition;
+                    gq.knowledge_id       = id;
+                    gq.kind               = "term";
+                    gq.key                = PK + "core";
+                    gq.value              = "CO-RE";
+                    gq.suggested_meaning  = u8"Compile Once – Run Everywhere";
+
+                    knowledge::Answer a;
+                    a.kind = knowledge::AnswerKind::Affirm;
+                    const auto r = knowledge::apply_answer(gq, a, &e);
+
+                    KnowledgeItem got;
+                    ksx.get("term", PK + "core", &got);
+                    if (r.outcome != knowledge::ConfirmOutcome::ConfirmedNewValue) {
+                        t_ok = false;
+                        twhy = "用户认可了引子，却没有被当成「学到了含义」";
+                    } else if (got.definition.find("Compile Once") == std::string::npos) {
+                        // 用户明明确认了一份含义，库里却什么都没存 —— 这一环断了
+                        t_ok = false;
+                        twhy = "引子没有落库（用户点头认可的含义丢了）";
+                    } else if (got.status != "confirmed") {
+                        t_ok = false; twhy = "认可引子之后状态没变 confirmed";
+                    }
+                }
+
+                // --- 没有引子：答 y 只表示"这是个重要概念"，**不许编含义** ---
+                if (t_ok) {
+                    KnowledgeItem it2;
+                    it2.kind       = "term";
+                    it2.key        = PK + "unknown";
+                    it2.value      = "SomeTerm";
+                    it2.status     = "candidate";
+                    it2.confidence = 0.9;
+                    const long long id2 = ksx.upsert(it2, &e);
+
+                    knowledge::GapQuestion gq;
+                    gq.rule         = GapRule::AskDefinition;
+                    gq.knowledge_id = id2;
+                    gq.kind         = "term";
+                    gq.key          = PK + "unknown";
+                    gq.value        = "SomeTerm";
+                    // suggested_meaning 故意留空
+
+                    knowledge::Answer a;
+                    a.kind = knowledge::AnswerKind::Affirm;
+                    const auto r = knowledge::apply_answer(gq, a, &e);
+
+                    KnowledgeItem got;
+                    ksx.get("term", PK + "unknown", &got);
+                    if (!got.definition.empty()) {
+                        // 编一句含义出来会静默污染摘要背景 —— 那是这类 bug 里最难查的
+                        t_ok = false;
+                        twhy = "没有引子时凭空编了一条含义出来";
+                    } else if (r.outcome != knowledge::ConfirmOutcome::ConfirmedExisting) {
+                        t_ok = false; twhy = "没有引子时的确认结果不对";
+                    }
+                }
+
+                ksx.purge_key_prefix(PK);
             }
 
             std::cout << "[SelfTest] 候选分诊（本地表优先/模型判决/引子/失败降级/不写库）: "

@@ -285,6 +285,9 @@ interaction::Prompt to_prompt(const GapQuestion& q) {
 
     case GapRule::AskDefinition:
         p.kind = interaction::Kind::AskTermMeaning;
+        // 把别人猜的含义交给交互层 —— 有它问题就变成确认题（"我猜是指 X。对吗？"）。
+        // **它只是问法**：写不写库由 apply_answer 决定（用户认了才写）。
+        p.suggested = q.suggested_meaning;
         break;
 
     case GapRule::LowConfidenceName:
@@ -421,14 +424,41 @@ ConfirmResult apply_answer(const GapQuestion& q, const Answer& a, std::string* e
             return r;
         }
 
+        // 【用户认可引子时，把**那份猜测**写进含义】
+        //
+        // 有引子的问题（"我猜是指 Compile Once – Run Everywhere。对吗？"）
+        // 答 y 的意思是"对，就是这个意思" —— 所以要把引子写成 definition。
+        // 不写的话，用户明明确认了一份含义，库里却什么都没存。
+        //
+        // ⚠️ 这**不违反 §6.5**：模型猜的东西本身不能变成约束，
+        // 但"用户确认过的内容"可以。这里写进去的是**用户刚刚点头认可的那句话**，
+        // 模型只是起草人。区别就是"有没有经过确认"这一道 —— 那正是红线的本体。
+        //
+        // 注意：如果没有引子（模型不认识这个词），答 y 就只是"这确实是个重要概念"，
+        // **不许编一句含义出来**（编了会污染摘要背景）。
+        std::string meaning_to_store;
+        if (a.kind == AnswerKind::NewValue) {
+            meaning_to_store = a.value;
+        } else if (a.kind == AnswerKind::Affirm && !q.suggested_meaning.empty()) {
+            meaning_to_store = q.suggested_meaning;
+        }
+
         // **只改 definition，不走 upsert。**
         //
         // 【为什么】upsert 的同值分支会 `hits + 1`，而"用户答了一句它指什么"
         // **不是又听到一次**。实测走 upsert 之后 `EnglishPod` 的 hits 从 3 变成 4 ——
         // 上一场会话明明只听到 3 次，界面上却写 4 次。给用户看的数字必须是真数字。
-        if (a.kind == AnswerKind::NewValue) {
+        if (!meaning_to_store.empty()) {
             std::string de;
-            if (!ks.set_definition(q.kind, q.value, a.value, &de)) {
+            // ⚠️ 用 `q.key`（问题手里本来就有的键），**不要**用 `normalize_key(q.value)` 反推。
+            //
+            // 【为什么】自检抓到的真问题：我原来写的是 `q.value`，而 set_definition
+            // 会自己再 normalize 一次。正常情况下 `normalize_key(value)` 恰好等于 key，
+            // 所以看不出问题；但只要展示形和键有一点不一致（多一个标点、
+            // 大小写折叠的边界情况），就会**查不到那一行 → 写入失败**，
+            // 而用户看到的是"我确认了含义却没记住"。
+            // 有现成的键就不要重新推导 —— 推导总会有一天推错。
+            if (!ks.set_definition(q.kind, q.key, meaning_to_store, &de)) {
                 r.outcome = ConfirmOutcome::Failed;
                 r.detail  = de.empty() ? u8"写入含义失败" : de;
                 set_err(r.detail);
@@ -439,7 +469,7 @@ ConfirmResult apply_answer(const GapQuestion& q, const Answer& a, std::string* e
         // 状态：已经是 confirmed 就不必再 set（`can_promote` 里 from == to 返回 false，
         // 那会让"用户答对了却报失败"—— 这个坑 2.6d 已经踩过一次）。
         KnowledgeItem cur;
-        const bool known = ks.get(q.kind, knowledge::normalize_key(q.value), &cur);
+        const bool known = ks.get(q.kind, q.key, &cur);
         if (!(known && cur.status == "confirmed")) {
             std::string e2;
             if (!ks.set_status(q.knowledge_id, "confirmed", "user_confirmed", &e2)) {
@@ -450,9 +480,10 @@ ConfirmResult apply_answer(const GapQuestion& q, const Answer& a, std::string* e
             }
         }
 
-        if (a.kind == AnswerKind::NewValue) {
+        if (!meaning_to_store.empty()) {
+            // 用户认可/给出了含义 → 这是"学到了内容"，不是"确认了个写法"
             r.outcome = ConfirmOutcome::ConfirmedNewValue;
-            r.value   = a.value;
+            r.value   = meaning_to_store;
         } else {
             r.outcome = ConfirmOutcome::ConfirmedExisting;
             r.value   = q.value;

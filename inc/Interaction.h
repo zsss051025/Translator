@@ -94,6 +94,17 @@ struct Prompt {
     // 这是唯一允许把内部细节说出去的地方 —— 它出现在"没记上"的时候，
     // 那时把原因藏起来才是更坏的行为。
     std::string failure;
+
+    // **别人替我们猜的含义**（目前来自分诊层的模型判断）。
+    //
+    // 有它的时候，"它指什么"就从开放式问题变成确认题：
+    //     没有引子：「CO-RE」它是你们项目中的一个重要概念吗？如果是，它具体指什么？
+    //     有引子  ：「CO-RE」我猜是指 Compile Once – Run Everywhere。对吗？
+    // 用户按个 y 就完事 —— **这是"多问几个"能成立的前提**
+    //（见 KnowledgeGap.h 里 kMaxQuestionsDefault 的框架说明）。
+    //
+    // ⚠️ 它**只是问法**：用户认了才写库（见 ConfirmGaps::apply_answer）。
+    std::string suggested;
 };
 
 enum class Outcome {
