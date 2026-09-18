@@ -3071,13 +3071,54 @@ static int run_selftest(const AppConfig& cfg) {
             }
         }
 
-        // ⑧ 上限：问不超过 max_questions 个（§1.3 红线）
+        // ⑧ 上限：问不超过 max_questions 个
+        //
+        // 【2026-09-18 改了框架】这原来是按"§1.3 红线：提问是稀缺资源"写的。
+        // 用户否掉了那个说法 —— 提问量会**自然衰减**，不需要靠上限压。
+        // 所以这个上限现在是**安全网**（防提取器失控吐 50 个候选），
+        // 措辞也改了：它约束的是我们的提取器，不是用户。
+        // 下面同时断言"正常规模不该被截断"—— 那是这条闸真正该守的东西。
         {
             std::vector<KnowledgeWithHistory> v;
             for (int i = 0; i < 20; ++i) v.push_back(mk(100 + i, "candidate", "T", 9, 0.9));
             const auto q = knowledge::detect_gaps(v, 5);
             if (q.size() != 5) { gap_ok = false; why = "问问题数应被截断到 5"; }
             if (!knowledge::detect_gaps(v, 0).empty()) { gap_ok = false; why = "max=0 时应一个问题都不出"; }
+
+            // **正常规模（每场几个新名字）绝不能被默认上限截断。**
+            // 这条守的是"别再用稀缺性的名义把闸收紧" —— 那次收紧的代价是
+            // 用户的演示被迫一场只学一个概念（kMaxDefinitionAsksPerSession 原来是 1）。
+            //
+            // ⚠️ 用例构造踩了三次坑，每次都值得记：
+            //   ① 6 个 `kind=term` 且无含义 → 全走开放式问题，撞上含义题上限（4）→ 出 4 个
+            //   ② 换成 `ProjA/ProjB/ProjC` → 编辑距离 1、同首字母，被写法冲突规则
+            //      **正确地**合并成 1 问 → 出 1 个
+            //   ③ person 类型的候选在默认 `current_session = -1` 下**一条规则都不触发**
+            //      （NewlySeen 要求本场、HighFreq 要求 hits≥3）→ 出 0 个
+            // 结论：**造"正常规模"的用例必须同时理解全部七条规则怎么互相作用**，
+            // 否则测的是别的东西。下面这组是逐条核过的：首字母全不同（不会被合并）、
+            // hits=3（触发 HighFreqUnconfirmed）、有含义（不触发 AskDefinition）。
+            {
+                std::vector<KnowledgeWithHistory> normal;
+                const char* vals[] = {"Alpha", "Bravo", "Charlie",
+                                      "Delta", "Echo", "Foxtrot"};
+                for (int i = 0; i < 6; ++i) {
+                    normal.push_back(mk(700 + i, "candidate", vals[i], 3, 0.9, 0,
+                                        u8"（占位含义）"));
+                }
+                const auto qd = knowledge::detect_gaps(normal);
+                if (qd.size() != 6) {
+                    gap_ok = false;
+                    why = "6 个互不相似的候选是正常规模，不该被默认上限截断（实际 "
+                          + std::to_string(qd.size()) + " 个）";
+                }
+            }
+            // 开放式问题（"它指什么"）的独立上限也不该卡在 1 —— 那正是
+            // 用户三场演示里"一场只学一个概念"的原因。
+            if (knowledge::kMaxDefinitionAsksPerSession < 3) {
+                gap_ok = false;
+                why = "含义问题的每场上限被收回去了（那会让学习速度被人为放慢）";
+            }
         }
 
         // ⑨ 空输入
