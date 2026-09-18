@@ -1,4 +1,4 @@
-#include "LlmSummarizer.h"
+﻿#include "LlmSummarizer.h"
 #include "CaBundle.h"
 #include "Utf8.h"   // 解析模型回复前先净化 UTF-8
 
@@ -8,7 +8,7 @@
 #include <sstream>
 #include <vector>
 
-#define CPPHTTPLIB_OPENSSL_SUPPORT
+// HTTPS 支持由 CMake 统一提供（CPPHTTPLIB_OPENSSL_SUPPORT），见 CMakeLists.txt。
 #include "httplib.h"
 #include "json.hpp"
 

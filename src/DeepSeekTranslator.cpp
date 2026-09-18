@@ -1,5 +1,7 @@
-#include "DeepSeekTranslator.h"
-#define CPPHTTPLIB_OPENSSL_SUPPORT             // 启用 HTTPS 支持
+﻿#include "DeepSeekTranslator.h"
+// HTTPS 支持由 CMake 的 target_compile_definitions 统一提供
+// （CPPHTTPLIB_OPENSSL_SUPPORT）。**不要在这里写 #define** ——
+// 漏一个文件就会报「set_ca_cert_path 不是成员」这种看不懂的错。
 #include "httplib.h"
 #include "json.hpp"
 #include <iostream>

@@ -42,6 +42,7 @@ add_executable(Translator
 	src/ConfirmGaps.cpp
 	src/Interaction.cpp
 	src/CommonWords.cpp
+	src/CandidateTriage.cpp
 	src/ModelLog.cpp
 	src/KnowledgeExtract.cpp
 	src/Utf8.cpp
@@ -94,6 +95,20 @@ target_link_libraries(Translator
 		OpenSSL::Crypto
 		Threads::Threads
 )
+
+# cpp-httplib 的 HTTPS 支持。
+#
+# 【为什么放在这里，而不是每个 .cpp 里写一遍 #define】
+# 原来 `LlmSummarizer.cpp` 和 `DeepSeekTranslator.cpp` 各自在 include 之前
+# 手写 `#define CPPHTTPLIB_OPENSSL_SUPPORT`。这个写法的问题不是啰嗦，是
+# **漏一个就报错、而且报得莫名其妙**：我新加的 CandidateTriage.cpp 就漏了，
+# 报的是「"set_ca_cert_path": 不是 "httplib::Client" 的成员」——
+# 看错误信息完全想不到"是因为少了个宏"。
+#
+# 放到 target_compile_definitions 之后，**每个编译单元都一样**，
+# 不用再靠"记得写"。同时也保证不会出现"A 文件有 HTTPS、B 文件没有"这种
+# 只在运行时才暴露的分裂。
+target_compile_definitions(Translator PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 
 
 # 链接 Windows 平台库

@@ -13,6 +13,7 @@
 #include "DeepSeekTranslator.h"
 #include "audio_capture.h"
 #include "SpeechEngine.h"
+#include "CandidateTriage.h"
 #include "CommonWords.h"
 #include "ModelLog.h"
 #include "SessionStore.h"
@@ -553,7 +554,53 @@ static void confirm_gaps_at_session_end(const AppConfig& cfg, long long session_
     }
 
     // 传 session_id：NewlySeen 规则靠它判断"这条是不是本场新听到的"。
-    const auto questions = detect_gaps_from_store(kMaxQuestionsDefault, session_id);
+    const auto raw_questions = detect_gaps_from_store(kMaxQuestionsDefault, session_id);
+
+    // ---- 分诊：把"人人皆知"的候选挡在提问之外（步骤 2.10）----
+    //
+    // 【放在这里而不是 detect_gaps 里】`detect_gaps` 是**纯函数**，必须确定性、
+    // 能进 L1。而分诊的第三层是联网的模型 —— 不确定的东西不能进纯函数。
+    // 所以分诊放在流程层，判断器是可注入的回调（自检喂脚本化判决）。
+    //
+    // 【判据只发候选词 + 一句证据，不发整场转录】
+    // 这是这一层和"摘要上云"最大的区别，隐私面小得多。
+    std::vector<GapQuestion> questions;
+    {
+        triage::Judge judge;
+        std::string judge_state;
+        if (cfg.deepseek_api_key.empty()) {
+            judge_state = u8"没有 DeepSeek Key → 只用本地通用词表";
+        } else {
+            judge = triage::make_cloud_judge(cfg.deepseek_api_key);
+            judge_state = u8"本地通用词表 + 云端判断（DeepSeek）";
+        }
+
+        size_t skipped = 0;
+        for (const auto& q : raw_questions) {
+            // 证据：拿候选在转录里的出现位置那一段当上下文。
+            // 取不到就传空 —— 空证据不会让判断失败，只是依据少一点。
+            std::string evidence;
+            if (q.kind == "person" || q.kind == "project") {
+                // 人名/项目名的判断更需要上下文，但这里只做最小实现：
+                // 拿展示形本身当证据（模型对专名的判断不依赖长上下文）
+                evidence = q.value;
+            }
+            const auto d = triage::decide(q.value, q.kind, evidence, judge);
+            if (d.verdict == triage::Verdict::Skip) {
+                ++skipped;
+                std::cout << "[分诊] 「" << q.value << "」不问 —— " << d.reason
+                          << "（" << d.source << "）" << std::endl;
+                continue;
+            }
+            questions.push_back(q);
+        }
+        if (skipped > 0 || !raw_questions.empty()) {
+            std::cout << "[分诊] " << raw_questions.size() << u8" 个候选 → 问 "
+                      << questions.size() << u8" 个（挡掉 " << skipped
+                      << u8" 个）。判据：" << judge_state << std::endl;
+        }
+    }
+
     if (questions.empty()) {
         // 【为什么这里要说话，而不是按 §1.3 保持静默】
         // 真跑会话 #44 实测：结束日志里**一行 [确认] 都没有**，因为抽出的 3 个名字
@@ -561,8 +608,8 @@ static void confirm_gaps_at_session_end(const AppConfig& cfg, long long session_
         // 这行为**是对的**，但它和"抽取器坏了 / 库读不到"长得一模一样，
         // 排查时只能靠读代码。§1.3 说的是"别问没意义的问题"，
         // 不是"别告诉用户发生了什么" —— 打一行状态不算打扰。
-        std::cout << "[确认] 没有需要确认的知识（本场抽出的条目都已在库里确认过）"
-                  << std::endl;
+        std::cout << "[确认] 没有需要确认的知识（本场抽出的条目都已在库里确认过，"
+                     "或已被分诊挡掉）" << std::endl;
         return;
     }
 
@@ -3676,6 +3723,137 @@ static int run_selftest(const AppConfig& cfg) {
                     return 1;
                 }
             }
+        }
+
+        // ㉑ **候选分诊**（步骤 2.10）—— 用脚本化判断器验编排，**不联网**
+        //
+        // 【为什么这一组必须是脚本化的】第三层判断是联网的模型：不确定、不可复现。
+        // 所以判断器做成可注入回调（和确认交互的 `LineReader` 同一招），
+        // 这一组喂一段**写死的判决序列**，走真实编排逻辑。
+        // 云端实现只是另一个回调 —— 换掉它不影响这里的任何断言。
+        {
+            using triage::Decision;
+            using triage::Verdict;
+            bool t_ok = true;
+            std::string twhy;
+
+            // ① 本地通用词表优先级最高：**judge 不该被调用**
+            {
+                int calls = 0;
+                auto judge = [&](const std::string&, const std::string&,
+                                 const std::string&, Decision* out) {
+                    ++calls;
+                    out->verdict = Verdict::Ask;
+                    return true;
+                };
+                const auto d = triage::decide("TV", "term", "", judge);
+                if (d.verdict != Verdict::Skip) {
+                    t_ok = false; twhy = "本地通用词表命中的词没被挡掉";
+                } else if (calls != 0) {
+                    // 本地表能定的，**一次网络都不该发** —— 那既是成本也是稳定性
+                    t_ok = false; twhy = "本地表已能判定，却还是调了判断器";
+                } else if (d.source != "common_words") {
+                    t_ok = false; twhy = "来源没标成 common_words（审计时看不出是谁挡的）";
+                }
+            }
+
+            // ② 模型说通用 → 不问；并带上引子
+            {
+                auto judge = [](const std::string&, const std::string&,
+                                const std::string&, Decision* out) {
+                    out->verdict = Verdict::Skip;
+                    out->reason  = u8"通用缩写";
+                    return true;
+                };
+                const auto d = triage::decide("WGBH", "term", "", judge);
+                if (d.verdict != Verdict::Skip || d.source != "model") {
+                    t_ok = false; twhy = "模型判通用时没挡住，或来源没标成 model";
+                }
+            }
+
+            // ③ 模型说值得问 → 问，而且**引子要带回来**
+            {
+                auto judge = [](const std::string&, const std::string&,
+                                const std::string&, Decision* out) {
+                    out->verdict = Verdict::Ask;
+                    out->primer  = u8"Compile Once – Run Everywhere";
+                    return true;
+                };
+                const auto d = triage::decide("CO-RE", "term", "", judge);
+                if (d.verdict != Verdict::Ask) {
+                    t_ok = false; twhy = "模型说值得问却被挡了";
+                } else if (d.primer.find("Compile Once") == std::string::npos) {
+                    // 引子是"把开放式问题降到接近选择题"的关键，丢了就等于没做
+                    t_ok = false; twhy = "引子没传回来（问了也还是开放式，用户要打一整句）";
+                }
+            }
+
+            // ④ **判断失败必须退化成"问"** —— 这一组最重要的一条
+            //
+            // 反过来（失败就不问）会造成最坏的一种失败：网络断了 →
+            // 系统**悄悄停止学习** → 用户完全看不出来，只会觉得"它好像没在记东西"。
+            // 而"多问一次"的代价只是按个回车。一个坏掉的判断器
+            // 不该有能力关掉整个闭环。
+            {
+                auto failing = [](const std::string&, const std::string&,
+                                  const std::string&, Decision*) {
+                    return false;      // 网络/超时/解析失败
+                };
+                const auto d = triage::decide("SomePrivateThing", "term", "", failing);
+                if (d.verdict != Verdict::Ask) {
+                    t_ok = false;
+                    twhy = "判断失败时没有退化成「问」—— 那会静默关掉整个学习闭环";
+                } else if (d.source != "fallback") {
+                    t_ok = false; twhy = "降级路径没标成 fallback";
+                }
+            }
+
+            // ⑤ 完全没有判断器（没配 Key）→ 也要退化成"问"，而不是不问
+            {
+                const auto d = triage::decide("SomePrivateThing", "term", "", nullptr);
+                if (d.verdict != Verdict::Ask) {
+                    t_ok = false; twhy = "没有判断器时没有退化成「问」";
+                }
+                // 但本地表仍然生效 —— 没 Key 不等于连通用词都挡不住
+                const auto d2 = triage::decide("down", "term", "", nullptr);
+                if (d2.verdict != Verdict::Skip) {
+                    t_ok = false; twhy = "没有判断器时本地通用词表也失效了";
+                }
+            }
+
+            // ⑥ 没配 Key 时 make_cloud_judge 必须返回**空**判断器
+            //    （返回一个"永远说不值得问"的判断器是最坏的做法：
+            //      那会让闭环在没配 Key 的时候静默停摆）
+            {
+                const auto j = triage::make_cloud_judge("");
+                if (j) {
+                    t_ok = false; twhy = "没有 Key 时不该造出可用的判断器";
+                }
+            }
+
+            // ⑦ 分诊层**不许**写知识库 —— 结构层面已经在头文件里保证了
+            //    （它没有 include KnowledgeStore.h），这里再做一次行为级确认：
+            //    上面所有 decide 调用前后，库里的条目数不变。
+            {
+                auto& ksx = KnowledgeStore::instance();
+                const int before = static_cast<int>(ksx.list("", 10000).size());
+                auto judge = [](const std::string&, const std::string&,
+                                const std::string&, Decision* out) {
+                    out->verdict = Verdict::Ask;
+                    out->primer  = u8"模型猜的东西";
+                    return true;
+                };
+                (void)triage::decide("InventedThing", "term", "", judge);
+                const int after = static_cast<int>(ksx.list("", 10000).size());
+                if (before != after) {
+                    t_ok = false;
+                    twhy = "分诊层往知识库里写了东西 —— §6.5 红线要求模型猜的东西绝不能入库";
+                }
+            }
+
+            std::cout << "[SelfTest] 候选分诊（本地表优先/模型判决/引子/失败降级/不写库）: "
+                      << (t_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+            if (!t_ok) { std::cerr << "    " << twhy << std::endl; return 1; }
         }
 
         // 【这里刻意不写"共 N 例"】原来写死了 `"✅ 11 例通过"`，
