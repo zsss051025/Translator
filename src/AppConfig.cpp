@@ -156,10 +156,33 @@ bool AppConfig::whisper_ready() const {
 }
 
 void AppConfig::dump() const {
+    // 数据库和交付物目录都打**绝对路径**，因为它们是相对当前目录解析的。
+    //
+    // 【为什么这一行值得改】`--db` 是相对 cwd 的，而同一个 `translations.db`
+    // 这个名字在仓库根和 `build\RelWithDebInfo\` 下都存在（是**两个不同的文件**）。
+    // 只打相对名的话，"我现在到底写进哪个库"要靠用户自己 `pwd` 才能判断 ——
+    // 而这个项目已经在这上面栽过（`verify_memory.py` 报"缺少记忆表"，
+    // 其实只是验错了文件；那次之后它改成打绝对路径）。
+    //
+    // 还要标出"这个库是不是新建的"：从仓库根不带 --db 跑会**新建一个空库**，
+    // 而用户看到空的会话列表时，第一反应是"我的记录丢了"——
+    // 其实只是写进了另一个文件。
+    auto abs_of = [](const std::string& p) {
+        std::error_code ec;
+        const auto a = fs::absolute(p, ec);
+        return ec ? p : a.lexically_normal().string();
+    };
+    const std::string db_abs = abs_of(db_path);
+    std::error_code ec_db;
+    const bool db_exists = fs::exists(db_abs, ec_db);
+
     std::cout << "[Config] Whisper 模型 : " << whisper_model
               << (whisper_ready() ? "  (已找到)" : "  (!! 不存在)") << "\n"
               << "[Config] 混元模型     : " << hunyuan_model << "\n"
-              << "[Config] 数据库       : " << db_path << "\n"
+              << "[Config] 数据库       : " << db_abs
+              << (db_exists ? "" : "  (不存在，本次会新建一个空库)")
+              << "\n"
+              << "[Config] 交付物目录   : " << abs_of(deliverable_dir) << "\n"
               << "[Config] 语言策略     : 源=" << source_lang
               << "  目标=" << target_lang
               << (source_lang == "auto"
