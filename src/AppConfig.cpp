@@ -97,6 +97,9 @@ AppConfig AppConfig::from(int argc, char** argv) {
         else if (arg == "--demo-session")  cfg.demo_session = true;
         else if (arg == "--test-window")   cfg.test_window = true;
         else if (arg == "--verbose")       cfg.verbose = true;
+        else if (arg == "--report")        next(cfg.report_goal);
+        // ⚠️ 刻意不叫 --ask —— 那个已被确认交互开关占用（见 AppConfig.h 的说明）
+        else if (arg == "--search")        next(cfg.search_query);
         else if (arg == "--wav")           next(cfg.wav_path);
         else if (arg == "--gaps")          cfg.show_gaps = true;
         else if (arg == "--extract") {

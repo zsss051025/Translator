@@ -1,4 +1,4 @@
-# 集成 vcpkg
+﻿# 集成 vcpkg
 set(CMAKE_TOOLCHAIN_FILE "C:/dev/vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE STRING "")
 
 cmake_minimum_required(VERSION 3.20)
@@ -47,6 +47,7 @@ add_executable(Translator
 	src/KnowledgeExtract.cpp
 	src/Utf8.cpp
 	src/AgentTool.cpp
+	src/AgentLoop.cpp
 	src/DeliverableWriter.cpp
 	src/LlmSummarizer.cpp
 	src/CaBundle.cpp

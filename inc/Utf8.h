@@ -66,4 +66,29 @@ std::string sanitize(const std::string& s, size_t* replaced = nullptr);
 std::string truncate(const std::string& s, size_t max_bytes,
                      const std::string& marker = "\xE2\x80\xA6\xEF\xBC\x88\xE5\xB7\xB2\xE6\x88\xAA\xE6\x96\xAD\xEF\xBC\x89");
 
+// ---------------------------------------------------------------------------
+// UTF-16 → UTF-8：**Windows 命令行参数的正确读法**
+// ---------------------------------------------------------------------------
+//
+// 【为什么必须有它 —— 中文参数会把程序直接搞崩】
+// Windows 上 `main(int, char** argv)` 拿到的 argv 是按**当前控制台代码页**
+// 编码的。中文 Windows 默认 936（GBK），于是：
+//
+//     Translator.exe --report "整理过去一周的工作"
+//       → argv[2] 是 GBK 字节（`D5 FB C0 ED ...`），不是 UTF-8
+//       → 程序当 UTF-8 用 → 非法字节
+//       → nlohmann::json::dump() 抛 type_error.316（invalid UTF-8 byte）
+//       → 未捕获 → std::terminate → **进程崩溃，exit code 0xC0000409**
+//
+// 实测就是这样：`--search EnglishPod` 一切正常，`--search 凤凰项目` 崩掉，
+// 而且**什么错误都不打**（看起来像"命令没生效"）。
+//
+// 【为什么不能靠 `chcp 65001`】程序内部确实调了 `chcp 65001`，
+// 但那是在**参数已经被编码之后**才执行的；而且实测先在 PowerShell 里
+// `chcp 65001` 再跑也无效（PS 5.1 传参用的是自己那套编码）。
+//
+// 【正确做法】用 `wmain` 拿宽字符参数（Windows 原生就是 UTF-16，
+// 与控制台代码页无关），再转成 UTF-8。这样中文参数在**任何**代码页下都对。
+std::string from_wide(const wchar_t* w);
+
 }  // namespace utf8

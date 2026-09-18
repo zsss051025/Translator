@@ -1,5 +1,9 @@
 #include "Utf8.h"
 
+#if defined(_WIN32)
+#include <windows.h>   // WideCharToMultiByte —— 宽字符参数转 UTF-8
+#endif
+
 namespace utf8 {
 
 namespace {
@@ -107,6 +111,26 @@ std::string truncate(const std::string& s, size_t max_bytes, const std::string& 
     std::string out = clean.substr(0, cut);
     if (room) out += marker;
     return out;
+}
+
+std::string from_wide(const wchar_t* w) {
+    if (!w || !*w) return {};
+#if defined(_WIN32)
+    // 用 Windows 自己的转换函数，而不是手写码点拼装：
+    // 代理对（emoji 等超出 BMP 的字符）、非 BMP 路径、异常输入都由它处理，
+    // 而且它给出的就是**合法 UTF-8**。
+    const int need = ::WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (need <= 1) return {};          // 0 = 失败，1 = 只有结尾的 \0
+    std::string out(static_cast<size_t>(need - 1), '\0');
+    ::WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), need, nullptr, nullptr);
+    return out;
+#else
+    // 非 Windows 平台本来就是 UTF-8 的 char**，不会走到这里
+    // （这个函数只在 wmain 里被调用，而 wmain 是 Windows 专用的）。
+    std::string out;
+    for (const wchar_t* p = w; *p; ++p) out.push_back(static_cast<char>(*p));
+    return out;
+#endif
 }
 
 }  // namespace utf8

@@ -23,6 +23,7 @@
 #include "KnowledgeExtract.h"
 #include "Utf8.h"
 #include "AgentTool.h"
+#include "AgentLoop.h"
 #include "DeliverableWriter.h"
 #include "LlmSummarizer.h"
 #include "SubtitleWindow.h"
@@ -733,7 +734,98 @@ static void mix_audio(std::vector<float>& dst, const std::vector<float>& src) {
 
 // --extract <会话id> [--apply]：对**已经存下来的**一场会话跑一遍自动抽取。
 //
-// 默认**只读**，只打印抽出什么。加 `--apply` 才真的写库，并接着跑确认交互。
+// --report "<任务>"：把一件事**派给 agent** —— 它自己决定调哪些工具、调几次，
+// 然后给出带出处的结论（§7 步骤 5.6，依赖 5.2 的规划循环）。
+//
+// 【为什么这是整个第 5 阶段的落点】在它之前，产品的四份交付物都是
+// "一场会话 → 一份文件"，**没有任何东西能跨会话回答一个问题**。
+// 而用户真正想要的是：「整理过去一周关于凤凰项目的工作」这种**派活**。
+//
+// 【失败模式是本命令最要紧的部分】资料不足时它必须说"我查不到"，
+// 绝不能编一份看起来完整的报告 —— 这直接决定赛题"结果交付与可验收性"
+// 是加分还是负分。所以：
+//   · 每次工具调用与结果都逐步打印（`--audit` 打的就是它）
+//   · 全程没调过工具就给结论 → 明确标出来
+//   · 预算耗尽 → 交半成品 + 说清为什么停
+static int run_report(const AppConfig& cfg) {
+    auto& store = SessionStore::instance();
+    if (!store.init(cfg.db_path)) {
+        std::cerr << "[报告] 打不开数据库: " << cfg.db_path << std::endl;
+        return 1;
+    }
+
+    agent::ToolRegistry reg;
+    agent::register_readonly_tools(reg);
+
+    agent::ToolContext ctx;
+    ctx.deliverable_root = cfg.deliverable_dir;
+
+    auto planner = agent::make_deepseek_planner(cfg.deepseek_api_key);
+    if (!planner) {
+        // **能力降级，不是崩溃** —— 说清楚，并指出退路。
+        std::cout << "[报告] 没有配置 DeepSeek API Key，做不了多步查证。\n"
+                     "        可以用 --ask \"<关键词>\" 做单次检索（不需要 Key、不走网络）。"
+                  << std::endl;
+        SessionStore::instance().close();
+        return 1;
+    }
+
+    std::cout << "[报告] 任务：" << cfg.report_goal << std::endl;
+    std::cout << "[报告] 可用工具 " << reg.size() << " 个：";
+    for (const auto& n : reg.names()) std::cout << n << " ";
+    std::cout << "\n-------- 执行过程 --------" << std::endl;
+
+    const auto r = agent::run(cfg.report_goal, reg, ctx, planner, agent::Budget(),
+                              &std::cout);
+
+    std::cout << "-------- 结果 --------" << std::endl;
+    std::cout << r.answer << std::endl;
+    std::cout << "\n[报告] " << r.steps_used << " 步 / " << r.tool_calls << " 次工具调用";
+    if (r.partial) std::cout << "（未完成）";
+    if (r.no_tools_used) std::cout << "  ⚠️ 全程没调用任何工具";
+    std::cout << "\n[报告] 停止原因：" << r.stop_reason << std::endl;
+
+    SessionStore::instance().close();
+    return r.ok ? 0 : 1;
+}
+
+// --search "<关键词>"：单次检索长期记忆（§7 步骤 5.3）。
+//
+// ⚠️ **不能叫 `--ask`**：那个名字已经被"会话结束的确认交互开关"占了
+// （`--ask` / `--no-ask`，见 AppConfig::AskMode）。计划文档里写的是
+// "5.3 `--ask` 检索"，落地时必须改名 —— 否则两个语义撞在一个参数上，
+// 谁先解析谁生效，行为取决于参数顺序。
+//
+// 【它是 agent 的**退化情形**，不是另一个功能】一次工具调用、零规划。
+// 两个好处：① 不需要 Key、不联网也能用 ② 两条路径共用同一个工具实现，
+// 不会出现"agent 查到的东西和 --search 查到的不同"这种走散。
+static int run_search(const AppConfig& cfg) {
+    auto& store = SessionStore::instance();
+    if (!store.init(cfg.db_path)) {
+        std::cerr << "[检索] 打不开数据库: " << cfg.db_path << std::endl;
+        return 1;
+    }
+
+    agent::ToolRegistry reg;
+    agent::register_readonly_tools(reg);
+    agent::ToolContext ctx;
+    ctx.deliverable_root = cfg.deliverable_dir;
+
+    nlohmann::json args;
+    args["query"] = cfg.search_query;
+    const auto tr = reg.call("search_knowledge", args.dump(), ctx);
+    if (!tr.ok) {
+        std::cerr << "[检索] 失败：" << tr.error << std::endl;
+        SessionStore::instance().close();
+        return 1;
+    }
+    std::cout << "[检索] " << cfg.search_query << " —— " << tr.audit << std::endl;
+    std::cout << tr.content << std::endl;
+    SessionStore::instance().close();
+    return 0;
+}
+
+// --extract <会话id> [--apply]：对**已经存下来的**一场会话跑一遍自动抽取。
 //
 // 【为什么要这个命令】
 //   ① 抽取器的自检用的是手搓段落，而本项目栽过两次"测试数据与真实数据形状不一致"
@@ -3079,6 +3171,215 @@ static int run_selftest(const AppConfig& cfg) {
         if (!db_ok) return 1;
     }
 
+    // ---- 22) Agent 规划循环（§7 步骤 5.2）----
+    //
+    // 【为什么这一组能存在，本身就是架构的证据】
+    // 规划是**联网 + 不确定**的：直接写进循环就永远进不了 L1（自检跑不了、
+    // 行为随模型变、回归无从谈起）。把"调 LLM"抽成可注入回调之后，
+    // 这里喂**脚本化的工具调用序列**，走的是**真实循环逻辑** ——
+    // 预算、审计留痕、工具失败处理、失败模式，全都能验。
+    {
+        using namespace agent;
+        bool a_ok = true;
+        std::string awhy;
+
+        auto mk_reg = []() {
+            ToolRegistry reg;
+            Tool t;
+            t.name        = "echo";
+            t.description = u8"回显参数（自检用）";
+            t.params_schema = "{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\"}}}";
+            t.run = [](const std::string& args, const ToolContext&, std::string*) {
+                ToolResult r;
+                r.ok      = true;
+                r.content = "{\"got\":" + args + "}";
+                r.audit   = u8"回显了一次";
+                return r;
+            };
+            std::string e;
+            reg.add(t, &e);
+
+            Tool bad;
+            bad.name        = "boom";
+            bad.description = u8"总是失败（自检用）";
+            bad.params_schema = "{\"type\":\"object\",\"properties\":{}}";
+            bad.run = [](const std::string&, const ToolContext&, std::string*) {
+                ToolResult r;
+                r.ok    = false;
+                r.error = u8"故意的失败";
+                return r;
+            };
+            reg.add(bad, &e);
+            return reg;
+        };
+
+        // ① 正常多步：查两次 → 给结论；审计要留下两次调用的痕迹
+        {
+            const auto reg = mk_reg();
+            std::vector<Step> script;
+            {
+                Step s; s.calls.push_back({"c1", "echo", "{\"x\":\"a\"}"}); script.push_back(s);
+                Step s2; s2.calls.push_back({"c2", "echo", "{\"x\":\"b\"}"}); script.push_back(s2);
+                Step s3; s3.content = u8"查到了：a 和 b"; script.push_back(s3);
+            }
+            size_t i = 0;
+            Planner p = [&](const std::vector<Message>&, const std::string&, Step* out,
+                            std::string*) {
+                if (i >= script.size()) return false;
+                *out = script[i++];
+                return true;
+            };
+            std::ostringstream sink;
+            const auto r = run(u8"查一下 a 和 b", reg, ToolContext{}, p, Budget(), &sink);
+            if (!r.ok || r.answer.find("a 和 b") == std::string::npos) {
+                a_ok = false; awhy = u8"正常多步没给出结论";
+            } else if (r.tool_calls != 2) {
+                a_ok = false; awhy = u8"工具调用次数应为 2，实际 " + std::to_string(r.tool_calls);
+            } else if (r.audit.size() != 2) {
+                // **审计是评审判断"它真在做事"的唯一依据**，缺了等于没有证据
+                a_ok = false; awhy = u8"审计留痕条数不对：" + std::to_string(r.audit.size());
+            } else if (sink.str().find("调用 echo") == std::string::npos) {
+                a_ok = false; awhy = u8"--audit 没有逐步打印出工具调用";
+            }
+        }
+
+        // ② **全程没调工具就给结论 → 必须标出来**（"不能编"那条唯一的机械抓手）
+        {
+            const auto reg = mk_reg();
+            Planner p = [](const std::vector<Message>&, const std::string&, Step* out,
+                           std::string*) {
+                out->content = u8"我猜大概是这样的……";   // 一次都没查
+                return true;
+            };
+            const auto r = run(u8"查一下", reg, ToolContext{}, p);
+            if (!r.no_tools_used) {
+                a_ok = false;
+                awhy = u8"全程没调工具却给了结论，没有被标出来 —— 那是编报告的信号";
+            }
+        }
+
+        // ③ 单个工具失败 → **不许让任务崩掉**，错误要作为观察回给模型
+        {
+            const auto reg = mk_reg();
+            size_t i = 0;
+            bool saw_error_obs = false;
+            std::vector<Step> script;
+            { Step s; s.calls.push_back({"c1", "boom", "{}"}); script.push_back(s); }
+            { Step s2; s2.calls.push_back({"c2", "echo", "{}"}); script.push_back(s2); }
+            { Step s3; s3.content = u8"我换了办法，查到了"; script.push_back(s3); }
+            Planner p = [&](const std::vector<Message>& h, const std::string&, Step* out,
+                            std::string*) {
+                for (const auto& m : h) {
+                    if (m.role == "tool" && m.content.find(u8"故意的失败") != std::string::npos) {
+                        saw_error_obs = true;
+                    }
+                }
+                if (i >= script.size()) return false;
+                *out = script[i++];
+                return true;
+            };
+            const auto r = run(u8"试一下", reg, ToolContext{}, p);
+            if (!r.ok) {
+                a_ok = false; awhy = u8"一次工具失败就把整个任务搞崩了";
+            } else if (!saw_error_obs) {
+                a_ok = false; awhy = u8"工具失败的原因没有回给模型（它没法换个办法）";
+            } else if (r.audit.size() != 2 || r.audit[0].tool_ok) {
+                a_ok = false; awhy = u8"审计没记下那一次失败";
+            }
+        }
+
+        // ④ **预算耗尽 → 交半成品 + 说清为什么停**，不是报错
+        {
+            const auto reg = mk_reg();
+            int n = 0;
+            Planner p = [&](const std::vector<Message>&, const std::string&, Step* out,
+                            std::string*) {
+                // 永远要求继续查 —— 模拟"停不下来"
+                out->calls.push_back({"c" + std::to_string(++n), "echo", "{}"});
+                return true;
+            };
+            Budget b; b.max_steps = 3;
+            const auto r = run(u8"查个没完", reg, ToolContext{}, p, b);
+            if (!r.partial) {
+                a_ok = false; awhy = u8"步数用完了却没标成 partial";
+            } else if (r.answer.find(u8"步数用完") == std::string::npos) {
+                // 用户看到"半成品 + 一句实话"是有用的；
+                // 看到 "Error: budget exceeded" 是没用的
+                a_ok = false; awhy = u8"预算耗尽时没有说清为什么停：" + r.answer;
+            } else if (r.tool_calls != 3) {
+                a_ok = false; awhy = u8"应恰好执行 3 步，实际 " + std::to_string(r.tool_calls);
+            }
+        }
+
+        // ⑤ 没有规划器（没配 Key）→ **能力降级，不是崩溃**，而且要说清退路
+        {
+            const auto reg = mk_reg();
+            const auto r = run(u8"随便", reg, ToolContext{}, Planner());
+            if (r.ok) {
+                a_ok = false; awhy = u8"没有规划器却报了 ok";
+            } else if (r.answer.find("--search") == std::string::npos) {
+                a_ok = false;
+                awhy = u8"没配 Key 时没告诉用户退路（--search）";
+            }
+        }
+
+        // ⑥ 没有工具 → 也要说人话
+        {
+            ToolRegistry empty_reg;
+            Planner p = [](const std::vector<Message>&, const std::string&, Step* out,
+                           std::string*) { out->content = "x"; return true; };
+            const auto r = run(u8"随便", empty_reg, ToolContext{}, p);
+            if (r.ok || r.answer.find(u8"没有任何可用的工具") == std::string::npos) {
+                a_ok = false; awhy = u8"没有工具时没说清楚";
+            }
+        }
+
+        // ⑦ 规划器返回失败 → 交已查到的部分 + 说清断线
+        {
+            const auto reg = mk_reg();
+            size_t i = 0;
+            Planner p = [&](const std::vector<Message>&, const std::string&, Step* out,
+                            std::string*) {
+                if (i++ == 0) { out->calls.push_back({"c1", "echo", "{}"}); return true; }
+                return false;   // 断线
+            };
+            const auto r = run(u8"查一下", reg, ToolContext{}, p);
+            if (!r.partial) {
+                a_ok = false; awhy = u8"规划器失败却没标成 partial";
+            } else if (r.stop_reason.find(u8"断线") == std::string::npos &&
+                       r.answer.find(u8"断线") == std::string::npos) {
+                a_ok = false; awhy = u8"断线时没说清楚";
+            }
+        }
+
+        // ⑧ assistant 消息必须带上**原始 arguments**（协议要求，反推是有损的）
+        {
+            const auto reg = mk_reg();
+            size_t i = 0;
+            std::string seen_args;
+            Planner p = [&](const std::vector<Message>& h, const std::string&, Step* out,
+                            std::string*) {
+                for (const auto& m : h) {
+                    if (m.role == "assistant" && !m.calls.empty()) {
+                        seen_args = m.calls[0].args_json;
+                    }
+                }
+                if (i++ == 0) { out->calls.push_back({"c1", "echo", "{\"x\":\"KEEP_ME\"}"}); return true; }
+                out->content = u8"好了";
+                return true;
+            };
+            (void)run(u8"查", reg, ToolContext{}, p);
+            if (seen_args.find("KEEP_ME") == std::string::npos) {
+                a_ok = false;
+                awhy = u8"历史里的工具调用参数丢了（我第一版从后续消息反推，arguments 会变成 {}）";
+            }
+        }
+
+        std::cout << "[SelfTest] Agent 规划循环（多步/审计/失败不崩/预算降级/没Key说退路）: "
+                  << (a_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+        if (!a_ok) { std::cerr << "    " << awhy << std::endl; return 1; }
+    }
+
     // ---- 12) 知识缺口检测六条规则（§6.6 / §6.7）----
     // 全内存构造，不碰数据库、不碰模型。
     {
@@ -4396,7 +4697,8 @@ static int run_selftest(const AppConfig& cfg) {
 }
 
 
-int main(int argc, char** argv) {
+// 真正的程序主体。参数已经是**合法 UTF-8**（由下面的 wmain/main 保证）。
+static int run_app(int argc, char** argv) {
     //  设置控制台为 UTF-8 编码，防止中文乱码
     system("chcp 65001");
 
@@ -4417,6 +4719,8 @@ int main(int argc, char** argv) {
     if (cfg.show_gaps)    return run_show_gaps(cfg);
     if (cfg.extract_session >= 0) return run_extract(cfg);
     if (cfg.tools_list_only || !cfg.tools_name.empty()) return run_tools(cfg);
+    if (!cfg.report_goal.empty()) return run_report(cfg);
+    if (!cfg.search_query.empty()) return run_search(cfg);
     if (cfg.dump_terms) return run_dump_terms(cfg);
     if (!cfg.dump_prompt.empty()) return run_dump_prompt(cfg);
     if (cfg.export_session >= 0) return run_export(cfg);
@@ -5038,3 +5342,39 @@ int main(int argc, char** argv) {
     SessionStore::instance().close();
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+// 入口：Windows 走 wmain，其它平台走 main
+// ---------------------------------------------------------------------------
+//
+// 【为什么必须用 wmain —— 中文参数会把程序直接搞崩】
+// Windows 上 `main(int, char** argv)` 拿到的 argv 是按**当前控制台代码页**
+// 编码的。中文 Windows 默认 936（GBK），于是：
+//
+//     Translator.exe --report "整理过去一周的工作"
+//       → argv[2] 是 GBK 字节（D5 FB C0 ED …），不是 UTF-8
+//       → 程序当 UTF-8 用 → 出现非法字节
+//       → nlohmann::json::dump() 抛 type_error.316 (invalid UTF-8 byte)
+//       → 未捕获 → std::terminate → **进程直接崩，exit code 0xC0000409**
+//
+// 实测：`--search EnglishPod` 一切正常，`--search 凤凰项目` 崩掉，
+// 而且**什么错误都不打** —— 看起来像"命令没生效"，最难查的那种。
+//
+// `wmain` 拿到的宽字符参数是 Windows 原生的 UTF-16，**与控制台代码页无关**，
+// 转成 UTF-8 之后中文参数在任何代码页下都对。
+//
+// ⚠️ `chcp 65001` 解决不了这个问题：程序内部那行 `system("chcp 65001")`
+// 是在**参数已经被编码之后**才执行的；实测先在 PowerShell 里 chcp 再跑也无效。
+#if defined(_WIN32)
+int wmain(int argc, wchar_t** wargv) {
+    std::vector<std::string> args;
+    args.reserve(static_cast<size_t>(argc));
+    for (int i = 0; i < argc; ++i) args.push_back(utf8::from_wide(wargv[i]));
+    std::vector<char*> argv;
+    argv.reserve(args.size());
+    for (auto& s : args) argv.push_back(s.data());
+    return run_app(argc, argv.data());
+}
+#else
+int main(int argc, char** argv) { return run_app(argc, argv); }
+#endif
