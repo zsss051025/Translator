@@ -756,6 +756,10 @@ static int run_report(const AppConfig& cfg) {
 
     agent::ToolRegistry reg;
     agent::register_readonly_tools(reg);
+    // 派活这条路**额外**给它"提议"能力（5.4）。正常会话路径不注册写工具 ——
+    // 调用点一眼能看出"这一步给了写权限"。而且它只能写 candidate：
+    // 见 AgentTool.h 里"闸门怎么保证"的三层说明。
+    agent::register_write_tools(reg);
 
     agent::ToolContext ctx;
     ctx.deliverable_root = cfg.deliverable_dir;
@@ -764,7 +768,7 @@ static int run_report(const AppConfig& cfg) {
     if (!planner) {
         // **能力降级，不是崩溃** —— 说清楚，并指出退路。
         std::cout << "[报告] 没有配置 DeepSeek API Key，做不了多步查证。\n"
-                     "        可以用 --ask \"<关键词>\" 做单次检索（不需要 Key、不走网络）。"
+                     "        可以用 --search \"<关键词>\" 做单次检索（不需要 Key、不走网络）。"
                   << std::endl;
         SessionStore::instance().close();
         return 1;
@@ -900,11 +904,22 @@ static int run_tools(const AppConfig& cfg) {
     agent::ToolRegistry reg;
     agent::register_readonly_tools(reg);
 
+    // 写工具（5.4）也注册进来，但**要说清它只在哪条路上有效**。
+    //
+    // 【为什么诊断里也要有它】项目的规矩是"诊断必须显示真实的东西"。
+    // 真实情况是**两条路的工具集不一样**：正常会话只有只读，
+    // `--report` 派活时额外有"提议"。诊断里只显示一半，会让人以为
+    // agent 不能写；显示出来但不说明，又会让人以为会话路径也能写。
+    // 所以：注册 + 明确标注生效范围。
+    agent::register_write_tools(reg);
+
     agent::ToolContext ctx;
     ctx.deliverable_root = cfg.deliverable_dir;
 
     if (cfg.tools_list_only) {
-        std::cout << "[Tools] 已注册 " << reg.size() << " 个工具（5.1 全部只读）：" << std::endl;
+        std::cout << "[Tools] 已注册 " << reg.size() << " 个工具"
+                     "（5 个只读 + 1 个「提议」；**提议只在 --report 派活时可用**）："
+                  << std::endl;
         for (const auto& n : reg.names()) {
             const agent::Tool* t = reg.find(n);
             std::cout << "  · " << n << std::endl;
@@ -3373,6 +3388,80 @@ static int run_selftest(const AppConfig& cfg) {
                 a_ok = false;
                 awhy = u8"历史里的工具调用参数丢了（我第一版从后续消息反推，arguments 会变成 {}）";
             }
+        }
+
+        // ⑨ **写工具的闸**（步骤 5.4）—— agent 只能提议，永远不能确认
+        //
+        // 【为什么这条必须有可执行证据】§6.5 红线是"模型猜的东西永远不能自动
+        // 变成约束"。写工具是**唯一可能破这条线的东西**（它真的往库里写）。
+        // 只在注释里承诺"我们只写 candidate"是不够的 —— 那和"注意不要泄漏
+        // 内部状态"是同一类靠不住的保证。所以这里真调一次写工具，然后**断言**：
+        //   ① 落库状态必须是 candidate
+        //   ② `usable_as_constraint()` 必须拒绝它（不进识别提示/翻译约束）
+        //   ③ 未知/非法 kind 必须被拒（不许借 kind 绕过）
+        {
+            const std::string PK = "__selftest_agentprop_";
+            auto& ksx = KnowledgeStore::instance();
+            ksx.purge_key_prefix(PK);
+
+            ToolRegistry wreg;
+            register_write_tools(wreg);
+            if (wreg.size() == 0) {
+                a_ok = false; awhy = u8"写工具没注册上";
+            } else if (wreg.find("propose_knowledge") == nullptr) {
+                a_ok = false; awhy = u8"propose_knowledge 没注册";
+            }
+
+            if (a_ok) {
+                nlohmann::json args;
+                args["value"] = PK + u8"凤凰项目";
+                args["kind"]  = "project";
+                args["evidence"] = u8"这周我们在推凤凰项目";
+                const auto tr = wreg.call("propose_knowledge", args.dump(), ToolContext{});
+                if (!tr.ok) {
+                    a_ok = false; awhy = u8"写工具调用失败：" + tr.error;
+                } else if (tr.content.find("\"status\":\"candidate\"") == std::string::npos) {
+                    a_ok = false; awhy = u8"写工具的结果没说明它是候选";
+                } else if (tr.audit.find(u8"待用户确认") == std::string::npos) {
+                    a_ok = false; awhy = u8"审计里没说清它是待确认的候选";
+                }
+
+                KnowledgeItem got;
+                const std::string nk = knowledge::normalize_key(PK + u8"凤凰项目");
+                if (a_ok && !ksx.get("project", nk, &got)) {
+                    a_ok = false; awhy = u8"agent 提议的东西没落库";
+                } else if (a_ok && got.status != "candidate") {
+                    // **这一条是本组的核心**：红线破了就是这里报
+                    a_ok = false;
+                    awhy = u8"agent 提议的东西落库状态不是 candidate，而是 " + got.status +
+                           u8" —— §6.5 红线破了";
+                } else if (a_ok && knowledge::usable_as_constraint(got)) {
+                    a_ok = false;
+                    awhy = u8"candidate 通过了 usable_as_constraint（它会进识别提示/翻译约束）";
+                }
+            }
+
+            // **非法 kind 必须被拒** —— 不许借 kind 字段绕过名字类的限制
+            if (a_ok) {
+                nlohmann::json bad;
+                bad["value"] = PK + u8"随便";
+                bad["kind"]  = "decision";       // 值是整句话的那类，刻意不收
+                const auto tr = wreg.call("propose_knowledge", bad.dump(), ToolContext{});
+                if (tr.ok) {
+                    a_ok = false;
+                    awhy = u8"写工具接受了 decision 这类 kind（值可以是整句话，风险大）";
+                }
+            }
+
+            // **空 value 必须被拒**
+            if (a_ok) {
+                nlohmann::json empty;
+                empty["kind"] = "term";
+                const auto tr = wreg.call("propose_knowledge", empty.dump(), ToolContext{});
+                if (tr.ok) { a_ok = false; awhy = u8"写工具接受了空的 value"; }
+            }
+
+            ksx.purge_key_prefix(PK);
         }
 
         std::cout << "[SelfTest] Agent 规划循环（多步/审计/失败不崩/预算降级/没Key说退路）: "

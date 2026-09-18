@@ -1,4 +1,4 @@
-#include "AgentTool.h"
+﻿#include "AgentTool.h"
 
 #include <algorithm>
 #include <chrono>
@@ -9,6 +9,7 @@
 #include <iostream>
 #include <sstream>
 
+#include "KnowledgeExtract.h"
 #include "KnowledgeStore.h"
 #include "SessionStore.h"
 #include "Utf8.h"
@@ -368,6 +369,58 @@ ToolResult tool_get_session_report(const std::string& args_json, const ToolConte
     return r;
 }
 
+// ===============================================================
+// 写工具：**提议**，不是写入
+// ===============================================================
+//
+// 【这一段的全部意义在一句话上】agent 可以让库**多一条候选**，
+// 但**没有任何办法**让它变成 confirmed。
+//
+// 做法上刻意绕开 `KnowledgeStore::upsert`（它接受 status 字段，
+// 理论上能写 confirmed —— 那就等于把闸门开在代码里，靠"我们不会那么调"来守）。
+// 这里只走 `save_candidates()`：那个函数写死 `status = candidate`，
+// 而且它的入参结构 `ExtractedCandidate` **根本没有 status 字段** ——
+// 也就是说，**这条路径连表达"confirmed"的能力都不存在**。
+ToolResult tool_propose_knowledge(const std::string& args_json, const ToolContext&,
+                                  std::string* err) {
+    ToolResult r;
+    const json a = json::parse(args_json);   // 和别的工具一样；坏参数由 ToolRegistry::call 兜
+
+    const std::string value = a.value("value", std::string());
+    if (value.empty()) { r.error = u8"缺少 value"; return r; }
+
+    knowledge::ExtractedCandidate c;
+    // kind 限定在**名字类**里：fact / decision 的值是整句话，
+    // 让 agent 自己写一整句话进库风险大（它会进摘要背景影响后续所有纪要）。
+    c.kind = a.value("kind", std::string("term"));
+    if (!knowledge::is_name_like_kind(c.kind)) {
+        r.error = u8"kind 只允许 person / project / product / term（实际：" + c.kind + u8"）";
+        return r;
+    }
+    c.key          = knowledge::normalize_key(value);
+    c.value        = value;
+    c.hits         = 1;
+    c.confidence   = 0.5;                    // 刻意压低：这是**提议**，不是识别出来的
+    c.source_text  = u8"由 agent 在任务中提议：" + a.value("evidence", std::string());
+    c.why          = a.value("reason", std::string("agent 提议"));
+
+    std::string e;
+    const int n = knowledge::save_candidates({c}, &e);
+    if (n <= 0) {
+        r.error = e.empty() ? u8"写入候选失败" : e;
+        return r;
+    }
+
+    r.ok      = true;
+    r.content = json{{"ok", true},
+                     {"status", "candidate"},
+                     {"value", value},
+                     {"note", u8"已记为**候选**，未经用户确认，不会被用作识别提示或翻译约束"}}
+                    .dump(-1, ' ', false, json::error_handler_t::replace);
+    r.audit   = u8"提出候选「" + value + u8"」（待用户确认，不生效）";
+    return r;
+}
+
 }  // namespace
 
 void register_readonly_tools(ToolRegistry& reg) {
@@ -436,6 +489,33 @@ void register_readonly_tools(ToolRegistry& reg) {
             "session_id":{"type":"integer","description":"会话编号，从 list_sessions 得到"}
         },"required":["session_id"]})",
         tool_get_session_report,
+    });
+}
+
+void register_write_tools(ToolRegistry& reg) {
+    std::string err;
+    auto add = [&](Tool t) {
+        if (!reg.add(std::move(t), &err)) {
+            std::cerr << "[Agent] 注册工具失败：" << err << std::endl;
+        }
+    };
+
+    add({
+        "propose_knowledge",
+        "**提议**把一个人名/项目/产品/术语记进长期记忆。"
+        "当你在任务中发现某个名字反复出现、而且它看起来是**他们组织私有**的"
+        "（不是通用词），但库里查不到时，用它提议记下来。\n"
+        "⚠️ 你**只能提议**：记下来的是 candidate（候选），"
+        "要等用户在会话结束时确认才会生效。你**不能**让它立刻生效。\n"
+        "⚠️ 不确定就不要提议 —— 提议会在下次会话结束时占用用户一次注意力。",
+        R"({"type":"object","properties":{
+            "value":{"type":"string","description":"要记的名字（原样写法，如 凤凰项目 / CO-RE / Penny）"},
+            "kind":{"type":"string","enum":["person","project","product","term"],
+                    "description":"类型：人名 / 项目名 / 产品名 / 术语"},
+            "evidence":{"type":"string","description":"你在哪句话里看到它的（原话，作为证据）"},
+            "reason":{"type":"string","description":"为什么觉得它值得记（一句话）"}
+        },"required":["value","kind"]})",
+        tool_propose_knowledge,
     });
 }
 
