@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <sstream>
 
+#include "CommonWords.h"   // 通用概念过滤：别问人人皆知的东西
+
 namespace knowledge {
 
 const char* to_string(GapRule r) {
@@ -152,6 +154,9 @@ std::vector<GapQuestion> detect_gaps(const std::vector<KnowledgeWithHistory>& en
             if (k.status == "archived") continue;
             if (k.value.empty() || k.asked_count >= kMaxAsks) continue;
             if (!is_name_like_kind(k.kind)) continue;
+            // 通用概念不参与写法冲突 —— 否则「TV/TVs」这种会被当成
+            // "同一个实体的两种写法"去问，而它们根本不需要被讨论。
+            if (commonwords::is_general(k.key)) continue;
             cand.push_back(i);
         }
 
@@ -216,6 +221,22 @@ std::vector<GapQuestion> detect_gaps(const std::vector<KnowledgeWithHistory>& en
         // archived 是用户明确否掉的，再问就是烦人（§1.3 提问稀缺）
         if (k.status == "archived") continue;
         if (k.value.empty()) continue;
+
+        // ---- 通用概念：不问 --------------------------------------------------
+        //
+        // 【这一条是干什么的】用户的原话是要"只问那些可能只会在我会话里出现的名词"。
+        // 而这一层就是那句要求的落点：**人人皆知的东西，问了只是浪费用户的注意力。**
+        //
+        // 【为什么不能交给模型判断】可以，但要等 agent 那条路（5.2）。
+        // 在那之前，先把**真实发生过的冤枉提问**用一张确定性表挡掉 ——
+        // 表里每一条都来自真实会话（见 inc/CommonWords.h 的注释），
+        // 所以它能进 L1、秒级可验，而且不会因为换了个模型就失效。
+        //
+        // 【为什么放在提问阶段，而不是提取阶段】提取阶段的职责是"尽量别漏"，
+        // 提问阶段的职责是"值得问才问"。两个阶段目标相反（见 CommonWords.h 的说明）。
+        // 在这里挡掉，候选仍然留在库里（`--gaps` 会标出"[通用词，不问]"），
+        // 看得见、可复查，而不是悄悄消失。
+        if (commonwords::is_general(k.key)) continue;
 
         // 问够次数了就不再问。
         //

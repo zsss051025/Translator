@@ -41,6 +41,7 @@ add_executable(Translator
 	src/KnowledgeGap.cpp
 	src/ConfirmGaps.cpp
 	src/Interaction.cpp
+	src/CommonWords.cpp
 	src/ModelLog.cpp
 	src/KnowledgeExtract.cpp
 	src/Utf8.cpp

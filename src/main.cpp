@@ -13,6 +13,7 @@
 #include "DeepSeekTranslator.h"
 #include "audio_capture.h"
 #include "SpeechEngine.h"
+#include "CommonWords.h"
 #include "ModelLog.h"
 #include "SessionStore.h"
 #include "KnowledgeStore.h"
@@ -294,12 +295,24 @@ static int run_show_gaps(const AppConfig& cfg) {
     }
     const auto all = KnowledgeStore::instance().list("", 10000);
     std::cout << "[Gaps] 库里共有 " << all.size() << " 条知识" << std::endl;
+    size_t n_general = 0;
     for (const auto& k : all) {
+        // 通用词要**标出来**，不能悄悄不问了事。
+        // 用户看到"TV 在库里但从来没被问过"时，得有个地方能确认
+        // "这是有意的"，而不是以为漏了。
+        const bool gen = commonwords::is_general(k.key);
+        if (gen) ++n_general;
         std::cout << "   #" << k.id << " [" << k.kind << "] " << k.key
                   << " = " << k.value
                   << "  status=" << k.status
                   << "  hits=" << k.hits
-                  << "  conf=" << k.confidence << std::endl;
+                  << "  conf=" << k.confidence
+                  << (gen ? "   [通用词，不问]" : "") << std::endl;
+    }
+    if (n_general > 0) {
+        std::cout << "   （通用词过滤表共 " << commonwords::size() << " 条，"
+                  << "本库命中 " << n_general << " 条 —— 人人皆知的东西不占用你的注意力）"
+                  << std::endl;
     }
 
     const auto qs = knowledge::detect_gaps_from_store();
@@ -3533,6 +3546,94 @@ static int run_selftest(const AppConfig& cfg) {
             }
             if (!found) {
                 gap_ok = false; why = "真正的多次值变化反而没被识别";
+            }
+        }
+
+        // ⑳ **通用概念不问用户**（用户需求："只问可能只会在我会话里出现的名词"）
+        //
+        // 【用例全部来自真实会话】下面"该问"和"不该问"两组的键，
+        // 都是**真实会话里真的被抽出来过**的候选 —— 可以在库里查回来：
+        //   #12（66 段）  EnglishPod / Marco / Erica / TV / PC / people / action / froze
+        //   #13（117 段） EnglishPod / Marco / Erika / Marko / TV / putting / together
+        //   #47（53 段）  Erica / EnglishPod / Marco / TV / down / Keep / movies / Speaking
+        //   demo.db #1    TV / EnglishPod / CarsPacked / WGBH / Marco / Erica
+        //
+        // 这一组守的是**两个方向**，缺一个都不算对：
+        //   ① 通用词不许问（问了就是浪费用户注意力，实测发生过 15 次以上）
+        //   ② 真专名**必须还会问** —— 把过滤表做宽到"什么都不问"是最容易犯的错，
+        //      而且它会静默地把整个闭环掐死
+        {
+            struct WCase { const char* key; bool should_ask; };
+            const WCase wc[] = {
+                // ---- 通用词：不问（都来自真实会话的冤枉提问）----
+                {"tv", false},      {"pc", false},      {"down", false},
+                {"keep", false},    {"movies", false},  {"speaking", false},
+                {"learners", false},{"exactly", false}, {"preview", false},
+                {"midnight", false},{"people", false},  {"action", false},
+                {"froze", false},   {"putting", false}, {"together", false},
+                // 通用缩写（同类推广：没人需要被问"API 是什么"）
+                {"api", false},     {"cpu", false},     {"url", false},
+                {"json", false},    {"ceo", false},     {"usb", false},
+                {"ui", false},      {"sdk", false},     {"csv", false},
+                {"pdf", false},     {"png", false},     {"ssh", false},
+                // ---- 真专名：必须还是会问 ----
+                {"marco", true},    {"erica", true},    {"erika", true},
+                {"marko", true},    {"englishpod", true},
+                {"carspacked", true}, {"wgbh", true},   {"samuel", true},
+                {"co-re", true},    {"phoenix", true},  {"凤凰项目", true},
+                // ---- 刻意**不**收的那一类：含义随公司变，问了有价值 ----
+                {"okr", true},      {"kpi", true},      {"mvp", true},
+            };
+            bool w_ok = true;
+            std::string wwhy;
+            int w_pass = 0;
+            for (const auto& c : wc) {
+                const bool gen = commonwords::is_general(c.key);
+                const bool asks = !gen;          // is_general → 不会问
+                if (asks == c.should_ask) { ++w_pass; continue; }
+                w_ok = false;
+                wwhy = std::string(c.should_ask ? "该问的却被过滤掉了: " : "不该问的还会问: ")
+                       + c.key;
+                break;
+            }
+            std::cout << "[SelfTest] 通用概念过滤（真实会话的冤枉提问 / 真专名不许误杀）: "
+                      << (w_ok ? "✅ " + std::to_string(w_pass) + "/" +
+                                 std::to_string(sizeof(wc) / sizeof(wc[0])) + " 通过"
+                               : "❌ 失败")
+                      << std::endl;
+            if (!w_ok) { std::cerr << "    " << wwhy << std::endl; return 1; }
+
+            // 表本身不能是空的（手写计数会撒谎那一课：这里报的是真实值）
+            if (commonwords::size() < 20) {
+                std::cerr << "[SelfTest] 通用词表只有 " << commonwords::size()
+                          << " 条 —— 表空了过滤器就等于没有" << std::endl;
+                return 1;
+            }
+
+            // 行为级：真的喂进 detect_gaps，确认通用词不产生问题
+            {
+                // ⚠️ **刻意用大写的键**。第一版这几条用例传的是 `"TV"`，
+                // 而当时的 `is_general` 只认小写 —— 过滤静默失效、TV 照样被问。
+                // 保留大写形式当用例，是为了让"不假设调用方归一化"这道防线
+                // 一直被守住（生产路径传的是小写，这里故意传大写）。
+                std::vector<KnowledgeWithHistory> v = {
+                    mk(600, "candidate", "TV", 5, 0.9, 0, ""),
+                    mk(601, "candidate", "down", 9, 0.9, 0, ""),
+                };
+                if (!knowledge::detect_gaps(v).empty()) {
+                    std::cerr << "[SelfTest] 通用词仍然被问出来了"
+                                 "（检查 is_general 是否在大小写上失效）" << std::endl;
+                    return 1;
+                }
+                // 但真专名照旧
+                std::vector<KnowledgeWithHistory> v2 = {
+                    mk(602, "candidate", "EnglishPod", 5, 0.9, 0, ""),
+                };
+                bool asked = !knowledge::detect_gaps(v2).empty();
+                if (!asked) {
+                    std::cerr << "[SelfTest] 真专名 EnglishPod 被通用词过滤误杀了" << std::endl;
+                    return 1;
+                }
             }
         }
 
