@@ -104,6 +104,49 @@ target_link_libraries(Translator
 		Threads::Threads
 )
 
+# ---- WebView2（§7 第 4 阶段 4.4）----
+#
+# 【为什么用它】交付物本来就是**自包含单文件 HTML**，WebView2 直接渲染就等于
+# "纪要查看器"白送 —— 省掉自己写一个渲染层。
+#
+# 【装法（已做）】`vcpkg install webview2:x64-windows` →
+#   webview2 1.0.3719.77 + wil。vcpkg 是**经典模式**（没有 vcpkg.json），
+#   和已有的 portaudio/openssl 一样。
+#
+# ⚠️ **它是 DLL 版 Loader**：链接的是 `WebView2Loader.dll.lib`，
+#    运行时必须有 `WebView2Loader.dll` 在 exe 旁边（架构约束 #5）。
+#    vcpkg 的 CMake 集成会在构建时把它拷到输出目录 —— 但那**只在
+#    `find_package` + link 这对同时成立时才发生**，所以打包/部署时
+#    要确认 `build\RelWithDebInfo\WebView2Loader.dll` 真的在。
+#
+# ⚠️ **不要改 /SUBSYSTEM**（架构约束 #1）：整个验证阶梯
+#    （--selftest / --wav / --gaps / 那些 python harness）全走控制台，
+#    改成纯 GUI 子系统会把它们全废掉。
+find_package(unofficial-webview2 CONFIG REQUIRED)
+target_link_libraries(Translator PRIVATE unofficial::webview2::webview2)
+
+# ⚠️ **显式把 WebView2Loader.dll 拷到 exe 旁边**（架构约束 #5）。
+#
+# 【为什么不能靠 vcpkg 的 applocal 自动拷】它是"可执行文件**真的**依赖了这个 dll"
+# 时才拷 —— 而 WebView2Loader 是运行时按需加载的：只要还没有代码调用 WebView2，
+# 链接器就把依赖丢掉了，post-build 扫描也就看不到它。
+# 实测就是这样：接上 find_package + link 之后重新构建，
+# `build\RelWithDebInfo\WebView2Loader.dll` **仍然不存在**。
+# 等到真有代码用它时才自动出现 —— 而那种"依赖某个条件才生效"的部署步骤，
+# 一旦条件在某台机器上不成立就是**运行时崩溃/静默打不开窗口**。
+# 所以这里显式拷，让它在**首次构建时**就必须出现（这是可验证的）。
+if(DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
+	set(_wv2_dll "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin/WebView2Loader.dll")
+	if(EXISTS "${_wv2_dll}")
+		add_custom_command(TARGET Translator POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different
+			        "${_wv2_dll}" "$<TARGET_FILE_DIR:Translator>"
+			COMMENT "部署 WebView2Loader.dll（架构约束 #5）")
+	else()
+		message(WARNING "找不到 ${_wv2_dll} —— WebView2 窗口会在运行时打不开")
+	endif()
+endif()
+
 # cpp-httplib 的 HTTPS 支持。
 #
 # 【为什么放在这里，而不是每个 .cpp 里写一遍 #define】

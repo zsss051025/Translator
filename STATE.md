@@ -165,7 +165,40 @@
 用户发现某条知识是错的，现在只能间接改（重抽取 / 清判断缓存）。
 缺一条「改这条知识」的路 —— **一个改不了的记忆是产品风险**。
 
-**优先级 3：第 4 阶段 GUI（4.1–4.11）** —— 整块没动，是产品形态本身。
+**优先级 3：第 4 阶段 GUI（4.1–4.11）** —— 4.1/4.2/4.3 已完成（助手 / 持久化配置 /
+DPAPI key）；4.4 的 **SDK 接入已完成，窗口本体还没写**。
+
+#### 4.4 的交接（下一次从这里接）
+
+**已完成**
+* `vcpkg install webview2:x64-windows` → `1.0.3719.77` + `wil`
+  （vcpkg 是**经典模式**，和已有的 portaudio/openssl 一样）
+* CMakeLists：`find_package(unofficial-webview2)` + link
+  + **显式 post-build 拷贝 `WebView2Loader.dll`**（160KB，已验证落在 exe 旁边）
+
+⚠️ **为什么 DLL 要显式拷**：vcpkg 的 applocal 是"exe 真的依赖它"时才拷，
+而 WebView2Loader 是**运行时按需加载**的 —— 只要还没有代码调用 WebView2，
+链接器就把依赖丢掉、post-build 也看不到它。**实测确认过**：接上 link 之后重新构建，
+DLL 仍然不存在。靠"某个条件成立才生效"的部署步骤，条件不成立时就是运行时崩溃。
+
+**还没写：窗口本体。要照着架构约束来，每条都有代价**
+
+| # | 约束 | 说明 |
+|---|---|---|
+| 1 | **保持控制台子系统** | 验证阶梯（`--selftest`/`--wav`/`--gaps`/python harness）全走控制台，改 `/SUBSYSTEM:WINDOWS` 会全废。做法：`ShowWindow(GetConsoleWindow(), SW_HIDE)` + 日志转文件 |
+| 2 | **录制主循环留在 main 线程** | WebView2 和字幕窗一样跑自己的线程 —— 不用搬主循环，这是省掉的一大块改造 |
+| 3 | **`RegisterHotKey` 是线程绑定的** | 字幕窗在自己线程注册了 `Ctrl+Alt+Q`，管理窗口**绝不能**再注册同一个。分工：托盘 = 开始记录；热键 = 结束记录 |
+| 4 | 用户数据目录重定向到 `%LOCALAPPDATA%` | 否则会在 exe 旁边建 `<exe>.WebView2\`，污染 `build\RelWithDebInfo\` |
+| 5 | ✅ 部署 `WebView2Loader.dll` | 已完成（见上） |
+| 6 | **结束提问必须由 GUI 弹窗实现** | 现在走 `std::getline` + `if (!stdin_is_tty()) ask = false;` —— **GUI 里今天会直接跳过提问**。接缝已留好：`run_confirmation()` 收 `std::function<bool(std::string&)>` |
+
+**可复用的现成模式**：`SubtitleWindow` 已经示范了"自己开线程 +
+`GetMessageW`/`DispatchMessageW` 消息泵"，`WebViewWindow` 照它写。
+**白送的**：交付物本来就是自包含单文件 HTML，WebView2 直接渲染 = 纪要查看器。
+
+**建议的最小第一步**：`--ui` 打开一个窗口渲染一份现成的 `meeting-*.html`。
+它一次验证四件事：窗口能开、WebView2 运行时能连上、HTML 能渲染、
+**控制台子系统没被破坏**。之后再逐个做 4.5–4.10 的页面。
 
 **小活（顺手可做）**：
 · **3.4 结项**：验收标准是"`--wav jfk.wav` 不该再出现伪造的 `Thank you.`" ——
