@@ -15,6 +15,8 @@ struct AppConfig {
     bool        selftest  = false;  // --selftest：不加载模型，只验证数据层通路
     long long   export_session = -1; // --export <id>：把指定会话导出为交付物后退出
     std::string deliverable_dir = "deliverables";  // --out <目录>：交付物输出根目录
+    // 用户是否显式给了 --out。和 db_path_explicit 同一个用途，见下面助手的说明。
+    bool        out_explicit = false;
     bool        demo_session = false; // --demo-session：写入一场演示会话后退出（用于验证导出）
     bool        test_window  = false; // --test-window：只弹悬浮字幕窗看外观，不加载模型/不采集音频
 
@@ -191,6 +193,26 @@ struct AppConfig {
     std::string fix_value;    std::string fix_kind;
     std::string fix_define;
     bool        fix_archive = false;
+
+    // ---- 助手（§7 第 4 阶段 4.1/4.2）----
+    //
+    //   --assistants            列出所有助手
+    //   --new-assistant <名>    新建一个助手（建目录 + 元信息）
+    //   --assistant <名>        用这个助手（库路径/输出目录由它推出来）
+    //   --remove-assistant <名> 移除一个助手（**软删除**：目录改名，不真删）
+    //   --set-key <key>         把 API key 用 DPAPI 加密后存进 config.json
+    //
+    // ⚠️ **显式给的 --db / --out 永远优先于助手**。
+    //    整个验证阶梯（--selftest / --wav / --gaps / 那些 python harness）
+    //    全靠显式路径指向临时库；助手若把它们覆盖掉，那套保障会**静默失效**。
+    bool        list_assistants = false;
+    std::string new_assistant;
+    std::string use_assistant;
+    std::string remove_assistant;
+    std::string set_key;
+    // 解析出来的助手 slug（空 = 没用助手）。给日志用，让"这次动的是哪个助手"
+    // 在启动横幅里能看见。
+    std::string assistant_slug;
 
     // --glossary <文件>：术语表（每行一个词/短语，# 为注释）。
     // 内容会作为 initial_prompt 喂给 Whisper，让专有名词识别更稳定。

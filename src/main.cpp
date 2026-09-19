@@ -21,6 +21,7 @@
 #include "SpeechFilter.h"
 #include "LangPolicy.h"
 #include "UtteranceMerge.h"
+#include "Assistant.h"
 #include "CommonWords.h"
 #include "ModelLog.h"
 #include "SessionStore.h"
@@ -1740,6 +1741,100 @@ static int run_fix(const AppConfig& cfg) {
         std::cout << "（复核：--fix \"" << (cfg.fix_value.empty() ? it.value : cfg.fix_value)
                   << "\" 看历史；--terms 看完整三条腿）" << std::endl;
     }
+    return 0;
+}
+
+// --assistants / --new-assistant / --remove-assistant / --set-key
+// 助手与用户级配置（§7 第 4 阶段 4.1/4.2/4.3）。
+//
+// 这几条命令合在一起，是因为它们都在回答同一个问题：
+// **"这台机器上的产品配置长什么样"** —— 分成四个函数只会让人跳来跳去。
+static int run_assistant_cmd(const AppConfig& cfg) {
+    using namespace assistant;
+
+    // ---- --set-key：把 key 用 DPAPI 加密后存起来 ----
+    if (!cfg.set_key.empty()) {
+        Settings s;
+        load_settings(&s);
+        std::string err;
+        const std::string enc = protect_key(cfg.set_key, &err);
+        if (enc.empty()) {
+            std::cerr << "加密失败：" << err << "\n"
+                      << "（**没有退化成明文保存** —— 那比不加密更坏。"
+                         "本次没有写入任何东西。）" << std::endl;
+            return 1;
+        }
+        s.api_key_protected = enc;
+        if (!save_settings(s, &err)) {
+            std::cerr << "写配置文件失败：" << err << std::endl;
+            return 1;
+        }
+        // 回读一次，确认真的能解开 —— 只写不验等于相信自己的加密
+        const std::string back = unprotect_key(enc, &err);
+        std::cout << "✅ API key 已用 DPAPI 加密存入：" << config_path() << std::endl;
+        std::cout << "   回读校验：" << (back == cfg.set_key ? "通过" : "**失败**")
+                  << "；明文没有落盘（文件里是 "
+                  << enc.size() << " 字节的密文 base64）" << std::endl;
+        return back == cfg.set_key ? 0 : 1;
+    }
+
+    // ---- --new-assistant ----
+    if (!cfg.new_assistant.empty()) {
+        std::string err;
+        if (!create(cfg.new_assistant, &err)) {
+            std::cerr << "新建助手失败：" << err << std::endl;
+            return 1;
+        }
+        Info info;
+        find(cfg.new_assistant, &info);
+        std::cout << "✅ 已新建助手「" << info.name << "」" << std::endl;
+        std::cout << "   目录  : " << info.dir << std::endl;
+        std::cout << "   知识库: " << info.db_path << std::endl;
+        std::cout << "   纪要  : " << info.out_dir << std::endl;
+        std::cout << "   用它  : --assistant \"" << info.name << "\"" << std::endl;
+        return 0;
+    }
+
+    // ---- --remove-assistant（软删除）----
+    if (!cfg.remove_assistant.empty()) {
+        std::string err;
+        if (!remove_soft(cfg.remove_assistant, &err)) {
+            std::cerr << "移除失败：" << err << std::endl;
+            return 1;
+        }
+        std::cout << "✅ 已移除助手「" << cfg.remove_assistant << "」" << std::endl;
+        // ⚠️ 必须说清楚它不是真删 —— 用户以为删了、其实还在，或者反过来，
+        //    两种误解都很糟。这里明说。
+        std::cout << "   **没有真正删除文件**：目录被改名成 <助手>.removed-<时间>，"
+                     "不再出现在列表里，但内容都还在。" << std::endl;
+        std::cout << "   确认不要了再手工删那个目录。" << std::endl;
+        return 0;
+    }
+
+    // ---- --assistants（列出；也是默认行为）----
+    const auto all = list();
+    std::cout << "配置目录：" << base_dir() << std::endl;
+    std::cout << "助手 " << all.size() << " 个：" << std::endl;
+    for (const auto& a : all) {
+        std::cout << "  · " << a.name << "  [" << a.slug << "]" << std::endl;
+        std::cout << "      知识库 " << a.db_path << std::endl;
+        std::cout << "      语言   " << a.source_lang << " -> " << a.target_lang
+                  << "    上云 " << (a.cloud ? "是" : "否") << std::endl;
+    }
+    if (all.empty()) {
+        std::cout << "    （还没有助手）" << std::endl;
+    }
+    Settings s;
+    load_settings(&s);
+    std::cout << "\n全局设置：" << std::endl;
+    std::cout << "  API Key   : "
+              << (s.api_key_protected.empty() ? "未设置（--set-key <key> 存一个）"
+                                              : "已设置（DPAPI 加密存储）")
+              << std::endl;
+    std::cout << "  上次用过  : " << (s.last_assistant.empty() ? "(没记录)" : s.last_assistant)
+              << std::endl;
+    std::cout << "\n新建：--new-assistant <名字>    使用：--assistant <名字>"
+              << std::endl;
     return 0;
 }
 
@@ -6486,6 +6581,92 @@ static int run_selftest(const AppConfig& cfg) {
             if (!f_ok) { std::cerr << "    " << f_why << std::endl; return 1; }
         }
 
+        // ㉜ **助手：目录名生成 + UTF-8 路径往返 + DPAPI**
+        //
+        // ⚠️ 这一组**刻意不碰文件系统**（不建目录、不写配置）：自检绝不能去动
+        //    用户真实的 `%LOCALAPPDATA%` —— 那是他的真实数据。
+        //    `slugify` / `to_wide` / DPAPI 都是无状态的，正好能在这里验；
+        //    而 create/list/助手隔离那几条是**集成行为**，已由 CLI 实测过。
+        {
+            bool a2_ok = true;
+            std::string a2_why;
+            auto afail = [&](const std::string& m) {
+                a2_ok = false;
+                if (a2_why.empty()) a2_why = m;
+            };
+
+            // ---- ① slugify：目录名生成（**同时是安全边界**）----
+            struct SlugCase { const char* in; const char* want; const char* why; };
+            const SlugCase scs[] = {
+                {"engclass", "engclass", "普通名字被改了"},
+                {u8"英语课助手", u8"英语课助手", "中文名字必须原样保留（主要用法）"},
+                {"Work / Project: 2026", "Work_Project_2026",
+                 "空格和非法字符没被换成下划线"},
+                {"..\\..\\evil", "evil",
+                 "**路径穿越没被挡住** —— 安全断言：失败说明能建到目录外"},
+                {"../../evil", "evil", "斜杠形式的路径穿越没被挡住"},
+                {"..", "assistant", "`..` 本身没被兜底（目录穿越的经典写法）"},
+                {".", "assistant", "`.` 本身没被兜底"},
+                {"", "assistant", "空名字没有兜底"},
+                {"a  b", "a_b", "连续下划线没被压缩"},
+                {"a:b*c?d", "a_b_c_d", "Windows 非法字符没被替换"},
+            };
+            for (const auto& c : scs) {
+                const std::string got = assistant::slugify(c.in);
+                if (got != c.want) {
+                    afail(std::string(c.why) + u8"（输入「" + c.in + u8"」得到「" + got
+                          + u8"」，期望「" + c.want + u8"」）");
+                }
+            }
+            if (!utf8::is_valid(assistant::slugify(u8"英语课助手·测试"))) {
+                afail("slugify 输出不是合法 UTF-8（json::dump 会抛异常 → 崩溃）");
+            }
+
+            // ---- ② UTF-8 ↔ 宽字符往返（Windows 路径的**两个方向**）----
+            //
+            // 【为什么必须有】这两个方向各崩过一次：
+            //   · 少了 to_wide：`--new-assistant "英语课助手"` → 0xC0000409 崩溃
+            //   · 少了 from_wide（用了 `path::string()`）：助手建成功了，
+            //     但 `--assistants` 列表里**看不到它** —— 静默丢数据
+            {
+                const std::string cn = u8"C:\\测试\\英语课助手\\data.db";
+                const std::wstring w = utf8::to_wide(cn);
+                if (w.empty()) {
+                    afail("to_wide 解不开中文路径（会崩溃或静默失败）");
+                } else if (utf8::from_wide(w.c_str()) != cn) {
+                    afail("UTF-8 → 宽 → UTF-8 往返之后内容变了");
+                }
+                // 截断的 UTF-8 必须返回空，**不能**返回半个串
+                if (!utf8::to_wide("\xE8\xAF").empty()) {
+                    afail("to_wide 对截断的 UTF-8 没返回空（调用方会拿到垃圾路径）");
+                }
+            }
+
+            // ---- ③ DPAPI：加密 + 回读 + 明文不落盘 ----
+            {
+                std::string e;
+                const std::string plain = "sk-selftest-not-a-real-key";
+                const std::string enc = assistant::protect_key(plain, &e);
+                if (enc.empty()) {
+                    afail("DPAPI 加密失败：" + e);
+                } else if (enc.find("sk-selftest") != std::string::npos) {
+                    afail("**密文里出现了明文** —— 那等于没加密");
+                } else if (assistant::unprotect_key(enc, &e) != plain) {
+                    afail("DPAPI 回读对不上：" + e);
+                }
+                if (!assistant::protect_key("", &e).empty()) {
+                    afail("空 key 被加密成功了（会存下一个空 key）");
+                }
+                if (!assistant::unprotect_key("bm90LWEtcmVhbC1jaXBoZXI=", &e).empty()) {
+                    afail("坏密文被解开了（返回了垃圾明文）");
+                }
+            }
+
+            std::cout << "[SelfTest] 助手（目录名/路径穿越/UTF-8 往返/DPAPI 加密）: "
+                      << (a2_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+            if (!a2_ok) { std::cerr << "    " << a2_why << std::endl; return 1; }
+        }
+
         // 【这里刻意不写"共 N 例"】原来写死了 `"✅ 11 例通过"`，
         // 而加用例的人（我）不会记得回来改数字 —— 本轮加了 ⑫⑬⑭ 三条之后，
         // 它照样打"11 例通过"，**在骗人**。手写计数就是这个下场。
@@ -6803,6 +6984,10 @@ static int run_app(int argc, char** argv) {
     if (cfg.show_actions || cfg.action_set_id >= 0) return run_actions(cfg);
     if (!cfg.verify_report.empty()) return run_verify_report(cfg);
     if (cfg.show_fix) return run_fix(cfg);
+    if (cfg.list_assistants || !cfg.new_assistant.empty() ||
+        !cfg.remove_assistant.empty() || !cfg.set_key.empty()) {
+        return run_assistant_cmd(cfg);
+    }
     if (!cfg.dump_prompt.empty()) return run_dump_prompt(cfg);
     if (cfg.export_session >= 0) return run_export(cfg);
 

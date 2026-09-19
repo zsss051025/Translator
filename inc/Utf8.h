@@ -91,4 +91,29 @@ std::string truncate(const std::string& s, size_t max_bytes,
 // 与控制台代码页无关），再转成 UTF-8。这样中文参数在**任何**代码页下都对。
 std::string from_wide(const wchar_t* w);
 
+// ---------------------------------------------------------------------------
+// UTF-8 → UTF-16：**给 std::filesystem / fstream 用的**
+// ---------------------------------------------------------------------------
+//
+// 【为什么必须有它 —— 中文路径会让程序直接崩】
+// Windows 上 `std::filesystem::path` 与 `std::ifstream` 从 `std::string`
+// 构造时，是按**当前 ANSI 代码页**（中文机器上就是 GBK）解释那段字节的，
+// **不是 UTF-8**。于是把 UTF-8 的中文路径交给它们：
+//   · 运气好：按 GBK 解出一串乱码 → 文件建到别的地方去了（**静默错**）
+//   · 运气不好：那段字节不是合法 GBK → 转换失败 → **抛异常** →
+//     没人接住 → `std::terminate` → 进程崩，exit `0xC0000409`
+//
+// 实测就是崩了：`--new-assistant "英语课助手"` → `0xC0000409`，
+// 同一个位置换成 ASCII（`engclass`）完全正常。
+//
+// ⚠️ 它和 `from_wide` 是**一对**：那次是"宽参数没转成 UTF-8"，
+//    这次是"UTF-8 路径没转回宽"。**两个方向都得转**，漏一个就崩。
+//
+// 用法：`std::ifstream f(std::filesystem::path(utf8::to_wide(p)), ...)`
+//      或 `std::ifstream f(utf8::to_wide(p).c_str(), ...)`（MSVC 支持宽路径）
+// **不要**再写 `std::ifstream f(utf8_path)`。
+//
+// ⚠️ **SQLite 不在此列**：`sqlite3_open()` 要的就是 UTF-8，别转。
+std::wstring to_wide(const std::string& s);
+
 }  // namespace utf8

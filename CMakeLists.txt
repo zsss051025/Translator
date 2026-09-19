@@ -36,6 +36,7 @@ add_executable(Translator
 	src/SpeechFilter.cpp
 	src/LangPolicy.cpp
 	src/UtteranceMerge.cpp
+	src/Assistant.cpp
 	src/ITranslator.cpp
 	src/DeepSeekTranslator.cpp
 	src/HunyuanTranslator.cpp

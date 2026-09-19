@@ -1,4 +1,5 @@
 #include "AppConfig.h"
+#include "Assistant.h"   // 助手：库路径/输出目录由它推出来（§7 第 4 阶段 4.1）
 
 #include <cstdlib>
 #include <filesystem>
@@ -90,7 +91,7 @@ AppConfig AppConfig::from(int argc, char** argv) {
         if (arg == "--whisper")            next(cfg.whisper_model);
         else if (arg == "--hunyuan")       next(cfg.hunyuan_model);
         else if (arg == "--db")          { next(cfg.db_path); cfg.db_path_explicit = true; }
-        else if (arg == "--out")           next(cfg.deliverable_dir);
+        else if (arg == "--out")         { next(cfg.deliverable_dir); cfg.out_explicit = true; }
         else if (arg == "--api-key")       next(cfg.deepseek_api_key);
         else if (arg == "--help" || arg == "-h" || arg == "--list") cfg.list_only = true;
         else if (arg == "--selftest")      cfg.selftest = true;
@@ -147,6 +148,11 @@ AppConfig AppConfig::from(int argc, char** argv) {
             cfg.show_fix = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') cfg.fix_word = argv[++i];
         }
+        else if (arg == "--assistants")        cfg.list_assistants = true;
+        else if (arg == "--new-assistant")     next(cfg.new_assistant);
+        else if (arg == "--assistant")         next(cfg.use_assistant);
+        else if (arg == "--remove-assistant")  next(cfg.remove_assistant);
+        else if (arg == "--set-key")           next(cfg.set_key);
         else if (arg == "--value")        next(cfg.fix_value);
         else if (arg == "--as-kind")      next(cfg.fix_kind);
         else if (arg == "--define")       next(cfg.fix_define);
@@ -209,6 +215,44 @@ AppConfig AppConfig::from(int argc, char** argv) {
             }
         }
         else std::cerr << "[Config] 忽略未知参数: " << arg << std::endl;
+    }
+
+    // ---- 助手：库路径与输出目录（§7 第 4 阶段 4.1）----
+    //
+    // ⚠️ **显式给的 --db / --out 永远优先。**
+    //    整个验证阶梯（`--selftest` / `--wav` / `--gaps` / 那些 python harness）
+    //    全靠显式路径指向**临时库**。助手如果把它们覆盖掉，那套保障会
+    //    **静默失效** —— 命令照样跑、结果看着正常，但动的是用户的真实数据。
+    //    这是本项目踩过最疼的一类坑（"少一个参数就往用户库里写假会话"）。
+    //
+    // 顺序也重要：助手解析在**参数解析之后**，所以它能看见 explicit 标志。
+    if (!cfg.use_assistant.empty() || !cfg.list_assistants) {
+        // 用哪个助手：显式指定的 > 上次用过的。都没有就不动路径（保持旧行为）。
+        std::string want = cfg.use_assistant;
+        assistant::Settings s;
+        if (want.empty()) assistant::load_settings(&s);
+        if (want.empty()) want = s.last_assistant;
+
+        if (!want.empty()) {
+            assistant::Info info;
+            if (assistant::find(want, &info)) {
+                if (!cfg.db_path_explicit) cfg.db_path = info.db_path;
+                if (!cfg.out_explicit)     cfg.deliverable_dir = info.out_dir;
+                cfg.assistant_slug = info.slug;
+                // 记住"上次用的"（只显式指定时才写盘，避免每次 --selftest 都改配置）
+                if (!cfg.use_assistant.empty() && s.last_assistant != info.slug) {
+                    s.last_assistant = info.slug;
+                    std::string e;
+                    if (!assistant::save_settings(s, &e)) {
+                        std::cerr << "[Config] 记不住'上次用的助手'：" << e << std::endl;
+                    }
+                }
+            } else if (!cfg.use_assistant.empty()) {
+                std::cerr << "[Config] 没有叫「" << cfg.use_assistant
+                          << "」的助手（用 --assistants 看有哪些，--new-assistant 新建）"
+                          << std::endl;
+            }
+        }
     }
 
     return cfg;

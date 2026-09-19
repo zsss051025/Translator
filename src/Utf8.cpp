@@ -133,4 +133,27 @@ std::string from_wide(const wchar_t* w) {
 #endif
 }
 
+std::wstring to_wide(const std::string& s) {
+    if (s.empty()) return {};
+#if defined(_WIN32)
+    // 和 from_wide 对称：用 Windows 自己的转换函数处理代理对与非法序列，
+    // 不手写码点拼装。
+    // ⚠️ **必须带 `MB_ERR_INVALID_CHARS`**：不带它的话，非法字节会被**替换成
+    //    U+FFFD** 而不是失败，于是调用方拿到一个"看着像路径、其实是垃圾"的字符串 ——
+    //    那比直接失败坏得多（会静默地往错误的地方写文件）。
+    //    带上之后非法输入返回 0，我们转成空串，调用方必须显式处理。
+    const int need = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(),
+                                           static_cast<int>(s.size()), nullptr, 0);
+    if (need <= 0) return {};      // 输入不是合法 UTF-8 → 返回空，调用方必须处理
+    std::wstring out(static_cast<size_t>(need), L'\0');
+    ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(),
+                          static_cast<int>(s.size()), out.data(), need);
+    return out;
+#else
+    std::wstring out;
+    for (unsigned char c : s) out.push_back(static_cast<wchar_t>(c));
+    return out;
+#endif
+}
+
 }  // namespace utf8
