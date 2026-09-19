@@ -279,7 +279,13 @@ bool SessionStore::init(const std::string& db_path) {
 
     if (!ensure_schema()) return false;
 
-    std::cout << "[DB] session store ready: " << db_path << std::endl;
+    // 诊断行走 **stderr**：它是给人排查用的信息，不该混进 stdout。
+    //
+    // 【为什么这件事值得改】`--ui-data` 的 stdout 是给机器解析的 JSON。
+    // 实测第一次验的时候就被这行绊了 —— python 报 "Expecting value: line 1
+    // column 1"，因为 stdout 第一行是 `[DB] session store ready: ...` 而不是 `{`。
+    // **一个命令的 stdout 要么给人看、要么给机器读，不要既给人又给机器。**
+    std::cerr << "[DB] session store ready: " << db_path << std::endl;
     return true;
 }
 

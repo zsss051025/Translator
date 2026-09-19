@@ -214,6 +214,11 @@ struct AppConfig {
     // 在启动横幅里能看见。
     std::string assistant_slug;
 
+    // --ui-data <名称> [--session <id>]：GUI 各页要的数据（JSON，§7 第 4 阶段）
+    // 名称：assistants / sessions / knowledge / actions / session
+    std::string ui_data;
+    long long   ui_session = -1;
+
     // --glossary <文件>：术语表（每行一个词/短语，# 为注释）。
     // 内容会作为 initial_prompt 喂给 Whisper，让专有名词识别更稳定。
     std::string glossary_path;

@@ -1838,6 +1838,212 @@ static int run_assistant_cmd(const AppConfig& cfg) {
     return 0;
 }
 
+// --ui-data <名称>：GUI 各页要的**数据契约**（§7 第 4 阶段 4.5/4.6/4.8/4.9）
+//
+//   --ui-data assistants            助手列表（4.5）
+//   --ui-data sessions              会话列表（4.6）
+//   --ui-data knowledge             知识库 + **"它会用在哪里"**（4.9）
+//   --ui-data actions               任务清单（4.8）
+//   --ui-data session --session <id>  某场会话的交付物文件（4.6 详情）
+//
+// 【为什么先做这一层，而不是先写窗口】
+// 窗口是 Win32 + COM + 消息泵，写起来慢、改起来慢；而**它需要什么数据**
+// 是现在就能定下来、而且能单独验的。先把契约定好有两个好处：
+//   ① 写窗口时不用一边调界面一边想"这个字段从哪来"
+//   ② 界面还没写就能用 python 把数据验一遍 —— 这是本项目一贯的做法
+//      （GUI 是唯一没法进自检的东西，所以它依赖的**接口**必须能进）
+//
+// 【为什么输出 JSON 而不是让人看的表格】GUI 不解析人的输出。
+// `--actions` / `--terms` 那些是**给人看的**，措辞会变、带颜色、带解释；
+// 让界面去 grep 它们，就是把"文案"和"数据"耦合起来 ——
+// 以后改一句提示语就可能把界面改坏。所以数据走 JSON，人看的走原来的命令。
+//
+// ⚠️ JSON 是**契约**：字段一旦发出去，界面就在依赖它。
+//    加字段安全；**改名/删字段要同时改界面**（现在界面还没有，正是定契约的好时机）。
+static int run_ui_data(const AppConfig& cfg) {
+    SessionStore::instance().init(cfg.db_path);
+    const std::string what = cfg.ui_data;
+
+    // ---- 4.5 助手列表 ----
+    if (what == "assistants") {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& a : assistant::list()) {
+            arr.push_back({
+                {"name", a.name}, {"slug", a.slug},
+                {"db_path", a.db_path}, {"out_dir", a.out_dir},
+                {"created_at", a.created_at},
+                {"source_lang", a.source_lang}, {"target_lang", a.target_lang},
+                {"cloud", a.cloud},
+            });
+        }
+        assistant::Settings s;
+        assistant::load_settings(&s);
+        std::cout << nlohmann::json{
+            {"assistants", arr},
+            {"last_assistant", s.last_assistant},
+            {"has_api_key", !s.api_key_protected.empty()},
+            {"config_path", assistant::config_path()},
+        }.dump(2) << std::endl;
+        return 0;
+    }
+
+    // ---- 4.6 会话列表 ----
+    if (what == "sessions") {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& s : SessionStore::instance().list_sessions(200)) {
+            // 有没有交付物 —— 界面靠它决定"能点开看纪要"还是"只能看转录"
+            const std::string dir = cfg.deliverable_dir + "\\session-" +
+                                    std::to_string(s.id);
+            const bool has_md   = std::filesystem::exists(
+                utf8::to_wide(dir + "\\meeting-" + std::to_string(s.id) + ".md"));
+            const bool has_html = std::filesystem::exists(
+                utf8::to_wide(dir + "\\meeting-" + std::to_string(s.id) + ".html"));
+            arr.push_back({
+                {"id", s.id}, {"started_at", s.started_at}, {"ended_at", s.ended_at},
+                {"engine", s.engine}, {"note", s.note},
+                {"segments", s.segment_count},
+                {"has_report", has_md || has_html},
+                {"report_dir", dir},
+            });
+        }
+        std::cout << nlohmann::json{{"sessions", arr}}.dump(2) << std::endl;
+        return 0;
+    }
+
+    // ---- 4.8 任务清单（跨会话聚合后的）----
+    if (what == "actions") {
+        using actions::ActionStore;      // 静态成员函数，不是命名空间
+        const auto st = ActionStore::stats();
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& a : ActionStore::list("", 500)) {
+            arr.push_back({
+                {"id", a.id}, {"title", a.title}, {"owner", a.owner},
+                {"due", a.due}, {"status", a.status}, {"origin", a.origin},
+                {"evidence", a.evidence},
+                {"seen_sessions", a.seen_sessions}, {"last_session", a.last_session},
+                // 台账里"哪几场提过" —— 4.8 的列表要能点回会话
+                {"source_session", a.source_session},
+            });
+        }
+        std::cout << nlohmann::json{
+            {"actions", arr},
+            {"stats", {{"total", st.total}, {"todo", st.todo},
+                       {"doing", st.doing}, {"done", st.done}}},
+        }.dump(2) << std::endl;
+        return 0;
+    }
+
+    // ---- 4.9 知识库 + **"它会用在哪里"** ----
+    //
+    // 【4.9 那一行特意写了"含三行"】因为这是整个产品最容易被误解的地方：
+    // 用户看到"它记住了 Erica"，会以为那就是个词典。
+    // 而实际上它有三条**完全不同的**出路，各自的后果也不一样：
+    //   ① 识别提示 —— 让 Whisper 偏向这个词（**默认关**，实测会漏字）
+    //   ② 翻译约束 —— 统一译文里的专名写法
+    //   ③ 摘要背景 —— 让纪要不与用户确认过的事实矛盾
+    // 界面必须把这三条分开显示，否则用户没法理解"我确认这个到底改变了什么"。
+    if (what == "knowledge") {
+        auto& ks = KnowledgeStore::instance();
+        const auto all = ks.list("", 2000);
+
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& k : all) {
+            // **逐条算**"它会用在哪里" —— 不能用一个全局标志糊过去：
+            // candidate / archived 一个字都进不去，confirmed 也要看 kind
+            //（fact/decision 只进摘要背景，不进识别提示和翻译约束）。
+            const bool usable = knowledge::usable_as_constraint(k);
+            const bool name_like = knowledge::is_name_like_kind(k.kind);
+            const bool in_translate = usable && name_like &&
+                                      !k.value.empty() && k.value.size() <= 40;
+            arr.push_back({
+                {"kind", k.kind},
+                {"kind_label", knowledge::kind_label_zh(k.kind)},
+                {"key", k.key}, {"value", k.value},
+                {"status", k.status},
+                {"hits", k.hits},
+                {"definition", k.definition},
+                {"first_seen_at", k.first_seen_at},
+                {"where", {
+                    // ① 识别提示：还要看用户开没开 --asr-prompt-kb
+                    {"asr_prompt", in_translate && cfg.asr_prompt_kb > 0},
+                    {"translate_constraint", in_translate},
+                    {"summary_background", usable && !k.value.empty()},
+                }},
+                // 为什么没被用上 —— 界面要能回答"这条为什么没生效"
+                {"why_not_used", usable ? std::string()
+                                        : (k.status == "confirmed"
+                                               ? std::string(u8"（值或类型不合格）")
+                                               : std::string(u8"未确认（" + k.status + u8"）"))},
+            });
+        }
+
+        // 三条腿**真实的**清单（不是逐条推断，而是真跑那两个装配函数）
+        const auto usable_items = ks.constraint_items();
+        nlohmann::json terms = nlohmann::json::array();
+        for (const auto& t : knowledge::constraint_terms(usable_items)) terms.push_back(t);
+        nlohmann::json bg = nlohmann::json::array();
+        for (const auto& b : knowledge::background_lines(usable_items)) bg.push_back(b);
+
+        std::cout << nlohmann::json{
+            {"items", arr},
+            {"legs", {
+                {"asr_prompt_enabled", cfg.asr_prompt_kb > 0},
+                {"asr_prompt_cap", cfg.asr_prompt_kb},
+                {"asr_prompt", terms},
+                {"translate_constraint", terms},
+                {"summary_background", bg},
+            }},
+        }.dump(2) << std::endl;
+        return 0;
+    }
+
+    // ---- 4.6 详情：某场会话的交付物 ----
+    if (what == "session") {
+        if (cfg.ui_session <= 0) {
+            std::cerr << "--ui-data session 需要 --session <id>" << std::endl;
+            return 1;
+        }
+        const long long sid = cfg.ui_session;
+        const std::string dir = cfg.deliverable_dir + "\\session-" + std::to_string(sid);
+        nlohmann::json files = nlohmann::json::array();
+        for (const char* name : {"meeting-", "actions.csv", "transcript.srt"}) {
+            const std::string leaf = std::string(name);
+            std::string full = dir + "\\" + leaf;
+            if (leaf.back() == '-') {
+                full = dir + "\\" + leaf + std::to_string(sid) + ".md";
+                const std::string html = dir + "\\" + leaf + std::to_string(sid) + ".html";
+                if (std::filesystem::exists(utf8::to_wide(full))) files.push_back(full);
+                if (std::filesystem::exists(utf8::to_wide(html))) files.push_back(html);
+                continue;
+            }
+            if (std::filesystem::exists(utf8::to_wide(full))) files.push_back(full);
+        }
+        auto segs = SessionStore::instance().fetch_segments(sid);
+        // 段落里带上**可点的出处**（和 5.7 的出处格式一致：#会话·段）
+        nlohmann::json jseg = nlohmann::json::array();
+        for (const auto& s : segs) {
+            evidence::Locator loc;
+            loc.session_id = sid;
+            loc.seq = s.seq;
+            jseg.push_back({
+                {"seq", s.seq}, {"ts", s.ts},
+                {"src", s.src_text}, {"tgt", s.tgt_text},
+                {"cite", evidence::format(loc)},
+            });
+        }
+        std::cout << nlohmann::json{
+            {"session_id", sid}, {"dir", dir}, {"files", files},
+            {"segments", jseg},
+        }.dump(2) << std::endl;
+        return 0;
+    }
+
+    std::cerr << "未知的 --ui-data 名称：" << what << "\n"
+              << "可用：assistants / sessions / knowledge / actions / session\n"
+              << "（session 需要 --session <id>）" << std::endl;
+    return 1;
+}
+
 static int run_dump_prompt(const AppConfig& cfg) {
     HunyuanTranslator hy(cfg.hunyuan_model);
     if (!hy.init()) {
@@ -6958,7 +7164,11 @@ static int run_selftest(const AppConfig& cfg) {
 // 真正的程序主体。参数已经是**合法 UTF-8**（由下面的 wmain/main 保证）。
 static int run_app(int argc, char** argv) {
     //  设置控制台为 UTF-8 编码，防止中文乱码
-    system("chcp 65001");
+    //
+    // ⚠️ `>nul` 不是随手加的：`chcp` 会往 stdout 打一行 "Active code page: 65001"，
+    //    而 `--ui-data` 的 stdout 必须是**纯 JSON**。实测那行就是第一个绊倒
+    //    python 解析的东西。诊断/环境信息一律不该污染机器读的输出。
+    system("chcp 65001 >nul");
 
     AppConfig cfg = AppConfig::from(argc, argv);
 
@@ -6969,7 +7179,17 @@ static int run_app(int argc, char** argv) {
     // 放在 cfg.dump() 之前，是为了让 `--list` 这类不加载模型的路径也保持一致行为。
     modellog::install_silencer(cfg.verbose);
 
-    cfg.dump();
+    // ⚠️ `--ui-data` **不打印启动横幅**。
+    //
+    // 【为什么】那条横幅是给**人**看的（模型路径、数据库路径、key 状态…），
+    // 而 `--ui-data` 的 stdout 是给**机器**解析的 JSON。两者混在一起，
+    // 界面就得先"跳过前 N 行"才能解析 —— 而 N 会随横幅内容变化。
+    //
+    // 这不是假设：我第一次用 python 验这些 JSON 时，解析器就被横幅绊了一下，
+    // 报的是 "Extra data: line 17"。**能解析出来纯属运气**（靠找第一个 `{`）。
+    //
+    // 规矩：**一个命令的 stdout 要么给人看、要么给机器读，不要既给人又给机器。**
+    if (cfg.ui_data.empty()) cfg.dump();
     if (cfg.list_only) return 0;
     if (cfg.selftest)  return run_selftest(cfg);
     if (cfg.demo_session) return run_demo_session(cfg);
@@ -6984,6 +7204,7 @@ static int run_app(int argc, char** argv) {
     if (cfg.show_actions || cfg.action_set_id >= 0) return run_actions(cfg);
     if (!cfg.verify_report.empty()) return run_verify_report(cfg);
     if (cfg.show_fix) return run_fix(cfg);
+    if (!cfg.ui_data.empty()) return run_ui_data(cfg);
     if (cfg.list_assistants || !cfg.new_assistant.empty() ||
         !cfg.remove_assistant.empty() || !cfg.set_key.empty()) {
         return run_assistant_cmd(cfg);
