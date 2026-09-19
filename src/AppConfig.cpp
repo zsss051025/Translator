@@ -146,6 +146,13 @@ AppConfig AppConfig::from(int argc, char** argv) {
         else if (arg == "--forget")        next(cfg.triage_forget);
         else if (arg == "--clear")         cfg.triage_clear = true;
         else if (arg == "--glossary")      next(cfg.glossary_path);
+        else if (arg == "--asr-prompt-kb") {
+            std::string v; next(v);
+            try { if (!v.empty()) cfg.asr_prompt_kb = std::stoi(v); }
+            catch (const std::exception&) {
+                std::cerr << "[Config] --asr-prompt-kb 需要数字，收到: " << v << std::endl;
+            }
+        }
         else if (arg == "--summarizer")    next(cfg.summarizer);
         else if (arg == "--llm-model")     next(cfg.llm_model);
         else if (arg == "--lang-recheck") {

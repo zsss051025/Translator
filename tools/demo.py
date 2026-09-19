@@ -189,21 +189,30 @@ def act2_learn(db):
 
 
 def act3_reuse(db):
-    hr("第 3 幕 · 第二次知道：学到的东西真的进了识别提示和翻译约束")
+    hr("第 3 幕 · 第二次知道：学到的东西真的被用上了")
     rc, out, err = run(["--terms", "--db", db])
     print(out[out.find("库:"):] if "库:" in out else out)
 
     checks = []
     for w in (u"凤凰项目", u"张伟", u"李经理", u"极光平台"):
-        # 出现在 ① 识别提示那一行里才算"用上了"
+        # 出现在 ② 翻译约束 或 ③ 摘要背景 里才算"用上了"
         if w not in out:
-            checks.append(f"{w} 没有出现在识别提示/翻译约束里")
-    print("\n>>> 该看到：第 2 幕教过的那几个词，现在出现在 ① 识别提示 和 ② 翻译约束 里。")
-    print(">>> 这就是「越用越懂你」的**可观测面** —— 下一次识别会偏向这些词。")
+            checks.append(f"{w} 没有出现在翻译约束/摘要背景里")
+    print("\n>>> 该看到：第 2 幕教过的词，现在出现在 ② 翻译约束 和 ③ 摘要背景 里。")
+    print(">>> 这两条腿是「越用越懂你」的落点：译文里的专名写法被统一，")
+    print(">>> 纪要不会和用户确认过的事实矛盾；`TermFixer` 还会按同一份词表")
+    print(">>> 在识别之后纠正文本（确定性，不会幻觉）。")
+    if u"(空)" in out and u"识别提示" in out:
+        # 这一条是**有意的设计**，不是故障 —— 说清楚，免得看的人以为是坏的
+        print(">>>")
+        print(">>> 注意 ① 识别提示是**(空)** —— 那是刻意的（2026-09-19 的实测决定）：")
+        print(">>>   给 Whisper 喂和音频内容无关的词会让它**漏字/幻觉**，")
+        print(">>>   而知识库是跨会议全局累积的，「无关」恰恰是常态。")
+        print(">>>   想启用：--asr-prompt-kb N（详见 tools/asr_prompt_ab.py 的实测）")
     for c in checks:
         print(">>>   ❌ " + c)
-    record(3, "复现：知识进识别提示/翻译约束", not checks,
-           "4 个词进入约束" if not checks else "有词没进去")
+    record(3, "复用：知识进翻译约束/摘要背景", not checks,
+           "4 个词被用上" if not checks else "有词没被用上")
     return not checks
 
 

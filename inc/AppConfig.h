@@ -167,6 +167,25 @@ struct AppConfig {
     // 内容会作为 initial_prompt 喂给 Whisper，让专有名词识别更稳定。
     std::string glossary_path;
 
+    // --asr-prompt-kb N：让**知识库**的词条也进识别提示，最多 N 个（默认 0 = 不进）。
+    //
+    // 【为什么默认是 0 —— 这是有实测证据的，不是保守起见】
+    // A/B 实测（`tools/asr_prompt_ab.py`，每档重复 3 次且结果完全一致）：
+    // 给 Whisper 喂**和音频内容无关**的词，它会**漏字**、会**幻觉**，而且越多越糟：
+    //     N=0  无提示            → …can do for you. **ask what you** can do for yourself…
+    //     N=5  真实库的 4 个词    → …can do for you. can do for yourself…   ← 吞掉 "ask what you"
+    //     N=4  4 个编造词        → …Thank you **for watching!**             ← 幻觉
+    //     N=40 40 个词（产品上限）→ 整句 "Thank you" 不见了
+    // 而知识库是**跨会议全局累积**的，"和本次内容无关"恰恰是常态
+    // （上周学的播客人名，这周开项目会照样会被喂进去）。
+    // 另一头，"有用"那一半**至今没有证据**（需要一段含易错专名的音频才能验）。
+    // 所以默认值取"不拿没被证明的收益去换已被证明的代价"。
+    //
+    // 收益那一半有**确定性**的落点，且不受这个开关影响：
+    // `TermFixer`（识别后按词表纠错，不会幻觉）、② 翻译约束、③ 摘要背景
+    // —— 它们照旧吃**全量**知识库。
+    int asr_prompt_kb = 0;
+
     // --summarizer auto|rules|local|cloud：导出交付物时用哪种摘要方式。
     //   auto  —— 有 --llm-model 就用它本地生成；否则有 API Key 就用云端；都没有则用规则
     //   rules —— 纯规则抽取，完全离线（兜底路径）

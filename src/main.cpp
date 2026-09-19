@@ -274,6 +274,60 @@ static std::vector<std::string> build_glossary(const AppConfig& cfg, ConstraintI
     return glossary;
 }
 
+// ① 识别提示的词条清单 —— **唯一装配点**（真跑路径和 --terms 都调它）。
+//
+// ===========================================================================
+// 【2026-09-19：知识库默认**不再**进识别提示。这是有实测证据的产品改动。】
+// ===========================================================================
+// 起因：识别腿从 2.5 做出来到现在，只有"词进去了"的验证，**没有"进去之后有没有用"**。
+// 于是写了个 A/B（`tools/asr_prompt_ab.py`）：拿一段**已知内容**的音频
+// （11 秒肯尼迪演讲），对比"不给提示"和"给提示"两档的转录，每档重复 3 次。
+//
+// 实测结果（每档 3 次**完全一样**，所以不是运行噪声）：
+//
+//     N=0  无提示            → …can do for you. **ask what you** can do for yourself…
+//     N=5  真实库的 4 个词    → …can do for you. can do for yourself…   ← **吞掉了 "ask what you"**
+//     N=4  4 个编造词        → …Thank you **for watching!**             ← 幻觉（音频里没这句）
+//     N=40 40 个词（产品上限）→ 4 段变 93 字符，整句 "Thank you" 不见了
+//
+// 也就是说：**喂进去的词如果和音频内容无关，Whisper 会漏字、会幻觉**，档位越高越糟。
+// 而"和本次内容无关"在我们的产品里恰恰是**常态** —— 知识库是**跨会议全局累积**的：
+// 用户上周学的播客人名，这周开项目会时照样会被喂进去。
+//
+// 另一头，"有用"这一半**至今没有证据**：那需要一段**含易错专名的音频**，
+// 而我们没有（jfk 那段在无提示时就基本正确，没有改进空间）。
+//
+// 【所以这是个取舍：不拿"没被证明有用"的机制，去换"已被证明有害"的代价。】
+// 收益那一半另有**确定性**的落点，且不受这个开关影响：
+//   · `TermFixer`：识别之后按词表纠正文本 —— **不会幻觉**，而且拿到的是完整词表
+//   · ② 翻译约束：统一译文里的专名写法
+//   · ③ 摘要背景：让纪要不与用户确认过的事实矛盾
+// 两条腿（②③）和 TermFixer **照旧吃全量知识库**（它们没有这个风险）。
+//
+// ⚠️ 想让知识库重新进提示：`--asr-prompt-kb N`。
+//    留这个开关是因为"有用"那一半**可能真的成立**（等有合适的音频就能验）；
+//    但在有证据之前，默认值是 0。
+static std::vector<std::string> build_prompt_terms(const AppConfig& cfg,
+                                                   const ConstraintInputs& kb) {
+    std::vector<std::string> out = load_glossary_terms(cfg.glossary_path);
+    // 判重走 `normalize_key` —— 本项目唯一的归一化口径。
+    // 不要在这里另写个小写化：两处判重标准不一致时，prompt 里会出现重复词
+    // 而没人知道为什么。
+    auto has = [&](const std::string& v) {
+        const std::string nv = knowledge::normalize_key(v);
+        for (const auto& e : out) {
+            if (knowledge::normalize_key(e) == nv) return true;
+        }
+        return false;
+    };
+    const size_t cap = cfg.asr_prompt_kb > 0
+                           ? static_cast<size_t>(cfg.asr_prompt_kb) : 0;
+    for (size_t i = 0; i < kb.terms.size() && i < cap; ++i) {
+        if (!has(kb.terms[i])) out.push_back(kb.terms[i]);
+    }
+    return out;
+}
+
 
 // --export <session_id>：把指定会话导出为交付物
 // （纪要 markdown / 行动项 csv / 单文件网页 / 双语字幕）
@@ -1177,11 +1231,28 @@ static int run_dump_terms(const AppConfig& cfg) {
     }
 
     std::cout << "\n--- ① 识别提示（Whisper initial_prompt）---" << std::endl;
-    const std::string prompt = terms_to_prompt(glossary);
+    // ⚠️ 必须走**同一个** build_prompt_terms()，否则这条命令立刻开始撒谎：
+    // 知识库默认不进提示之后，这里若还打全量词表，人看到的和引擎收到的是两回事
+    // （本项目"诊断工具撒谎"已经栽过四次）。
+    const std::vector<std::string> prompt_terms = build_prompt_terms(cfg, kb);
+    const std::string prompt = terms_to_prompt(prompt_terms);
     if (prompt.empty()) {
         std::cout << "(空) —— 引擎不会收到任何 initial_prompt" << std::endl;
+        if (cfg.asr_prompt_kb <= 0 && !kb.terms.empty()) {
+            // 【必须解释为什么"库里有词但提示是空的"】否则用户会以为功能坏了。
+            std::cout << "     知识库有 " << kb.terms.size()
+                      << " 个可用词条，但**默认不进识别提示**（实测会漏字/幻觉，"
+                         "见 --asr-prompt-kb 的说明）。" << std::endl;
+            std::cout << "     想启用：--asr-prompt-kb " << kb.terms.size()
+                      << "（或用 --glossary 指定确知与本次内容相关的词表）" << std::endl;
+        }
     } else {
         std::cout << prompt << std::endl;
+        std::cout << "     （共 " << prompt_terms.size() << " 个词条"
+                  << (cfg.asr_prompt_kb > 0
+                          ? "，含知识库词条上限 " + std::to_string(cfg.asr_prompt_kb) + " 个"
+                          : "，全部来自 --glossary 文件")
+                  << "）" << std::endl;
     }
 
     std::cout << "\n--- ② 翻译约束（逐条下发）---" << std::endl;
@@ -6036,7 +6107,7 @@ static int run_app(int argc, char** argv) {
     // 区别很重要：报条数只能说明"我们打算喂什么"，打印字符串才说明"引擎真收到了什么"。
     // （诊断工具撒谎的坑这个项目踩过两次，见 run_dump_prompt 的注释。）
     {
-        const std::string prompt = terms_to_prompt(glossary);
+        const std::string prompt = terms_to_prompt(build_prompt_terms(cfg, kb));
         if (!prompt.empty()) {
             constexpr size_t kShow = 160;
             std::cout << "[识别提示] initial_prompt = "
