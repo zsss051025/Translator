@@ -6055,13 +6055,16 @@ static int run_selftest(const AppConfig& cfg) {
             if (lang != "en" || sw != 0)
                 lfail("中间判回锁定语言，候选却没清零（打断前的计数被接着用了）");
 
-            // ⑤ 首次锁定也要连续 N 段一致（开场音乐同样会判错语言）
+            // ⑤ **首次锁定一段就锁**（锁定要快，切换要慢）
+            //
+            // ⚠️ 这一条我原本断言的是"首次锁定也要连续 N 段一致"，理由是
+            //    "开场往往是音乐、判断不可靠"。**实测把那个理由否掉了**：
+            //    jfk 上三种配置分别是 106 / 79 / 8 字符 ——
+            //    让更多段走 `auto` 检测，等于**多毁几段**（auto 要同时判语言和转写）。
+            //    所以改成：首次一段就锁；判错语言的代价交给"切换要连续 N 段"兜住。
             run({"en"}, "", 3, &lang, &sw);
-            if (lang != "" || sw != 0)
-                lfail("首次判断就锁定了 —— 开场音乐可能把它带偏");
-            run({"en", "en", "en"}, "", 3, &lang, &sw);
             if (lang != "en" || sw != 1)
-                lfail("连续 3 段一致却没锁定");
+                lfail("首次锁定没有一段就锁（会让更多段走 auto 检测，实测会丢内容）");
 
             // ⑥ need=1 应退回旧行为（一次就切）—— 排查时要用
             run({"zh"}, "en", 1, &lang, &sw);
@@ -6077,7 +6080,7 @@ static int run_selftest(const AppConfig& cfg) {
             if (!langpolicy::should_probe("zh")) lfail("有候选时不重新检测（切换会拖成几分钟）");
             if (langpolicy::should_probe(""))   lfail("没候选时也要求每段检测（浪费且更易判错）");
 
-            std::cout << "[SelfTest] 语言锁定/切换（连续一致才切换/候选打断清零/首发需确认）: "
+            std::cout << "[SelfTest] 语言策略（锁定要快/切换要慢/候选打断清零）: "
                       << (l_ok ? "✅ 通过" : "❌ 失败") << std::endl;
             if (!l_ok) { std::cerr << "    " << l_why << std::endl; return 1; }
         }
