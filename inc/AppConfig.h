@@ -123,6 +123,16 @@ struct AppConfig {
     std::string target_lang = "zh";
     int         lang_recheck_sec = 120;
 
+    // --lang-switch-confirm N：语言锁定/切换要**连续 N 段判断一致**才认（默认 3）。
+    //
+    // 【为什么需要】原来一次判断就切换。真实会话（live.db #2，英文课）里，
+    // 120 秒重检那一拍正好落在音乐/转场段上，Whisper 对那 3~4 秒判成了中文
+    // → 吐出「春日的留书,你在路上做一回。」→ **锁定语言被切换成 zh**。
+    // 机制与连带风险见 inc/LangPolicy.h。
+    //
+    // 1 = 退回旧行为（一次就切），排查时可以用。
+    int         lang_switch_confirm = 3;
+
     // --dump-prompt <文本>：加载混元模型，打印实际 prompt 与 tokenize 结果后退出。
     // 用于验证特殊 token 是否被正确识别（不需要声卡）。
     std::string dump_prompt;

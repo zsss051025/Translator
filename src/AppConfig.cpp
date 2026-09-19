@@ -177,8 +177,14 @@ AppConfig AppConfig::from(int argc, char** argv) {
         }
         else if (arg == "--summarizer")    next(cfg.summarizer);
         else if (arg == "--llm-model")     next(cfg.llm_model);
-        else if (arg == "--lang-recheck") {
+        else if (arg == "--lang-switch-confirm") {
             std::string v; next(v);
+            try { if (!v.empty()) cfg.lang_switch_confirm = std::stoi(v); }
+            catch (const std::exception&) {
+                std::cerr << "[Config] --lang-switch-confirm 需要数字（段数），收到: " << v << std::endl;
+            }
+        }
+        else if (arg == "--lang-recheck") {            std::string v; next(v);
             try { if (!v.empty()) cfg.lang_recheck_sec = std::stoi(v); }
             catch (const std::exception&) {
                 std::cerr << "[Config] --lang-recheck 需要数字参数，收到: " << v << std::endl;

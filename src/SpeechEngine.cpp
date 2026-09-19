@@ -1,5 +1,6 @@
 #include "SpeechEngine.h"
 #include "SpeechFilter.h"   // 归一化 + 幻觉黑名单 + 非内容判据（可单测）
+#include "LangPolicy.h"     // 语言锁定/切换状态机（纯函数、可单测）
 #include <algorithm>
 #include <cctype>
 #include <iostream>
@@ -83,6 +84,15 @@ void SpeechEngine::set_language_policy(const std::string& source_lang, int reche
 	// auto 模式下仍然保持为空，等 whisper 检测（那条路本来就能正常写上）。
 	current_lang_ = (requested_lang_ == "auto") ? std::string() : requested_lang_;
 	last_detect_ = std::chrono::steady_clock::time_point{};
+	pending_lang_.clear();
+	pending_count_ = 0;
+}
+
+void SpeechEngine::set_language_switch_confirm(int n) {
+	std::lock_guard<std::mutex> lock(lang_mutex_);
+	lang_switch_confirm_ = n > 0 ? n : 1;
+	pending_lang_.clear();
+	pending_count_ = 0;
 }
 
 std::string SpeechEngine::get_language() const {
@@ -158,6 +168,9 @@ bool SpeechEngine::should_detect_language() const {
 	std::lock_guard<std::mutex> lock(lang_mutex_);
 	if (requested_lang_ != "auto") return false;    // 用户指定了固定语言，永不检测
 	if (current_lang_.empty())     return true;     // 还没锁定
+	// 候选期间**每段都检测**，不用等下一个重检周期 ——
+	// 否则"连续 N 段一致"会变成"连续 N 个 120 秒"（6 分钟才切换，太迟钝）。
+	if (langpolicy::should_probe(pending_lang_)) return true;
 	const auto now = std::chrono::steady_clock::now();
 	return (now - last_detect_) > std::chrono::seconds(lang_recheck_sec_);
 }
@@ -170,14 +183,32 @@ void SpeechEngine::update_detected_language() {
 
 	std::lock_guard<std::mutex> lock(lang_mutex_);
 	const std::string detected = s;
-	if (detected != current_lang_) {
-		std::cout << "\n[Lang] 源语言"
-		          << (current_lang_.empty() ? "锁定" : "切换")
-		          << ": " << (current_lang_.empty() ? "(未定)" : current_lang_)
-		          << " -> " << detected << std::endl;
-		current_lang_ = detected;
-	}
 	last_detect_ = std::chrono::steady_clock::now();
+
+	// 状态机在 LangPolicy 里（纯函数、有单测）。这里只负责打日志。
+	const auto act = langpolicy::decide(detected, current_lang_,
+	                                    &pending_lang_, &pending_count_,
+	                                    lang_switch_confirm_);
+
+	if (act == langpolicy::Action::Lock) {
+		// 【为什么首次锁定也要"连续 N 段一致"】开场往往是音乐/片头，
+		// 那一段的语言判断同样不可靠 —— 这正是这套素材最容易踩的地方。
+		std::cout << "\n[Lang] 源语言锁定: " << detected
+		          << "（连续 " << lang_switch_confirm_ << " 段一致才锁）" << std::endl;
+		current_lang_ = detected;
+	} else if (act == langpolicy::Action::Switch) {
+		// ⚠️ 这行值得看清楚：它意味着**源语言真的换了**。
+		// 换错一次不只是脏一段 —— 若新语言恰好等于目标语言，
+		// 主循环会把它当成"无需翻译"，**后面的翻译会静默停掉**。
+		std::cout << "\n[Lang] 源语言切换: " << current_lang_ << " -> " << detected
+		          << "（连续 " << lang_switch_confirm_ << " 段一致）" << std::endl;
+		current_lang_ = detected;
+	} else if (!pending_lang_.empty()) {
+		// 有候选但还不够 —— 打出来，让"被音乐带偏但没切换"变成可观测的
+		std::cout << "[Lang] 疑似语言变化 " << current_lang_ << " -> " << pending_lang_
+		          << "（" << pending_count_ << "/" << lang_switch_confirm_
+		          << " 段，暂不切换）" << std::endl;
+	}
 }
 
 void SpeechEngine::start() {

@@ -19,6 +19,7 @@
 #include "ActionStore.h"
 #include "Evidence.h"
 #include "SpeechFilter.h"
+#include "LangPolicy.h"
 #include "CommonWords.h"
 #include "ModelLog.h"
 #include "SessionStore.h"
@@ -5994,6 +5995,93 @@ static int run_selftest(const AppConfig& cfg) {
             if (!c_ok) { std::cerr << "    " << c_why << std::endl; return 1; }
         }
 
+        // ㉙ **语言锁定/切换状态机**
+        //
+        // 【这一组钉的是"静默的语言漂移"】真实会话（live.db #2，英文课）里
+        // 120 秒重检那一拍正好落在音乐/转场段，Whisper 对那 3~4 秒判成中文
+        // → 吐出「春日的留书,你在路上做一回。」→ 锁定语言被**切换成 zh**。
+        // 连带风险更大：若新语言恰好等于目标语言，主循环会把后面的英文段
+        // 当成"无需翻译"，**翻译静默停掉**。
+        //
+        // 状态机的每一步转移都在下面钉住 —— 它错了不会报错，只会静默变味。
+        {
+            using langpolicy::Action;
+            bool l_ok = true;
+            std::string l_why;
+            auto lfail = [&](const std::string& m) {
+                l_ok = false;
+                if (l_why.empty()) l_why = m;
+            };
+            auto run = [](const std::vector<std::string>& seq, const std::string& start,
+                          int need, std::string* out_lang, int* out_switches) {
+                std::string cur = start, pend;
+                int cnt = 0, sw = 0;
+                for (const auto& d : seq) {
+                    const auto a = langpolicy::decide(d, cur, &pend, &cnt, need);
+                    if (a == Action::Lock || a == Action::Switch) {
+                        cur = d;
+                        ++sw;
+                    }
+                }
+                *out_lang = cur;
+                *out_switches = sw;
+            };
+
+            std::string lang;
+            int sw = 0;
+
+            // ① **核心回归**：锁定 en 之后，只来一段 zh（音乐段）→ 不许切换
+            run({"zh"}, "en", 3, &lang, &sw);
+            if (lang != "en" || sw != 0)
+                lfail("单段判成中文就把锁定语言切换了 —— 这正是真实会话里出的事");
+
+            // ② 连续 3 段都是 zh → 确认切换
+            run({"zh", "zh", "zh"}, "en", 3, &lang, &sw);
+            if (lang != "zh" || sw != 1)
+                lfail("连续 3 段一致却没切换（真换了语言会跟不上）");
+
+            // ③ 候选被打断 → 清零（"zh, zh, en, zh, zh" 不应切换）
+            run({"zh", "zh", "en", "zh", "zh"}, "en", 3, &lang, &sw);
+            if (lang != "en" || sw != 0)
+                lfail("候选被打断后没有清零（两段零散的判断被当成了连续）");
+
+            // ④ 判回锁定语言 → 候选清零（打断之后只剩 2 段 zh，不够确认）
+            //
+            // ⚠️ 这个用例我第一版写成 `zh,en,zh,zh,zh`，期望"不切换" —— **错了**：
+            //    打断之后确实又有连续 3 段 zh，那时候切换是**正确**行为。
+            //    是**用例**构造得不对，不是代码不对。改成打断后只剩 2 段才验到点子上。
+            //    （顺带说明：写"不该发生"的用例时，要保证序列里**真的**不满足触发条件。）
+            run({"zh", "en", "zh", "zh"}, "en", 3, &lang, &sw);
+            if (lang != "en" || sw != 0)
+                lfail("中间判回锁定语言，候选却没清零（打断前的计数被接着用了）");
+
+            // ⑤ 首次锁定也要连续 N 段一致（开场音乐同样会判错语言）
+            run({"en"}, "", 3, &lang, &sw);
+            if (lang != "" || sw != 0)
+                lfail("首次判断就锁定了 —— 开场音乐可能把它带偏");
+            run({"en", "en", "en"}, "", 3, &lang, &sw);
+            if (lang != "en" || sw != 1)
+                lfail("连续 3 段一致却没锁定");
+
+            // ⑥ need=1 应退回旧行为（一次就切）—— 排查时要用
+            run({"zh"}, "en", 1, &lang, &sw);
+            if (lang != "zh" || sw != 1)
+                lfail("need=1 时没有退回『一次就切换』的旧行为");
+
+            // ⑦ 空检测（拿不到语言）不许动状态
+            run({"", "", ""}, "en", 3, &lang, &sw);
+            if (lang != "en" || sw != 0)
+                lfail("空检测结果改动了状态（会把锁定清掉）");
+
+            // ⑧ 候选期间应该**每段都检测**（否则 N 段会拖成 N×120 秒）
+            if (!langpolicy::should_probe("zh")) lfail("有候选时不重新检测（切换会拖成几分钟）");
+            if (langpolicy::should_probe(""))   lfail("没候选时也要求每段检测（浪费且更易判错）");
+
+            std::cout << "[SelfTest] 语言锁定/切换（连续一致才切换/候选打断清零/首发需确认）: "
+                      << (l_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+            if (!l_ok) { std::cerr << "    " << l_why << std::endl; return 1; }
+        }
+
         // 【这里刻意不写"共 N 例"】原来写死了 `"✅ 11 例通过"`，
         // 而加用例的人（我）不会记得回来改数字 —— 本轮加了 ⑫⑬⑭ 三条之后，
         // 它照样打"11 例通过"，**在骗人**。手写计数就是这个下场。
@@ -6342,6 +6430,8 @@ static int run_app(int argc, char** argv) {
     // 语言策略：默认"首次检测后锁定"，不再每段重新检测。
     // 实测日志显示 auto 在 3 秒碎片上经常只有 20% 把握，判错一次整段识别就废了。
     engine.set_language_policy(cfg.source_lang, cfg.lang_recheck_sec);
+    // 语言锁定/切换都要连续 N 段一致才认（理由见 AppConfig / LangPolicy.h）
+    engine.set_language_switch_confirm(cfg.lang_switch_confirm);
 
     // 术语：一份列表，三个用途——
     //   ① 喂给 Whisper 作为 initial_prompt（识别时偏向专名）

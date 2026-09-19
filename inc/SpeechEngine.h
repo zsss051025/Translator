@@ -47,6 +47,13 @@ public:
 	// 每段都做自动检测是识别错误的常见来源——3 秒碎片上模型经常只有 20% 把握。
 	void set_language_policy(const std::string& source_lang, int recheck_sec);
 
+	// 语言（锁定或切换）需要**连续多少段判断一致**才认（默认 3）。
+	//
+	// 【为什么需要它】原来**一次判断就切换**，于是音乐/转场那一段被判成别的语言时
+	// 锁定语言当场就被改掉 —— 真实会话里直接导致英文课上出现中文原文
+	// （机制见 inc/LangPolicy.h）。1 = 退回旧行为（一次就切）。
+	void set_language_switch_confirm(int n);
+
 	// 当前锁定的源语言（如 "en"）；尚未检测出来时为空
 	std::string get_language() const;
 
@@ -106,6 +113,12 @@ private:
 	std::string requested_lang_ = "auto";           // 用户请求的语言（"auto" 或具体代码）
 	std::string current_lang_;                      // 已锁定的源语言
 	int         lang_recheck_sec_ = 120;            // auto 模式下的重检间隔
+
+	// 语言状态的"候选"部分：判出别的语言时先记在这里，连续够多段才真的切换。
+	// 状态机本身在 langpolicy::decide()（纯函数、有单测）。
+	std::string pending_lang_;
+	int         pending_count_ = 0;
+	int         lang_switch_confirm_ = 3;
 	mutable std::mutex lang_mutex_;
 	std::chrono::steady_clock::time_point last_detect_{};
 
