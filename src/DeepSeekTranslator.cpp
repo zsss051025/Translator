@@ -1,4 +1,4 @@
-﻿#include "DeepSeekTranslator.h"
+#include "DeepSeekTranslator.h"
 // HTTPS 支持由 CMake 的 target_compile_definitions 统一提供
 // （CPPHTTPLIB_OPENSSL_SUPPORT）。**不要在这里写 #define** ——
 // 漏一个文件就会报「set_ca_cert_path 不是成员」这种看不懂的错。
@@ -112,6 +112,11 @@ void DeepSeekTranslator::network_worker() {
 		}
 		const std::string& text_to_translate = req.text;
 
+		// ① 清洗输入（去首尾空白）—— 和本地混元走同一个函数。
+		//    理由见 ITranslator::clean_source：前导空格会让弱模型把指令翻出来。
+		const std::string src = ITranslator::clean_source(text_to_translate);
+		if (src.empty()) { continue; }
+
 		// 构建请求体
 		// system prompt 由目标语言决定，不再硬编码"翻译成中文"
 		//
@@ -122,13 +127,16 @@ void DeepSeekTranslator::network_worker() {
 			target_name() +
 			". Output only the translation itself, with no explanation and no quotation marks." +
 			ITranslator::glossary_constraint(
-				ITranslator::glossary_for_text(glossary_, text_to_translate));
+				ITranslator::glossary_for_text(glossary_, src)) +
+			// 上下文：**和本地混元用同一个 context_block()**。
+			// 前文只进 system（不进 user），否则模型分不清哪句要译、哪句是背景。
+			ITranslator::context_block();
 
 		json payload = {
 			{"model", "deepseek-chat"},
 			{"messages", json::array({
 				{{"role", "system"}, {"content", sys_prompt}},
-				{{"role", "user"}, {"content", text_to_translate}}
+				{{"role", "user"}, {"content", src}}
 			})}
 		};
 
@@ -155,6 +163,13 @@ void DeepSeekTranslator::network_worker() {
 					try {
 						auto response_json = json::parse(res->body);
 						std::string translated_text = response_json["choices"][0]["message"]["content"];
+						// ② 回显兜底：万一还是把指令翻了出来，回退成原文
+						//（显示看不懂的英文，好过显示看着通顺的伪造中文）
+						if (ITranslator::looks_like_prompt_echo(translated_text)) {
+							std::cerr << "[翻译] ⚠️ 输出疑似「把指令翻译了一遍」，已回退为原文："
+							          << src << std::endl;
+							translated_text = src;
+						}
 						std::cout << "翻译结果: " << translated_text << std::endl;
 						SessionStore::instance().log_segment(text_to_translate, translated_text, name(), last_api_ms_.load(), req.confidence);
 						{
@@ -163,6 +178,9 @@ void DeepSeekTranslator::network_worker() {
 							last_source_      = text_to_translate;
 						}
 						translation_count_.fetch_add(1);
+						// 译完才推进滚动上下文（理由同本地混元：前文是"之前说过什么"，
+						// 不能把当前段也塞进去）
+						note_source(text_to_translate);
 						success = true;
 					}
 					catch (const std::exception& e) {

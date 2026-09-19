@@ -119,6 +119,14 @@ AppConfig AppConfig::from(int argc, char** argv) {
                 cfg.tools_list_only = false;
             }
         }
+        else if (arg == "--context-lines") next(cfg.context_lines_text);
+        else if (arg == "--context") {
+            std::string v; next(v);
+            try { if (!v.empty()) cfg.context_lines = std::stoi(v); }
+            catch (const std::exception&) {
+                std::cerr << "[Config] --context 需要数字（段数），收到: " << v << std::endl;
+            }
+        }
         else if (arg == "--endpoint-ms") {
             std::string v; next(v);
             try { if (!v.empty()) cfg.endpoint_ms = std::stoi(v); }

@@ -58,7 +58,10 @@ std::string HunyuanTranslator::translate_system_prompt(const std::string& text) 
     return "You are a professional translator. Translate the user's message into " + target_name() +
            ". Output only the translation itself, with no explanation, no prefix, "
            "no quotation marks, and no repetition of these instructions." +
-           ITranslator::glossary_constraint(ITranslator::glossary_for_text(glossary_, text));
+           ITranslator::glossary_constraint(ITranslator::glossary_for_text(glossary_, text)) +
+           // 上下文（最近几段的原文，只读）。**同一个 context_block() 也被云端用** ——
+           // 两处各写一份必然走散。没有前文时它返回空串，这里等于没加。
+           ITranslator::context_block();
 }
 
 void HunyuanTranslator::debug_dump_prompt(const std::string& text) const {
@@ -300,11 +303,27 @@ long long HunyuanTranslator::get_last_api_ms() {
 /////////////////////////////////////////////////////////////
 
 
-bool HunyuanTranslator::translate_once(const std::string& text, std::string& out) {
+bool HunyuanTranslator::translate_once(const std::string& raw_text, std::string& out) {
+    // ① 清洗输入：**去掉首尾空白**。这一步不是洁癖 ——
+    //    实测 `" and I'm"`（带前导空格）会让模型把 system prompt 翻译出来
+    //    （输出「我是一个专业的翻译人员。」），而不带空格时正常译成「而我也是」。
+    //    Whisper 的输出约 28% 带前导空格，所以这个触发器很常见。
+    const std::string text = ITranslator::clean_source(raw_text);
+    if (text.empty()) { out.clear(); return true; }
+
     const std::string sys = translate_system_prompt(text);
     std::string raw;
     if (!generate_once(sys, text, raw, /*max_new=*/128)) return false;
     out = sanitize_output(std::move(raw));   // 剥掉可能被回显的 prompt 片段
+
+    // ② 回显兜底：万一还是把指令翻了出来，**回退成原文**。
+    //    显示一句看不懂的英文，比显示一句看着很通顺的伪造中文安全得多 ——
+    //    前者用户知道"这句没译出来"，后者他会当真。
+    if (ITranslator::looks_like_prompt_echo(out)) {
+        std::cerr << "[翻译] ⚠️ 输出疑似「把指令翻译了一遍」，已回退为原文："
+                  << text << std::endl;
+        out = text;
+    }
     return true;
 }
 
@@ -445,5 +464,10 @@ void HunyuanTranslator::translation_worker() {
             last_source_      = req.text;
         }
         translation_count_.fetch_add(1);
+
+        // 译完才把它推进滚动上下文 —— 下一段翻译时会作为"前文"带上。
+        // **必须在译完之后**：前文要的是"这一段之前说过什么"，
+        // 把当前段也推进去会让模型在下一段里看到两遍。
+        note_source(req.text);
     }
 }

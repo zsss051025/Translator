@@ -1617,6 +1617,31 @@ static int run_dump_prompt(const AppConfig& cfg) {
     // 顺便跑一次真实翻译，验证 prompt 修复后是否还有回显
     std::cout << "\n===== 真实翻译测试 =====" << std::endl;
     std::cout << "输入: " << cfg.dump_prompt << std::endl;
+
+    // ---- 上下文：把前面几段塞成"前文"，对照着看有没有用 ----
+    //
+    // 这条路径存在的理由：用户反馈「被切碎的语句翻译出来就四不像」，
+    // 而"给翻译带上上下文"这件事**光看代码没法判断有没有用** ——
+    // 得拿真实的残句跑一次对照。所以 `--dump-prompt` 也支持上下文：
+    //     --dump-prompt "and I'm" --context-lines "Thank you.|Wait for us here, George."
+    // 两个开关分开：`--context N` 管真跑时的段数，`--context-lines` 直接给内容。
+    if (!cfg.context_lines_text.empty()) {
+        // 用 `|` 分隔多段（不用逗号：句子本身就带逗号）
+        std::vector<std::string> lines;
+        std::string cur;
+        for (size_t i = 0; i < cfg.context_lines_text.size(); ++i) {
+            if (cfg.context_lines_text[i] == '|') { lines.push_back(cur); cur.clear(); }
+            else cur += cfg.context_lines_text[i];
+        }
+        if (!cur.empty()) lines.push_back(cur);
+        hy.set_context_lines(static_cast<int>(lines.size()));
+        for (const auto& l : lines) hy.note_source(l);
+        std::cout << "前文 " << lines.size() << " 段:" << std::endl;
+        for (const auto& l : lines) std::cout << "   - " << l << std::endl;
+    } else {
+        hy.set_context_lines(0);      // 不显式给前文就不带，保证单句对照是干净的
+    }
+
     std::string out;
     if (!hy.translate_once(cfg.dump_prompt, out)) {
         std::cerr << "[Dump] 翻译失败" << std::endl;
@@ -5885,6 +5910,90 @@ static int run_selftest(const AppConfig& cfg) {
             if (!s_ok) { std::cerr << "    " << s_why << std::endl; return 1; }
         }
 
+        // ㉘ **翻译输入清洗 + 回显兜底**
+        //
+        // 【这一组钉的是一个"产出伪造内容"的真事故】用户真跑一部电影，
+        // 其中一段原文 `and I'm` 被译成「我是一个专业的翻译人员。」
+        // —— 那是 **system prompt 的第一句**（`You are a professional translator…`）
+        // 被模型当成待译内容翻了一遍。
+        //
+        // ⚠️ 我一开始把它诊断成"小模型替残句补全了"，**那是错的**。
+        //    真正的触发器是可复现的：
+        //        --dump-prompt "and I'm"    → 而我也是              ✅
+        //        --dump-prompt " and I'm"   → 我是一个专业的翻译人员。 ❌
+        //    差别只是**一个前导空格**，而 Whisper 的输出约 28% 带前导空格。
+        {
+            bool c_ok = true;
+            std::string c_why;
+            auto cfail2 = [&](const std::string& m) {
+                c_ok = false;
+                if (c_why.empty()) c_why = m;
+            };
+
+            // ---- ① clean_source：去首尾空白 ----
+            struct TrimCase { const char* in; const char* want; const char* why; };
+            const TrimCase tcs[] = {
+                {" and I'm",      "and I'm",  "前导空格没被去掉（这就是回显的触发器）"},
+                {"and I'm ",      "and I'm",  "尾部空格没被去掉"},
+                {"  ¶¶  ",        "¶¶",       "两侧空白都没去干净"},
+                {"\tThank you.\n", "Thank you.", "制表符/换行没被当成空白"},
+                {"and I'm",       "and I'm",  "本来就干净的字符串被改了"},
+                {u8"　你好　",     u8"你好",   "全角空格没被去掉"},
+                {u8"凤凰项目",     u8"凤凰项目", "正常中文被改了"},
+                {"",              "",         "空串应原样返回"},
+                {"   ",           "",         "全空白应收敛成空串"},
+            };
+            for (const auto& c : tcs) {
+                const std::string got = ITranslator::clean_source(c.in);
+                if (got != c.want) cfail2(c.why);
+            }
+
+            // ---- ② looks_like_prompt_echo：认出"把指令翻译了一遍" ----
+            struct EchoCase { const char* s; bool want; const char* why; };
+            const EchoCase ecs[] = {
+                // **实测出现的那一句**
+                {u8"我是一个专业的翻译人员。", true, "实测回显的那句没被认出来"},
+                // 模型换个说法/只译一半也要抓住
+                {u8"你是专业的翻译人员", true, "换人称的回显没被认出来"},
+                {"You are a professional translator.", true, "英文原样回显没被认出来"},
+                {"Output only the translation itself", true, "英文半句回显没被认出来"},
+
+                // ⚠️ **这一条断言的是"不抓"，而且是有意的取舍。**
+                //    「我是一个专业翻译」和"一个人自我介绍说自己是专业翻译"**无法区分** ——
+                //    后者在讨论翻译工作的会上完全可能出现，而误判的代价是
+                //    **一句正常的译文被换成英文原文**。
+                //    所以特征词只收到「专业的翻译人员」这种长到不可能出现在对白里的程度，
+                //    接受"半截回显漏判"。方向和 ASR 黑名单一致：宁可漏判，不可误判。
+                {u8"我是一个专业翻译", false,
+                 "半截回显被抓了 —— 如果这条失败，说明特征词被放松到会误伤自我介绍"},
+
+                // ⚠️ **反向：真实台词绝不能被当成回显**（误判会把正常译文换成原文）
+                {u8"而我也是", false, "正常译文被误判成回显"},
+                {u8"谢谢你，乔治，在这里等我们。", false, "正常译文被误判成回显"},
+                {"Thank you for watching the show.", false, "正常内容被误判成回显"},
+                {"My partner is a translator.", false,
+                 "台词里出现 translator 不该被误判（特征词要够长够独特）"},
+                {"", false, "空串不是回显"},
+                // 「不要解释」这类**短而通用**的短语曾经在表里，被这条自检抓了出来：
+                // 正常台词「不要解释了，我们继续。」会被判成回显。
+                {u8"不要解释了，我们继续。", false,
+                 "正常台词被判成回显 —— 短而通用的短语不许进特征词表"},
+            };
+            int echo_false_pos = 0;
+            for (const auto& c : ecs) {
+                const bool got = ITranslator::looks_like_prompt_echo(c.s);
+                if (got != c.want) {
+                    if (!c.want) ++echo_false_pos;
+                    cfail2(c.why);
+                }
+            }
+            (void)echo_false_pos;
+
+            std::cout << "[SelfTest] 翻译输入清洗 + 回显兜底（前导空格/指令被翻/不误伤台词）: "
+                      << (c_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+            if (!c_ok) { std::cerr << "    " << c_why << std::endl; return 1; }
+        }
+
         // 【这里刻意不写"共 N 例"】原来写死了 `"✅ 11 例通过"`，
         // 而加用例的人（我）不会记得回来改数字 —— 本轮加了 ⑫⑬⑭ 三条之后，
         // 它照样打"11 例通过"，**在骗人**。手写计数就是这个下场。
@@ -6350,6 +6459,13 @@ static int run_app(int argc, char** argv) {
         // 但那是"靠时序侥幸"，一旦以后有人改成启动即预热就会变成数据竞争。
         translator->set_target_language(cfg.target_lang);   // 译文语言
         translator->set_glossary(glossary);
+        // 上下文：把最近 N 段的**原文**带给翻译，让它知道"这件事在说什么"。
+        // 默认 2，`--context 0` 关闭。理由与代价见 ITranslator.h 的说明。
+        translator->set_context_lines(cfg.context_lines);
+        if (cfg.context_lines > 0) {
+            std::cout << "[翻译] 上下文 " << cfg.context_lines
+                      << " 段（前文只进 system、只作理解用，不会被翻译）" << std::endl;
+        }
         if (!glossary.empty()) {
             std::cout << "[术语] 已作为翻译约束下发（" << glossary.size()
                       << " 条），用于统一译文里的专名写法" << std::endl;
