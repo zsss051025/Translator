@@ -6661,6 +6661,24 @@ static int run_app(int argc, char** argv) {
                   << " —— " << why << std::endl;
 
         std::unique_ptr<ITranslator> translator;
+
+        // ---- 残句合并 ----
+        //
+        // 【为什么放在这里】它是**每场会话一份**的状态：攒着的残句必须随会话
+        // 结束而清空（不然下一场会把上一场的尾巴带出来）。放在 while(1) 里面
+        // 就是这个意思 —— 每开一场会都是一个新的 Joiner。
+        //
+        // 语义见 inc/UtteranceMerge.h：残句先不译，等下一段到了再决定 ;
+        // 等不到就超时吐出 ; 会话结束必须冲刷（漏了 = 最后一句永远不翻译）。
+        uttermerge::Joiner joiner;
+        // 单调秒数：传进 Joiner 的是调用方的时间，不是它的内部时钟，
+        // 这样这段状态机在自检里可以用数字驱动（见 UtteranceMerge.h 的说明）。
+        const auto session_t0 = std::chrono::steady_clock::now();
+        auto now_sec = [&session_t0]() {
+            return std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - session_t0).count();
+        };
+
         if(choice == 2) {
             auto hy = std::make_unique<HunyuanTranslator>(cfg.hunyuan_model);
             if(!hy->init()) {
@@ -7130,8 +7148,19 @@ static int run_app(int argc, char** argv) {
                         subtitle.set_status(status_line(u8"无需翻译"));
                     }
                 } else {
-                    // 把识别置信度一并传下去，最终落库
-                    translator->push_text(result, quality.confidence);
+                    // 残句合并：**残句先攒着，等下一段到了再一起译**。
+                    //
+                    // 【为什么要拦在这里】残句单独送翻译时，弱模型会**替它补全** ——
+                    // 真实数据：`You get to get in a` → 「你可以亲自体验一下。」
+                    // （原文里没有这句，下一段才是 car with your family…）。
+                    // 判据与取舍见 inc/UtteranceMerge.h。
+                    //
+                    // 返回空串 = 现在不译（攒着），后面 poll/flush 会负责吐出来。
+                    const std::string to_translate = joiner.push(result, now_sec());
+                    if (!to_translate.empty()) {
+                        // 把识别置信度一并传下去，最终落库
+                        translator->push_text(to_translate, quality.confidence);
+                    }
                 }
                 // \r 会让光标回到行首，实现原地刷新的效果
                 // 后面加一些空格是为了覆盖掉之前可能更长的文字
@@ -7153,10 +7182,44 @@ static int run_app(int argc, char** argv) {
             if (wav_pcm.empty()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
-        }
 
+            // F. 残句合并：攒太久了就吐出来
+            //
+            // 【为什么每轮都要调，而不是等下一段】说话人可能说完半句就停下了 ——
+            // 那时候没有"下一段"来触发合并，攒着的那半句会一直不出字幕。
+            // 这一句就是"等不到下一段"的出口；漏了它，症状是
+            // **半句话永远卡在缓冲区里**，而屏幕上只表现为"少了一句"。
+            {
+                const std::string stale = joiner.poll(now_sec());
+                if (!stale.empty()) {
+                    translator->push_text(stale, -1.0);   // 已经过了时效，不再带置信度
+                }
+            }
+        }
         // 5. 资源清理
         std::cout << "\n\n[System] 正在结束本次记录..." << std::endl;
+
+        // ⚠️ **残句合并的冲刷必须在 translator->stop() 之前。**
+        //
+        // 【漏了会怎样】最后一句如果是残句（"and I'm" 这种），它一直攒在
+        // Joiner 里等下一段 —— 而这一场已经结束了，永远等不到。
+        // 症状是**最后半句永远不翻译**，而屏幕上只表现为"少了一句"。
+        // 它只在收尾路径上发生，平时跑一百场都看不出来 ——
+        // 所以自检里专门有一条断言钉着 `flush()`（见 UtteranceMerge 那一组）。
+        {
+            const std::string tail = joiner.flush();
+            if (!tail.empty()) {
+                std::cout << "[翻译] 收尾：把攒着的残句一起译掉 —— "
+                          << tail << std::endl;
+                translator->push_text(tail, -1.0);
+                // 给翻译线程一点时间把它译完再停（否则 stop() 会把队列丢掉）
+                const int q = translator->get_translation_count();
+                for (int i = 0; i < 50 && translator->get_translation_count() == q; ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+            }
+        }
+
         subtitle.stop();
         if (capture_mic) capture_mic->stop();
         capture_sys.stop();
