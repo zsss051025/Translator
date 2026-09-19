@@ -37,6 +37,7 @@ add_executable(Translator
 	src/LangPolicy.cpp
 	src/UtteranceMerge.cpp
 	src/Assistant.cpp
+	src/WebViewWindow.cpp
 	src/ITranslator.cpp
 	src/DeepSeekTranslator.cpp
 	src/HunyuanTranslator.cpp

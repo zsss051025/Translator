@@ -22,6 +22,7 @@
 #include "LangPolicy.h"
 #include "UtteranceMerge.h"
 #include "Assistant.h"
+#include "WebViewWindow.h"
 #include "CommonWords.h"
 #include "ModelLog.h"
 #include "SessionStore.h"
@@ -7204,6 +7205,97 @@ static int run_app(int argc, char** argv) {
     if (cfg.show_actions || cfg.action_set_id >= 0) return run_actions(cfg);
     if (!cfg.verify_report.empty()) return run_verify_report(cfg);
     if (cfg.show_fix) return run_fix(cfg);
+    if (cfg.ui_verify && cfg.ui_file.empty()) {
+        // 说清怎么用，而不是默默什么都不做
+        std::cout << nlohmann::json{{"ok", false},
+                                    {"error", "--ui-verify 要配 --ui <html文件> 一起用"}}
+                         .dump()
+                  << std::endl;
+        return 1;
+    }
+    if (!cfg.ui_file.empty()) {
+        // ---- --ui：WebView2 窗口（§7 第 4 阶段 4.4 的第一步）----
+        //
+        // 【为什么只做"渲染一份 HTML"】它一次验证四件事：窗口能开、
+        // WebView2 运行时能连上、HTML 能渲染、**控制台子系统没被破坏**。
+        // 页面（4.5–4.10）在后面接。
+        //
+        // ⚠️ 起不来时**要能优雅退回**：说清原因、返回非零，而不是黑屏或崩。
+        //    最常见的原因是没装 WebView2 运行时（本机已装）或
+        //    WebView2Loader.dll 不在 exe 旁边（CMake 已部署）。
+        WebViewWindow w;
+        // ---- 自动检验模式（--ui-verify）----
+        //
+        // 【它检验什么】不是"窗口开出来了"，而是**"这份 HTML 真的渲染出内容了"**。
+        // 差别很大：WebView2 连不上、文件路径编码错、页面白屏，前一种都会通过。
+        // 所以这里读 DOM 而不是只看窗口句柄 —— 这也是"诊断工具不能撒谎"。
+        if (cfg.ui_verify) {
+            // ⚠️ 返回**对象**而不是 `JSON.stringify(...)`：ExecuteScript 本来就会把
+            //    结果编码成 JSON，再 stringify 一层就变成"JSON 里的字符串"，
+            //    调用方要多解一次（本项目已经因为这种"多包一层"踩过坑）。
+            w.set_probe(
+                "(function(){"
+                "  var h1 = document.querySelector('h1');"
+                "  return {"
+                "    title: document.title,"
+                "    text_len: (document.body ? document.body.innerText.length : 0),"
+                "    els: document.querySelectorAll('*').length,"
+                "    h1: (h1 ? h1.innerText : null)"
+                "  };"
+                "})()");
+        }
+        if (!w.start(cfg.ui_file, "AudioTranslator")) {
+            if (cfg.ui_verify) {
+                // 检验模式的 stdout 必须是**纯 JSON**，错误也得是 JSON ——
+                // 否则调用方拿到的是半截真话。
+                std::cout << nlohmann::json{{"ok", false},
+                                            {"probe_done", false},
+                                            {"nav_ok", false},
+                                            {"error", w.error()}}.dump()
+                          << std::endl;
+                return 1;
+            }
+            std::cerr << "[UI] 打不开窗口：" << w.error() << "\n"
+                      << "     （命令行功能不受影响 —— 这个窗口是可选的）"
+                      << std::endl;
+            return 1;
+        }
+        if (cfg.ui_verify) {
+            w.wait();
+            nlohmann::json out;
+            out["probe_done"] = w.probe_done();
+            out["nav_ok"]     = w.nav_ok();
+
+            // ⚠️ 判据是 **probe 跑完了 + 导航成功 + 正文非空**，三者缺一不可。
+            //    只看 probe_done 会把"页面渲染出来是空的"判成通过 ——
+            //    那正是这个检验本来要抓的情况。
+            bool has_text = false;
+            const std::string raw = w.probe_result();
+            nlohmann::json probe = nullptr;
+            if (!raw.empty()) {
+                nlohmann::json p = nlohmann::json::parse(raw, nullptr, false);
+                if (!p.is_discarded()) {
+                    probe = p;
+                    if (probe.is_object() && probe.contains("text_len") &&
+                        probe["text_len"].is_number())
+                        has_text = probe["text_len"].get<long long>() > 0;
+                } else {
+                    // 解析不了也要留证据，不能悄悄当成 null
+                    out["probe_raw"] = raw;
+                }
+            }
+            out["probe"] = probe;
+            out["has_text"] = has_text;
+            const bool ok = out["probe_done"].get<bool>() &&
+                            out["nav_ok"].get<bool>() && has_text;
+            out["ok"] = ok;
+            std::cout << out.dump() << std::endl;
+            return ok ? 0 : 1;
+        }
+        std::cout << ">>> 窗口已打开，关闭窗口即退出 <<<" << std::endl;
+        w.wait();
+        return 0;
+    }
     if (!cfg.ui_data.empty()) return run_ui_data(cfg);
     if (cfg.list_assistants || !cfg.new_assistant.empty() ||
         !cfg.remove_assistant.empty() || !cfg.set_key.empty()) {

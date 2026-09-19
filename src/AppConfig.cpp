@@ -154,6 +154,8 @@ AppConfig AppConfig::from(int argc, char** argv) {
         else if (arg == "--remove-assistant")  next(cfg.remove_assistant);
         else if (arg == "--set-key")           next(cfg.set_key);
         else if (arg == "--ui-data")           next(cfg.ui_data);
+        else if (arg == "--ui")                next(cfg.ui_file);
+        else if (arg == "--ui-verify")         cfg.ui_verify = true;
         else if (arg == "--session") {
             std::string v; next(v);
             try { if (!v.empty()) cfg.ui_session = std::stoll(v); }

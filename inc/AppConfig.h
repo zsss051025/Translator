@@ -219,6 +219,15 @@ struct AppConfig {
     std::string ui_data;
     long long   ui_session = -1;
 
+    // --ui <html文件>：打开 WebView2 窗口渲染这个文件（§7 第 4 阶段 4.4）。
+    // 空 = 不开窗口。**它不改变任何既有行为** —— 不加这个参数时程序完全照旧。
+    std::string ui_file;
+
+    // --ui-verify：配合 --ui 用的**自动检验**模式。
+    // 页面加载完后跑一段 JS 把渲染结果打出来，然后自己关窗退出。
+    // 没有它就只能靠人眼盯窗口 —— 而"窗口是白屏"和"HTML 没问题"分不出来。
+    bool ui_verify = false;
+
     // --glossary <文件>：术语表（每行一个词/短语，# 为注释）。
     // 内容会作为 initial_prompt 喂给 Whisper，让专有名词识别更稳定。
     std::string glossary_path;
