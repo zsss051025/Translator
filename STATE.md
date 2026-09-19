@@ -166,7 +166,8 @@
 缺一条「改这条知识」的路 —— **一个改不了的记忆是产品风险**。
 
 **优先级 3：第 4 阶段 GUI（4.1–4.11）** —— 4.1/4.2/4.3 已完成（助手 / 持久化配置 /
-DPAPI key）；4.4 的 **SDK 接入已完成，窗口本体还没写**。
+DPAPI key）；4.4 的**窗口本体已完成**（`--ui` 能开窗口，`--ui-verify` 能自动检验），
+只剩"隐藏控制台"和"GUI 弹窗提问"。页面 4.5–4.11 未开工。
 
 #### 4.4 的交接（下一次从这里接）
 
@@ -181,16 +182,54 @@ DPAPI key）；4.4 的 **SDK 接入已完成，窗口本体还没写**。
 链接器就把依赖丢掉、post-build 也看不到它。**实测确认过**：接上 link 之后重新构建，
 DLL 仍然不存在。靠"某个条件成立才生效"的部署步骤，条件不成立时就是运行时崩溃。
 
-**还没写：窗口本体。要照着架构约束来，每条都有代价**
+**窗口本体：已完成（2026-09-19，提交 `1515718` + 本条 review 修正）**
 
-| # | 约束 | 说明 |
+交付：`inc/WebViewWindow.h` + `src/WebViewWindow.cpp`，接在 `--ui <html>` 上。
+架构见头文件注释，这里只记**两个实测出来的坑**（都会重犯，所以写死）：
+
+1. **宿主线程必须是 STA**。三种组合都跑过：
+   请求 `MTA` → **环境**创建就失败 `0x80010106 RPC_E_CHANGED_MODE`；
+   请求 `STA` → 正常；不请求 → 同样失败。
+   → `CoInitializeEx(COINIT_APARTMENTTHREADED)` 不是可选项。
+   用 RAII 守卫（`ComApartment`）保证**所有**返回路径都 `CoUninitialize`
+   —— 那个函数有 4 个出口，手写必漏一个。
+
+2. ⚠️ **在 DSH 文件沙箱里跑，即使 STA 正确，控制器创建仍失败
+   `0x8000FFFF E_UNEXPECTED`**：窗口建得出来、环境建得出来、
+   `msedgewebview2` 子进程照常起、连用户数据目录都写满了，**只有最后一步失败**。
+   **沙箱外同一个二进制正常**。
+   → 这是**测试环境的产物，不是产品缺陷**。将来再见到 `E_UNEXPECTED`，
+   先确认是不是在沙箱里跑的 —— 别再去改 STA 那段（我第一次就是这么猜错的，
+   白花了一轮）。**要跑真窗口检验必须用 `danger-full-access`。**
+
+**新增的检验手段：`--ui-verify`**
+"窗口起来了"是个**看不见**的结论 —— 没有它，以后改 UI 只能靠人眼盯，
+而且**"窗口白屏"和"HTML 没问题"分不出来**，正是"诊断工具撒谎"的老毛病。
+现在窗口自己把渲染结果说出来：加载完 → 跑 JS 读 DOM → 打印 JSON → 自己关窗。
+判据是**三者同时成立**：`probe_done` + `nav_ok` + **正文非空**。
+
+实测（5 个用例，命令见下方"怎么检验"）：
+
+| 用例 | 结果 |
+|---|---|
+| 真实页面 | `ok:true` `text_len=1237` `h1="会议纪要 · 会话 #9001"` `els=131`，exit 0 |
+| **空白页（负对照）** | `ok:false` `has_text:false` **`nav_ok:true`**，exit 1 |
+| 文件不存在 | `ok:false` + JSON 带 `error`，exit 1 |
+| 中文目录+中文文件名 | `ok:true`，和 ASCII 路径**结果一致**（验 `to_file_url` 百分号编码） |
+| 只给 `--ui-verify` 不给 `--ui` | `ok:false` + 说明怎么用，exit 1 |
+
+空白页那条是关键：它证明这个检验量的是**内容**，不是"导航成没成功"。
+
+**约束表仍有效，逐条标状态**
+
+| # | 约束 | 状态 |
 |---|---|---|
-| 1 | **保持控制台子系统** | 验证阶梯（`--selftest`/`--wav`/`--gaps`/python harness）全走控制台，改 `/SUBSYSTEM:WINDOWS` 会全废。做法：`ShowWindow(GetConsoleWindow(), SW_HIDE)` + 日志转文件 |
-| 2 | **录制主循环留在 main 线程** | WebView2 和字幕窗一样跑自己的线程 —— 不用搬主循环，这是省掉的一大块改造 |
-| 3 | **`RegisterHotKey` 是线程绑定的** | 字幕窗在自己线程注册了 `Ctrl+Alt+Q`，管理窗口**绝不能**再注册同一个。分工：托盘 = 开始记录；热键 = 结束记录 |
-| 4 | 用户数据目录重定向到 `%LOCALAPPDATA%` | 否则会在 exe 旁边建 `<exe>.WebView2\`，污染 `build\RelWithDebInfo\` |
-| 5 | ✅ 部署 `WebView2Loader.dll` | 已完成（见上） |
-| 6 | **结束提问必须由 GUI 弹窗实现** | 现在走 `std::getline` + `if (!stdin_is_tty()) ask = false;` —— **GUI 里今天会直接跳过提问**。接缝已留好：`run_confirmation()` 收 `std::function<bool(std::string&)>` |
+| 1 | **保持控制台子系统** | ⬜ 未做（`ShowWindow(SW_HIDE)` + 日志转文件） |
+| 2 | **录制主循环留在 main 线程** | ✅ 窗口跑自己线程，主循环没动 |
+| 3 | **`RegisterHotKey` 是线程绑定的** | ✅ 没注册任何全局热键 |
+| 4 | 用户数据目录重定向到 `%LOCALAPPDATA%` | ✅ `assistant::base_dir()\webview2` |
+| 5 | ✅ 部署 `WebView2Loader.dll` | ✅ 且**已验** `--ui` 能真开窗口 |
+| 6 | **结束提问必须由 GUI 弹窗实现** | ⬜ **未做，且这是学习闭环在 GUI 下的断点**：现在走 `std::getline` + `if (!stdin_is_tty()) ask = false;`，GUI 里**静默跳过提问**。接缝已留好：`run_confirmation()` 收 `std::function<bool(std::string&)>` |
 
 **可复用的现成模式**：`SubtitleWindow` 已经示范了"自己开线程 +
 `GetMessageW`/`DispatchMessageW` 消息泵"，`WebViewWindow` 照它写。
@@ -199,6 +238,36 @@ DLL 仍然不存在。靠"某个条件成立才生效"的部署步骤，条件�
 **建议的最小第一步**：`--ui` 打开一个窗口渲染一份现成的 `meeting-*.html`。
 它一次验证四件事：窗口能开、WebView2 运行时能连上、HTML 能渲染、
 **控制台子系统没被破坏**。之后再逐个做 4.5–4.10 的页面。
+✅ **这一步已做完**，见上面"窗口本体：已完成"。
+
+#### 怎么检验 4.4（人看 + 机器判，两条都要走）
+
+```powershell
+cd C:\dev\projects\AudioTranslator
+$exe = ".\build\RelWithDebInfo\Translator.exe"
+$page = "build\RelWithDebInfo\uiout\session-9001\meeting-9001.html"
+
+# ① 人眼看：应该弹出一个窗口，里面有中文会议纪要。关掉窗口即退出。
+& $exe --ui $page
+
+# ② 机器判：应该打印一行 JSON 且 exit 0（不用管窗口，它自己关）
+& $exe --ui-verify --ui $page ; echo "exit=$LASTEXITCODE"
+#   期望： {"has_text":true,"nav_ok":true,"ok":true,"probe":{...},"probe_done":true}
+#          text_len 是个正数（正常 1237）、h1 是"会议纪要 · 会话 #9001"
+
+# ③ 负对照（**这条最该跑**）：证明这个检验真的会失败，而不是永远说 ok
+#    ⚠️ 用 -Encoding ascii，**别用 -Encoding UTF8** —— 见 §四 的坑：
+#    PowerShell 5.1 按 ANSI 读、按 UTF-8 写，中文会被双重编码。
+#    这里内容纯 ASCII，用 ascii 就不可能出错。
+Set-Content -Path build\RelWithDebInfo\uiout\blank.html -Encoding ascii `
+  -Value '<!doctype html><html><head><meta charset="utf-8"><title>blank</title></head><body></body></html>'
+& $exe --ui-verify --ui build\RelWithDebInfo\uiout\blank.html ; echo "exit=$LASTEXITCODE"
+#   期望： ok:false  has_text:false  **nav_ok:true**  exit=1
+#   nav_ok:true 但 ok:false = 这个检验量的是"页面上有没有字"，不是"导航成没成功"
+```
+
+⚠️ **`--ui` / `--ui-verify` 在 DSH 沙箱里会失败**（`E_UNEXPECTED`，见上面坑 2）。
+在沙箱里跑要带 `danger-full-access`；你自己在普通终端里跑不受影响。
 
 **小活（顺手可做）**：
 · **3.4 结项**：验收标准是"`--wav jfk.wav` 不该再出现伪造的 `Thank you.`" ——
@@ -528,6 +597,10 @@ DLL 仍然不存在。靠"某个条件成立才生效"的部署步骤，条件�
 | 09-19 | **"多检测几段更稳妥"是错的：`auto` 本身在损害识别** | 我原以为"首次锁定也要求连续一致"更稳（防开场音乐带偏）。实测把它否掉了 —— jfk 上 `--lang en` 固定 / 旧行为 / 让前 3 段走 auto，分别是 **106 / 79 / 8 字符**。原因是 `auto` 要在那 3~4 秒里**同时判语言和转写**。结论：**锁定要快、切换要慢**（判错的代价由切换机制兜住，延迟锁定的代价没有兜底） |
 | 09-19 | **诊断工具撒谎（第五次）：`--dump-prompt` 只测本地混元** | 它函数里直接构造 `HunyuanTranslator`，**不看 `--translator`**。我加了 `--translator cloud` 去"验云端上下文"，跑出来耗时 177ms（本地量级）、输出和本地一模一样，才发现测的还是本地。**要验云端得单独写 harness。** |
 | 09-19 | **harness 的默认值会悄悄过期** | 「知识库不进 initial_prompt」改成默认关之后，`asr_prompt_ab.py` 没跟着加 `--asr-prompt-kb`，于是**两档实际都是"无提示"**，跑出一模一样的结果。我差点把它当成"prompt 无害"的证据。已修，并加了一行**断言式提示**：造了 N 条知识而 prompt 为空时明确打"对照不成立"。 |
+| 09-19 | **诊断工具撒谎（第六次）：把测试沙箱的故障当成产品缺陷** | `--ui` 报 `CreateCoreWebView2Controller hr=0x8000FFFF E_UNEXPECTED`，我立刻断定是"没初始化 COM 套间"，加了 STA 并**在注释里写下"不做的后果实测过"**。后来发现：**沙箱里这个错必然出现**（窗口、环境、`msedgewebview2` 子进程、用户数据目录全都正常，只有最后一步失败），**沙箱外同一个二进制完全正常**。于是那句"实测过"是**假的** —— 我把自己没有验证过的因果写成了结论。补做了真实验（MTA/STA/不初始化三种组合）之后才把注释改写成只有事实的版本。**教训**：①先说清"这是在什么环境里失败"再下结论；②**注释里的"实测过"三个字是承诺，写之前必须真的做过**。 |
+| 09-19 | **"成功了"和"没失败"不是一回事（`start()` 的漏洞）** | `WebViewWindow::start()` 等 8 秒后**只判 `failed`**：既不成功也没报错 → **返回 true**。而 `--ui-verify` 接着会调 `wait()`，看门狗定时器却是在控制器回调里才装的（回调压根没跑过）→ **永久挂住**。首启动本来就慢，8 秒并非不可能超。修法：超时也算失败并说清原因，上限放宽到 20 秒。**排查要点**：写"等待某条件"的循环时，**超时分支必须和失败分支一样明确**，否则"等不到"会伪装成"成功了"。 |
+| 09-19 | **看门狗只装在成功路径上 = 没装** | 同一个 bug 的另一半：`SetTimer` 写在控制器回调里。回调本身没跑起来时定时器就不存在，于是"保险丝"只保护了**本来就不需要保险**的情况。**兜底机制的挂载点必须不依赖它要保护的那条路径成功。** |
+| 09-19 | **错误信息用赋值 = 后面的原因会吃掉前面的** | WebView2 的失败链上，环境回调**覆盖**了套间初始化写下的 `im->error`，我看到的就只剩最后一个错误码 —— 而真正的线索是第一个。改成追加（用竖线连接）。同一个位置还有第二处撒谎：HRESULT 打的是十进制 `-2147418113`，**这个数字在网上搜不到任何东西**，换成 `0x8000FFFF (E_UNEXPECTED)` 才可查。 |
 
 ---
 

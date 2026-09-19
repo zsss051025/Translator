@@ -1,6 +1,8 @@
 #include "WebViewWindow.h"
 
 #include <atomic>
+#include <cctype>    // std::isalnum（to_file_url）
+#include <cstdio>    // std::snprintf（to_file_url 的 %XX 编码、hr_text）
 #include <filesystem>
 #include <thread>
 
@@ -285,12 +287,24 @@ bool WebViewWindow::start(const std::string& html_path, const std::string& title
         im->webview.Reset();
     });
 
-    // 等窗口起来（最多 8 秒）。**不无限等** —— 起不来就要能返回失败，
+    // 等窗口起来（最多 20 秒）。**不无限等** —— 起不来就要能返回失败，
     // 而不是让用户对着黑屏。
-    for (int i = 0; i < 80 && !im->ready && !im->failed; ++i) {
+    //
+    // ⚠️ 这里**必须**在超时后也返回 false。原来的写法只判 `failed`，
+    //    于是"8 秒过去、既不成功也没报错"会被当成**成功**返回 ——
+    //    而 `--ui-verify` 接着会调 wait()，可看门狗定时器是在控制器回调里
+    //    才装的（回调没跑过），结果就是**永久挂住**。
+    //    首启动 + 冷 profile 本来就慢，所以我同时把上限放宽到 20 秒。
+    for (int i = 0; i < 200 && !im->ready && !im->failed; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     if (im->failed) {
+        error_ = im->error;
+        return false;
+    }
+    if (!im->ready) {
+        append_error(im, u8"20 秒内 WebView2 控制器没建起来"
+                          u8"（运行时没装、被杀软拦住，或处在受限沙箱里）");
         error_ = im->error;
         return false;
     }
