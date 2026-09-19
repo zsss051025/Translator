@@ -1584,6 +1584,165 @@ static int run_verify_report(const AppConfig& cfg) {
     return 0;
 }
 
+// --fix [<词>] [--value X] [--as-kind K] [--define D] [--archive]
+//
+// 改正一条知识。**用户手改的唯一入口。**
+//
+// 【为什么必须有它】在这之前，用户发现某条知识是错的**没有任何直接办法**：
+// 只能靠重跑抽取（碰运气）或者清判断缓存（那是另一回事）。
+// 而错的条目会一直出现在识别提示 / 翻译约束 / 摘要背景里，用户只能看着。
+// 「一个改不了的记忆」不是缺功能，是**产品风险** —— 用户会因此不再信任库里的一切。
+//
+// 三个刻意的设计：
+//   ① 改写法走 `user_edit_value()`，**不降级**：用户自己改就是在确认新值
+//      （走 upsert 的话，他刚改好的东西会立刻退回"未确认"，再也进不了约束）
+//   ② 归档走 `status='archived'`，**不 DELETE**：§6.5 只降级不删，删了不可复查
+//   ③ 每一处改动都留下 `reason='user_edited'` 的历史 —— 让"用户改的"和
+//      "模型猜的"在流水里分得开，也让用户能回头看"我改过什么"
+static int run_fix(const AppConfig& cfg) {
+    if (!SessionStore::instance().init(cfg.db_path)) {
+        std::cerr << "打不开数据库: " << cfg.db_path << std::endl;
+        return 1;
+    }
+    auto& ks = KnowledgeStore::instance();
+
+    // ---- 没有指定词：列出全部，帮用户找到要改的那条 ----
+    if (cfg.fix_word.empty()) {
+        const auto all = ks.list("", 10000);
+        std::cout << "库: " << cfg.db_path << std::endl;
+        std::cout << "共 " << all.size() << " 条知识：" << std::endl;
+        for (const auto& k : all) {
+            std::cout << "  [" << k.status << "] " << knowledge::kind_label_zh(k.kind)
+                      << " 「" << k.value << "」";
+            if (!k.definition.empty()) std::cout << " —— " << k.definition;
+            std::cout << std::endl;
+        }
+        std::cout << "\n改一条：--fix <词> --value <新写法> / --define <含义> "
+                     "/ --as-kind <类型> / --archive" << std::endl;
+        return 0;
+    }
+
+    // ---- 定位这一条 ----
+    //
+    // 用户给的是他**看到的那个词**（可能是值、也可能带大小写差异），
+    // 所以先按 key 找，找不到再按 value 里包含它来找。
+    KnowledgeItem it;
+    bool found = ks.find_by_key(cfg.fix_word, &it);
+    if (!found) {
+        std::vector<KnowledgeItem> hits;
+        const std::string need = knowledge::normalize_key(cfg.fix_word);
+        for (const auto& k : ks.list("", 10000)) {
+            if (knowledge::normalize_key(k.value).find(need) != std::string::npos) {
+                hits.push_back(k);
+            }
+        }
+        if (hits.size() == 1) {
+            it = hits[0];
+            found = true;
+        } else if (hits.size() > 1) {
+            std::cerr << "「" << cfg.fix_word << "」匹配到多条，请写全一点：" << std::endl;
+            for (const auto& k : hits) {
+                std::cerr << "  [" << k.status << "] " << knowledge::kind_label_zh(k.kind)
+                          << " 「" << k.value << "」" << std::endl;
+            }
+            return 1;
+        }
+    }
+    if (!found) {
+        std::cerr << "库里没有「" << cfg.fix_word << "」。"
+                  << "用 `--fix`（不带词）看全部，或 `--gaps` 看待确认的。" << std::endl;
+        return 1;
+    }
+
+    std::cout << "改之前：" << knowledge::kind_label_zh(it.kind)
+              << "「" << it.value << "」 状态=" << it.status;
+    if (!it.definition.empty()) std::cout << " 含义=" << it.definition;
+    std::cout << std::endl;
+
+    const bool want_change = !cfg.fix_value.empty() || !cfg.fix_kind.empty() ||
+                             !cfg.fix_define.empty() || cfg.fix_archive;
+    if (!want_change) {
+        // 只看不改：把变化历史打出来 —— 这是"我凭什么这么说"的落点
+        const auto hist = ks.history(it.id);
+        std::cout << "\n变化历史（" << hist.size() << " 条）：" << std::endl;
+        if (hist.empty()) {
+            std::cout << "  （没有变化，这条从写进来就没动过）" << std::endl;
+        }
+        for (const auto& h : hist) {
+            std::cout << "  " << h.changed_at << "  " << h.reason << ": "
+                      << h.old_value << " -> " << h.new_value << std::endl;
+        }
+        std::cout << "\n要改它：--fix \"" << it.value << "\" --value <新写法>"
+                     " / --define <含义> / --as-kind <类型> / --archive" << std::endl;
+        return 0;
+    }
+
+    int changed = 0;
+    std::string err;
+
+    // ① 改正写法（**不降级** —— 用户自己改就是在确认）
+    if (!cfg.fix_value.empty()) {
+        if (cfg.fix_value == it.value) {
+            std::cout << "写法没变（「" << it.value << "」）—— 无需改动。" << std::endl;
+        } else if (ks.user_edit_value(it.kind, it.key, cfg.fix_value, &err)) {
+            std::cout << "✅ 写法已改为「" << cfg.fix_value << "」（状态 confirmed）"
+                      << std::endl;
+            ++changed;
+        } else {
+            std::cerr << "❌ 改写法失败：" << err << std::endl;
+        }
+    }
+
+    // ② 改正含义
+    if (!cfg.fix_define.empty()) {
+        if (ks.set_definition(it.kind, it.key, cfg.fix_define, &err)) {
+            std::cout << "✅ 含义已改为「" << cfg.fix_define << "」" << std::endl;
+            ++changed;
+        } else {
+            std::cerr << "❌ 改含义失败：" << err << std::endl;
+        }
+    }
+
+    // ③ 改正类型
+    if (!cfg.fix_kind.empty()) {
+        if (cfg.fix_kind == it.kind) {
+            std::cout << "类型没变（" << knowledge::kind_label_zh(it.kind)
+                      << "）—— 无需改动。" << std::endl;
+        } else if (ks.set_kind(it.kind, it.key, cfg.fix_kind, &err)) {
+            std::cout << "✅ 类型已改为 " << knowledge::kind_label_zh(cfg.fix_kind)
+                      << std::endl;
+            ++changed;
+        } else {
+            std::cerr << "❌ 改类型失败：" << err << std::endl;
+        }
+    }
+
+    // ④ 归档（**只降级，不删**）
+    if (cfg.fix_archive) {
+        if (it.status == "archived") {
+            std::cout << "它已经是归档状态 —— 无需改动。" << std::endl;
+        } else if (ks.set_status(it.id, "archived", "user_edited", &err)) {
+            std::cout << "✅ 已归档（**没有删除** —— 它不再进识别提示/翻译约束/"
+                         "摘要背景，但历史都留着，随时可以复查）" << std::endl;
+            ++changed;
+        } else {
+            std::cerr << "❌ 归档失败：" << err << std::endl;
+        }
+    }
+
+    if (changed > 0) {
+        // 改完立刻回显"现在会喂给识别和翻译什么" —— 让用户看到他这一改的**后果**。
+        // 不显示的话，他只能相信"我改对了"，没法确认改动真的生效了。
+        std::cout << "\n--- 改完之后，识别提示/翻译约束里现在是这些 ---" << std::endl;
+        for (const auto& t : knowledge::constraint_terms(ks.constraint_items())) {
+            std::cout << "  " << t << std::endl;
+        }
+        std::cout << "（复核：--fix \"" << (cfg.fix_value.empty() ? it.value : cfg.fix_value)
+                  << "\" 看历史；--terms 看完整三条腿）" << std::endl;
+    }
+    return 0;
+}
+
 static int run_dump_prompt(const AppConfig& cfg) {
     HunyuanTranslator hy(cfg.hunyuan_model);
     if (!hy.init()) {
@@ -6224,6 +6383,109 @@ static int run_selftest(const AppConfig& cfg) {
             if (!m_ok) { std::cerr << "    " << m_why << std::endl; return 1; }
         }
 
+        // ㉛ **用户手工改正知识**（`--fix <词> --value X`）
+        //
+        // 【这一组最重要的是"不许降级"那一条】`upsert` 里有一条规则：
+        // 值变了就把 confirmed 降回 candidate —— 那是为**模型抽出来的新值**设的
+        // （旧确认是针对旧值的）。但**用户自己改就是在确认新值**：
+        // 走 upsert 的话，他刚改好的东西立刻退回"未确认"，再也进不了
+        // 识别提示/翻译约束 —— 用户会看到"改对了反而没用"。
+        {
+            auto& ksx = KnowledgeStore::instance();
+            bool f_ok = true;
+            std::string f_why;
+            auto ffail2 = [&](const std::string& m) {
+                f_ok = false;
+                if (f_why.empty()) f_why = m;
+            };
+            const std::string FK = "__selftest_fix";
+            ksx.purge_key_prefix(FK);
+
+            KnowledgeItem a;
+            a.kind = "person"; a.key = FK; a.value = "Erika";
+            a.status = "confirmed"; a.confidence = 0.9; a.hits = 5;
+            if (ksx.upsert(a) <= 0) ffail2("用例造数据失败");
+
+            // ① 改写法 → 值变了、**状态仍是 confirmed**（核心断言）
+            std::string e;
+            if (!ksx.user_edit_value("person", FK, "Erica", &e)) {
+                ffail2("user_edit_value 失败：" + e);
+            } else {
+                KnowledgeItem got;
+                if (!ksx.get("person", FK, &got)) {
+                    ffail2("改完之后读不回来");
+                } else {
+                    if (got.value != "Erica") ffail2("值没改成功");
+                    if (got.status != "confirmed") {
+                        ffail2("用户改写法之后状态变成了「" + got.status +
+                               "」—— 用户自己改就是在确认新值，**不许降级**"
+                               "（走 upsert 就会这样，结果是「改对了反而没用」）");
+                    }
+                    // ② 别的字段一个都不许动
+                    if (got.hits != 5) {
+                        ffail2("改写法把 hits 动了（应保持 5，实际 "
+                               + std::to_string(got.hits) + "）");
+                    }
+                }
+            }
+
+            // ③ 历史里必须留下 user_edited（让"用户改的"和"模型猜的"分得开）
+            {
+                bool has_edit = false;
+                for (const auto& k : ksx.list("", 10000)) {
+                    if (knowledge::normalize_key(k.key) != FK) continue;
+                    for (const auto& h : ksx.history(k.id)) {
+                        if (h.reason == "user_edited" && h.new_value == "Erica") {
+                            has_edit = true;
+                        }
+                    }
+                }
+                if (!has_edit) ffail2("改动没有进历史（reason 应为 user_edited）");
+            }
+
+            // ④ **值没变不许报失败**（用户把写法重打一遍很自然；§2.6d 同类问题栽过）
+            if (!ksx.user_edit_value("person", FK, "Erica", &e)) {
+                ffail2("改成同一个值报了失败 —— 「无需变更」不是错误");
+            }
+
+            // ⑤ 空值 / 超长值必须拒（前者会让这条知识彻底失效）
+            if (ksx.user_edit_value("person", FK, "", &e)) ffail2("空写法被接受了");
+            if (ksx.user_edit_value("person", FK, std::string(300, 'x'), &e))
+                ffail2("超长写法被接受了");
+
+            // ⑥ 不存在的条目 → 报失败（**不新建行**）
+            if (ksx.user_edit_value("person", "__no_such_key__", "X", &e))
+                ffail2("改一个不存在的条目却报成功（会凭空建行）");
+
+            // ⑦ 归档是"降级"不是"删除"（§6.5）
+            {
+                long long fid = 0;
+                for (const auto& k : ksx.list("", 10000)) {
+                    if (knowledge::normalize_key(k.key) == FK) fid = k.id;
+                }
+                if (fid == 0) {
+                    ffail2("找不到用例条目");
+                } else if (!ksx.set_status(fid, "archived", "user_edited", &e)) {
+                    ffail2("归档失败：" + e);
+                } else {
+                    KnowledgeItem got;
+                    // 关键：归档之后**还能读回来**（证明是降级不是删除）
+                    if (!ksx.get("person", FK, &got) || got.status != "archived") {
+                        ffail2("归档之后条目不见了 —— 应该是降级而不是删除（§6.5）");
+                    }
+                    // 而且它不能再进约束
+                    for (const auto& t : knowledge::constraint_terms(ksx.constraint_items())) {
+                        if (t == got.value) ffail2("归档的条目仍然进了识别提示/翻译约束");
+                    }
+                }
+            }
+
+            ksx.purge_key_prefix(FK);
+            std::cout << "[SelfTest] 手工改正知识（不降级/留痕 user_edited/归档不删）: "
+                      << (f_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+            if (!f_ok) { std::cerr << "    " << f_why << std::endl; return 1; }
+        }
+
         // 【这里刻意不写"共 N 例"】原来写死了 `"✅ 11 例通过"`，
         // 而加用例的人（我）不会记得回来改数字 —— 本轮加了 ⑫⑬⑭ 三条之后，
         // 它照样打"11 例通过"，**在骗人**。手写计数就是这个下场。
@@ -6540,6 +6802,7 @@ static int run_app(int argc, char** argv) {
     if (cfg.triage_cache) return run_triage_cache(cfg);
     if (cfg.show_actions || cfg.action_set_id >= 0) return run_actions(cfg);
     if (!cfg.verify_report.empty()) return run_verify_report(cfg);
+    if (cfg.show_fix) return run_fix(cfg);
     if (!cfg.dump_prompt.empty()) return run_dump_prompt(cfg);
     if (cfg.export_session >= 0) return run_export(cfg);
 

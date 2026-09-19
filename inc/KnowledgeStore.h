@@ -197,6 +197,25 @@ public:
     bool set_definition(const std::string& kind, const std::string& key,
                         const std::string& definition, std::string* err = nullptr);
 
+    // **用户手工改正这条知识的写法**（`--fix <词> --value <新写法>`）。
+    //
+    // 【为什么不能走 upsert —— 这条最关键】
+    // upsert 里有一条规则：**值变了就把 confirmed 降回 candidate**。
+    // 那条规则是为**模型抽出来的新值**设的：旧的那次确认是针对**旧值**的，
+    // 值一变，那个确认就不再成立 —— 留着它等于让模型的新猜测借着用户对旧值的
+    // 信任，混进识别提示和翻译约束里（正是 §6.5 要防的事）。
+    //
+    // 但**用户自己改值不一样**：他就是在确认新值。
+    // 走 upsert 的话结果是"用户刚改正了一条知识，它立刻退回未确认状态"——
+    // 用户会看到自己刚修好的东西**又变回"未确认"**，而它再也进不了
+    // 识别提示/翻译约束。那等于"改对了反而没用"。
+    //
+    // 所以单开一条路径：写新值 + **状态置为 confirmed** + 历史记 `user_edited`
+    //（§6.8 定义的三个 reason 之一，专门用来区分"用户说的"和"模型猜的"）。
+    // 不动 hits、不动 asked_count、不动 confidence。
+    bool user_edit_value(const std::string& kind, const std::string& key,
+                         const std::string& new_value, std::string* err = nullptr);
+
     // 改一条知识的 **kind**（类型标签）。
     //
     // 【为什么需要它】抽取器只能区分"人名句式 → person"和"其它大写词 → term"，

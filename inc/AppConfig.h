@@ -173,6 +173,25 @@ struct AppConfig {
     // 非空 = 执行这条命令并退出。
     std::string verify_report;
 
+    // ---- --fix：改正一条知识（用户手改的唯一入口）----
+    //
+    //   --fix                    列出全部知识（找到要改的那条）
+    //   --fix <词>               查看这一条（含变化历史）
+    //   --fix <词> --value X     改正写法
+    //   --fix <词> --as-kind K   改正类型（term/person/project/product/fact/decision）
+    //   --fix <词> --define D    改正含义
+    //   --fix <词> --archive     归档（**不删** —— §6.5 只降级，删了就不可复查）
+    //
+    // 【为什么必须有它】在这之前，用户发现某条知识是错的**没有任何直接办法**：
+    // 只能靠重跑抽取（碰运气）或清判断缓存（那是另一个东西）。
+    // **一个改不了的记忆是产品风险** —— 它会一直出现在识别提示/翻译约束/
+    // 摘要背景里，而用户只能看着。
+    bool        show_fix = false;
+    std::string fix_word;        // 空 = 列出全部
+    std::string fix_value;    std::string fix_kind;
+    std::string fix_define;
+    bool        fix_archive = false;
+
     // --glossary <文件>：术语表（每行一个词/短语，# 为注释）。
     // 内容会作为 initial_prompt 喂给 Whisper，让专有名词识别更稳定。
     std::string glossary_path;

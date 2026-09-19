@@ -142,6 +142,15 @@ AppConfig AppConfig::from(int argc, char** argv) {
             }
         }
         else if (arg == "--actions")       cfg.show_actions = true;
+        else if (arg == "--fix") {
+            // 后面跟不跟词都合法：单独出现 = 列出全部
+            cfg.show_fix = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') cfg.fix_word = argv[++i];
+        }
+        else if (arg == "--value")        next(cfg.fix_value);
+        else if (arg == "--as-kind")      next(cfg.fix_kind);
+        else if (arg == "--define")       next(cfg.fix_define);
+        else if (arg == "--archive")      cfg.fix_archive = true;
         else if (arg == "--verify-report") next(cfg.verify_report);
         else if (arg == "--status")        next(cfg.actions_status);
         // --done/--doing/--todo 三个都是"把某条 action 改成这个状态"。

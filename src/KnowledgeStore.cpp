@@ -777,6 +777,121 @@ bool KnowledgeStore::set_definition(const std::string& kind, const std::string& 
     return true;
 }
 
+bool KnowledgeStore::user_edit_value(const std::string& kind, const std::string& key,
+                                     const std::string& new_value, std::string* err) {
+    auto set_err = [&](const std::string& m) { if (err) *err = m; };
+    if (new_value.empty()) {
+        set_err(u8"新写法是空的 —— 不写（空值会让这条知识彻底失效）");
+        return false;
+    }
+    if (new_value.size() > 200) {
+        // 和 constraint_terms 的 40 字上限同一个思路：词条不该是一整句话。
+        // 但这里是**用户手工输入**，宽松一些，200 字只是防手滑粘贴一整段。
+        set_err(u8"新写法太长（>200 字节）—— 这不像一个词条");
+        return false;
+    }
+
+    SessionStore& ss = SessionStore::instance();
+    std::lock_guard<std::mutex> lock(ss.mutex_);
+    if (ss.db_ == nullptr) { set_err(u8"库未打开"); return false; }
+
+    const std::string nk = knowledge::normalize_key(key);
+    const std::string ts = SessionStore::now_string();
+
+    // 先读旧值（要写进历史，也要判断"是不是真的变了"）
+    std::string old_value, old_status;
+    {
+        sqlite3_stmt* st = nullptr;
+        if (sqlite3_prepare_v2(ss.db_,
+                "SELECT value, status FROM knowledge WHERE kind = ? AND key = ?;",
+                -1, &st, nullptr) != SQLITE_OK) {
+            set_err(std::string("查询失败: ") + sqlite3_errmsg(ss.db_));
+            return false;
+        }
+        sqlite3_bind_text(st, 1, kind.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, nk.c_str(),   -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const unsigned char* v = sqlite3_column_text(st, 0);
+            const unsigned char* s2 = sqlite3_column_text(st, 1);
+            old_value  = v  ? reinterpret_cast<const char*>(v)  : "";
+            old_status = s2 ? reinterpret_cast<const char*>(s2) : "";
+        } else {
+            sqlite3_finalize(st);
+            set_err(u8"库里没有这条知识（key=" + nk + u8"）—— 不新建，请先用 --gaps/--terms 确认它存在");
+            return false;
+        }
+        sqlite3_finalize(st);
+    }
+
+    // ⚠️ 值没变也**不要**报失败：用户把写法重新打一遍是很自然的事
+    //（§2.6d 栽过一次同类问题：「无需变更」不是错误）。
+    // 但也不写历史 —— 值没变就不是一次变化。
+    if (old_value == new_value) {
+        // 唯一要补的是：如果他改的正好是"已归档"的条目，给他捞回来。
+        // （用户明确点名要它，那就不该继续躺着。）
+        if (old_status != "confirmed") {
+            sqlite3_stmt* st = nullptr;
+            if (sqlite3_prepare_v2(ss.db_,
+                    "UPDATE knowledge SET status='confirmed', updated_at=? "
+                    "WHERE kind=? AND key=?;", -1, &st, nullptr) == SQLITE_OK) {
+                sqlite3_bind_text(st, 1, ts.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(st, 2, kind.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(st, 3, nk.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_step(st);
+                sqlite3_finalize(st);
+            }
+        }
+        return true;
+    }
+
+    // 写新值 + **状态置为 confirmed**（理由见头文件：用户自己改就是在确认）
+    {
+        sqlite3_stmt* st = nullptr;
+        const char* sql =
+            "UPDATE knowledge SET value = ?, status = 'confirmed', updated_at = ? "
+            "WHERE kind = ? AND key = ?;";
+        if (sqlite3_prepare_v2(ss.db_, sql, -1, &st, nullptr) != SQLITE_OK) {
+            set_err(std::string("更新失败: ") + sqlite3_errmsg(ss.db_));
+            return false;
+        }
+        sqlite3_bind_text(st, 1, new_value.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, ts.c_str(),        -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, kind.c_str(),      -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 4, nk.c_str(),        -1, SQLITE_TRANSIENT);
+        const int rc = sqlite3_step(st);
+        sqlite3_finalize(st);
+        if (rc != SQLITE_DONE) {
+            set_err(std::string("更新失败: ") + sqlite3_errmsg(ss.db_));
+            return false;
+        }
+    }
+
+    // 写历史：reason = **user_edited**（§6.8 定义的三个之一）。
+    // 它让"用户改的"和"模型猜的"在流水里能分开 —— 这正是 --fix 存在的证据面。
+    {
+        sqlite3_stmt* hs = nullptr;
+        const char* sqlh =
+            "INSERT INTO knowledge_history"
+            "(knowledge_id,old_value,new_value,changed_at,source_session,source_seq,"
+            " source_text,reason) "
+            "SELECT id, ?, ?, ?, NULL, NULL, ?, 'user_edited' "
+            "FROM knowledge WHERE kind = ? AND key = ?;";
+        if (sqlite3_prepare_v2(ss.db_, sqlh, -1, &hs, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(hs, 1, old_value.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(hs, 2, new_value.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(hs, 3, ts.c_str(),        -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(hs, 4, u8"用户用 --fix 手工改正", -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(hs, 5, kind.c_str(),      -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(hs, 6, nk.c_str(),        -1, SQLITE_TRANSIENT);
+            sqlite3_step(hs);
+            sqlite3_finalize(hs);
+        }
+    }
+
+    // FTS 索引由 AFTER UPDATE 触发器自动维护，这里不写 FTS 语句。
+    return true;
+}
+
 bool KnowledgeStore::set_kind(const std::string& kind, const std::string& key,
                               const std::string& new_kind, std::string* err) {
     auto set_err = [&](const std::string& m) { if (err) *err = m; };
