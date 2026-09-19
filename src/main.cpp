@@ -18,6 +18,7 @@
 #include "TriageCache.h"
 #include "ActionStore.h"
 #include "Evidence.h"
+#include "SpeechFilter.h"
 #include "CommonWords.h"
 #include "ModelLog.h"
 #include "SessionStore.h"
@@ -5703,6 +5704,93 @@ static int run_selftest(const AppConfig& cfg) {
             std::cout << "[SelfTest] 负责人抽取（留空好过写错人 / 标点与修饰语不误入）: "
                       << (o_ok ? "✅ 通过" : "❌ 失败") << std::endl;
             if (!o_ok) { std::cerr << "    " << o_why << std::endl; return 1; }
+        }
+
+        // ㉖ **识别垃圾过滤**：`¶¶` 和"套话幻觉"
+        //
+        // 【这一组的所有用例都来自真实数据】2026-09-19 用户真跑一部电影（126 段），
+        // 其中 10 段是伪造的，而且**全都通过了原来的置信度检查**：
+        //     seq 39…46   ` ¶¶`                              conf 0.70~0.79
+        //     seq 97/106/119  ` Sous-titrage Société Radio-Canada`  conf 0.75~0.81
+        //     seq 113     ` Sous-titrage ST' 501`            conf 0.80
+        // 也就是说：**置信度对这类幻觉系统性失效**（模型"确信"自己在说实话）。
+        // 所以补两条不依赖模型自报指标的判据，这一组把它们钉住。
+        {
+            bool f_ok = true;
+            std::string f_why;
+            auto ffail = [&](const std::string& m) {
+                f_ok = false;
+                if (f_why.empty()) f_why = m;
+            };
+
+            // ---- ① 非内容：一个字母/汉字都没有 ----
+            struct NoContentCase { const char* s; bool want; const char* why; };
+            const NoContentCase ncs[] = {
+                {" ¶¶",          true,  "「 ¶¶」应被判为非内容（真实会话里的原样）"},
+                {"¶¶",           true,  "「¶¶」应被判为非内容"},
+                {" ...",         true,  "「 ...」应被判为非内容"},
+                {"--",           true,  "纯符号应被判为非内容"},
+                {" ",            true,  "空白应被判为非内容"},
+                {"",            true,  "空串应被判为非内容"},
+                {"it.",          false, "「it.」有字母，是内容"},
+                {"ê",            false, "带音标的拉丁字母是内容（法语字幕里很常见）"},
+                {"。",           false, "全角句号按首字节算内容 —— **刻意保守**，见头文件"},
+                {u8"呃",         false, "汉字是内容"},
+                {"OK",           false, "「OK」是内容"},
+            };
+            for (const auto& c : ncs) {
+                const bool got = speechfilter::has_no_content(c.s);
+                if (got != c.want) ffail(c.why);
+            }
+
+            // ---- ② 套话黑名单 ----
+            struct HalluCase { const char* s; bool want; const char* why; };
+            const HalluCase hcs[] = {
+                {" Sous-titrage Société Radio-Canada", true,
+                 "真实会话里的原样：应命中黑名单"},
+                {" Sous-titrage ST' 501", true, "真实会话里的原样：应命中黑名单"},
+                {"Sous-titrage Société Radio-Canada", true, "去掉前导空格也应命中"},
+                {"SOUS-TITRAGE", true, "大小写不敏感"},
+                {"Thanks for watching!", true, "平台推广语应命中"},
+                {"Please subscribe to the channel", true, "平台推广语应命中"},
+                {"Amara.org", true, "经典幻觉应命中"},
+                {u8"字幕由 XX 字幕组制作", true, "中文字幕组署名应命中"},
+                {u8"谢谢观看", true, "中文侧套话应命中"},
+
+                // ⚠️ **反向：真人说的话绝不能被吃掉**（删真话比漏幻觉坏得多）
+                {"Where you go? 50 Franklin.", false, "电影里的正常对白被误判成幻觉"},
+                {"I don't drive Americans.", false, "正常对白被误判成幻觉"},
+                {"Americans make me sick.", false, "正常对白被误判成幻觉"},
+                {"Sing the national anthem!", false, "正常对白被误判成幻觉"},
+                {"Thank you.", false, "「Thank you」是真实对白，**绝不能**被当推广语"},
+                {u8"我们下周再看一下这个方案。", false, "正常中文句子被误判成幻觉"},
+                {u8"这件事由李经理负责跟进。", false, "正常中文句子被误判成幻觉"},
+                {"", false, "空串不是幻觉（由非内容那一关处理）"},
+            };
+            for (const auto& c : hcs) {
+                const bool got = speechfilter::is_boilerplate_hallucination(c.s);
+                if (got != c.want) {
+                    // 失败时把**归一化之后的样子**一起打出来：黑名单是一条条字符串，
+                    // 拼错了不会报错、只会安静地不干活（我自己就写错过一次），
+                    // 所以宁可把中间结果摊开。
+                    std::cerr << "    [命中检查] raw=[" << c.s << "] norm=["
+                              << speechfilter::normalize_for_compare(c.s)
+                              << "] got=" << got << " want=" << c.want << std::endl;
+                    ffail(c.why);
+                }
+            }
+
+            // ---- ③ 归一化只有一份（黑名单、回显、重复抑制共用）----
+            {
+                if (speechfilter::normalize_for_compare("Sous-titrage") !=
+                    speechfilter::normalize_for_compare("SOUS TITRAGE")) {
+                    ffail("归一化没有忽略大小写/标点");
+                }
+            }
+
+            std::cout << "[SelfTest] 识别垃圾过滤（非内容/套话幻觉/不误伤真实对白）: "
+                      << (f_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+            if (!f_ok) { std::cerr << "    " << f_why << std::endl; return 1; }
         }
 
         // 【这里刻意不写"共 N 例"】原来写死了 `"✅ 11 例通过"`，

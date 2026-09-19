@@ -1,4 +1,5 @@
 #include "SpeechEngine.h"
+#include "SpeechFilter.h"   // 归一化 + 幻觉黑名单 + 非内容判据（可单测）
 #include <algorithm>
 #include <cctype>
 #include <iostream>
@@ -20,27 +21,9 @@ constexpr int    kRepeatReject = 2;
 constexpr size_t kRepeatMinLen = 6;    // 规范化后至少这么长才做重复判定
 constexpr size_t kRepeatMaxLen = 60;   // 太长的句子即使重复也更可能是真实内容
 
-// 规范化：只保留字母数字与多字节字符，去掉空白标点并转小写。
-// 用于「识别结果 vs 术语提示」和「跨段重复」两种比较。
-std::string normalize_for_compare(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (size_t i = 0; i < s.size(); ) {
-        const unsigned char c = static_cast<unsigned char>(s[i]);
-        if (c < 0x80) {
-            if (std::isalnum(c)) out += static_cast<char>(std::tolower(c));
-            ++i;
-        } else {
-            size_t len = 1;
-            if      ((c & 0xE0) == 0xC0) len = 2;
-            else if ((c & 0xF0) == 0xE0) len = 3;
-            else if ((c & 0xF8) == 0xF0) len = 4;
-            out += s.substr(i, len);
-            i += len;
-        }
-    }
-    return out;
-}
+// 归一化 + 垃圾判据都搬去了 SpeechFilter（那边能单测）。
+// 这里只留一个 using，让下面的调用点读起来不变。
+using speechfilter::normalize_for_compare;
 
 // 按空白切词
 std::vector<std::string> split_words_ws(const std::string& s) {
@@ -326,9 +309,23 @@ void SpeechEngine::run_inference_loop() {
 			q.confidence = (n_tok > 0) ? (sum_p / static_cast<double>(n_tok)) : -1.0;
 			q.no_speech  = (n_seg > 0) ? (sum_ns / static_cast<double>(n_seg)) : 0.0;
 
-			// ---- 幻觉过滤 ----
+			// ---- 幻觉 / 非内容过滤 ----
+			//
+			// ⚠️ **顺序即判据强度**：把"不需要用到模型自报指标"的两条放在最前面。
+			// 真实会话（2026-09-19）暴露了下面两条概率阈值会**系统性漏掉**
+			// "自信的幻觉"（`¶¶` conf 0.70~0.79、`Sous-titrage…` conf 0.75~0.81），
+			// 所以现在先看"这句话本身是不是内容"，再看模型自报的概率。
 			if (!combined_text.empty()) {
-				if (is_prompt_echo(combined_text)) {
+				if (speechfilter::has_no_content(combined_text)) {
+					// ` ¶¶` / ` ...` —— 一个字母/汉字都没有，不可能是内容。
+					// 这类段以前**每一段都被送去翻译了一次**，再原样进交付物。
+					q.rejected = true;
+					q.reject_reason = "整段没有任何字母/汉字（符号或空白，疑似音乐/静音）";
+				} else if (speechfilter::is_boilerplate_hallucination(combined_text)) {
+					// Whisper 的套话幻觉。**置信度对这类完全无效**（见函数注释）。
+					q.rejected = true;
+					q.reject_reason = "命中 Whisper 套话幻觉黑名单（字幕组署名/平台推广语）";
+				} else if (is_prompt_echo(combined_text)) {
 					// 模型在"续写术语提示词"，不是识别音频
 					q.rejected = true;
 					q.reject_reason = "疑似续写 initial_prompt（术语提示被回显）";

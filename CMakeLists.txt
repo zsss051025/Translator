@@ -33,6 +33,7 @@ add_executable(Translator
 	src/miniaudio_impl.cpp
 	src/audio_capture.cpp
 	src/SpeechEngine.cpp
+	src/SpeechFilter.cpp
 	src/ITranslator.cpp
 	src/DeepSeekTranslator.cpp
 	src/HunyuanTranslator.cpp
