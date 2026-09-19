@@ -20,6 +20,7 @@
 #include "Evidence.h"
 #include "SpeechFilter.h"
 #include "LangPolicy.h"
+#include "UtteranceMerge.h"
 #include "CommonWords.h"
 #include "ModelLog.h"
 #include "SessionStore.h"
@@ -6109,6 +6110,118 @@ static int run_selftest(const AppConfig& cfg) {
             std::cout << "[SelfTest] 语言策略（锁定要快/切换要慢/候选打断清零）: "
                       << (l_ok ? "✅ 通过" : "❌ 失败") << std::endl;
             if (!l_ok) { std::cerr << "    " << l_why << std::endl; return 1; }
+        }
+
+        // ㉚ **残句合并**
+        //
+        // 【这一组钉的是"残句被翻译替它补全"】用户原话：
+        //   「被切碎的语句翻译出来就四不像了」。真实数据里：
+        //     原文 `You get to get in a`     → 「你可以亲自体验一下。」
+        //     原文 `English people actually` → 「实际上，英国人也确实如此。」
+        //
+        // ⚠️ 最该守住的一条是**最后那条断言**：等不到下一段时必须吐出来。
+        //    它只在"收尾/静默"路径上发生，平时跑一百场都看不出来 ——
+        //    漏了就是"最后一句永远不翻译"。
+        {
+            using uttermerge::Joiner;
+            bool m_ok = true;
+            std::string m_why;
+            auto mfail = [&](const std::string& m) {
+                m_ok = false;
+                if (m_why.empty()) m_why = m;
+            };
+
+            // ---- ① looks_incomplete：只认明确的悬空尾巴 ----
+            struct IncCase { const char* s; bool want; const char* why; };
+            const IncCase ics[] = {
+                // 真实数据里的残句（都必须认出来）
+                {"You get to get in a", true, "「…get in a」以冠词结尾，是残句"},
+                {"and I'm", true, "「and I'm」以助动词结尾，是残句"},
+                {"I know you probably don't understand how", true,
+                 "「…understand how」以疑问词结尾，是残句"},
+                {"So when your car is packed it means that", true,
+                 "「…means that」以 that 结尾，是残句"},
+                {"let's look at our two", true, "以数词结尾，后面一定还有词"},
+                {"but we've only been on the road for 10 minutes no but I", true,
+                 "以人称代词结尾，是残句"},
+                // 完整句/正常短句（**绝不能**被当成残句，否则会合并错）
+                {"Thank you.", false, "有终止标点"},
+                {"Road Trip.", false, "有终止标点"},
+                {"Ask not what your country can do for you,", true,
+                 "以逗号结尾 → 判残句（弱信号但稳赚：jfk 上它和下一段合起来正是完整那句）"},
+                {u8"接口文档需要重写，", true, "中文以逗号结尾同样判残句"},
+                {"Americans make me sick.", false, "完整句"},
+                {"", false, "空串"},
+                {u8"我们下周再看一下这个方案。", false, "中文有终止标点"},
+                {u8"这件事由李经理负责", false,
+                 "中文没有终止标点也**不判残句**（Whisper 对中文常不打标点，判了会合并错）"},
+                {u8"没有终止标点的正常中文句子", false, "同上：中文侧保守放过"},
+                {"Listen as a husband and wife", false,
+                 "名词结尾不判残句 —— 收进来会合并得太多（已知取舍）"},
+            };
+            for (const auto& c : ics) {
+                const bool got = uttermerge::looks_incomplete(c.s);
+                if (got != c.want) mfail(c.why);
+            }
+
+            // ---- ② 拼接：中文不加空格 ----
+            if (uttermerge::join_text(u8"凤凰项目", u8"的接口文档") != u8"凤凰项目的接口文档")
+                mfail("中文之间被加了空格");
+            if (uttermerge::join_text("Ask not", "what your country") !=
+                "Ask not what your country")
+                mfail("英文之间没加空格");
+
+            // ---- ③ 合并：残句等下一段 ----
+            {
+                Joiner j;
+                // 完整句 → 立刻可译
+                if (j.push("Thank you.", 0.0) != "Thank you.") mfail("完整句被攒住了");
+                // 残句 → 攒着（返回空）
+                if (!j.push("You get to get in a", 1.0).empty()) mfail("残句没被攒住");
+                if (!j.holding()) mfail("残句没有进入持有状态");
+                // 下一段到了 → 合并成一句吐出来
+                const std::string out = j.push("car with your family and drive on a vacation.", 1.2);
+                if (out != "You get to get in a car with your family and drive on a vacation.")
+                    mfail("残句与下一段没有正确合并，实际：" + out);
+                if (j.holding()) mfail("吐出之后没有清空持有状态");
+            }
+
+            // ---- ④ 超时：说话人停下了，必须吐出来 ----
+            {
+                Joiner j;
+                (void)j.push("and I'm", 10.0);
+                if (!j.poll(10.5).empty()) mfail("还没到超时就吐了");
+                const std::string out = j.poll(10.0 + uttermerge::kHoldTimeoutSec);
+                if (out != "and I'm") mfail("超时后没有吐出攒着的残句");
+                if (j.holding()) mfail("超时吐出后没有清空");
+            }
+
+            // ---- ⑤ **收尾必须冲刷**（最容易漏的一条）----
+            {
+                Joiner j;
+                (void)j.push("and I'm", 0.0);
+                const std::string out = j.flush();
+                if (out != "and I'm")
+                    mfail("会话结束时没有冲刷攒着的残句 —— 漏了就是「最后一句永远不翻译」");
+                if (j.holding()) mfail("冲刷之后没有清空");
+                // 冲刷之后再 push，不该把上一轮的东西带出来
+                if (j.push("Got it.", 1.0) != "Got it.")
+                    mfail("冲刷之后的第一句被上一轮的状态污染了");
+            }
+
+            // ---- ⑥ 上限：不能无限攒下去 ----
+            {
+                Joiner j;
+                (void)j.push("and I'm", 0.0);       // 1
+                (void)j.push("so", 0.1);            // 2（合并后仍悬空）
+                (void)j.push("but", 0.2);           // 3（到上限）
+                if (j.holding())
+                    mfail("攒到上限了还不出字幕（说话人断断续续时字幕会一直不出来）");
+            }
+
+            std::cout << "[SelfTest] 残句合并（悬空判定/合并/超时吐出/收尾冲刷/上限）: "
+                      << (m_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+            if (!m_ok) { std::cerr << "    " << m_why << std::endl; return 1; }
         }
 
         // 【这里刻意不写"共 N 例"】原来写死了 `"✅ 11 例通过"`，
