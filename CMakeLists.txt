@@ -44,6 +44,7 @@ add_executable(Translator
 	src/CommonWords.cpp
 	src/CandidateTriage.cpp
 	src/TriageCache.cpp
+	src/ActionStore.cpp
 	src/ModelLog.cpp
 	src/KnowledgeExtract.cpp
 	src/Utf8.cpp

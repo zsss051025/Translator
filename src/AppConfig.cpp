@@ -119,6 +119,19 @@ AppConfig AppConfig::from(int argc, char** argv) {
                 cfg.tools_list_only = false;
             }
         }
+        else if (arg == "--actions")       cfg.show_actions = true;
+        else if (arg == "--status")        next(cfg.actions_status);
+        // --done/--doing/--todo 三个都是"把某条 action 改成这个状态"。
+        // 合成一个分支是因为它们除了目标值之外完全一样 —— 写三遍就是三处要走散。
+        else if (arg == "--done" || arg == "--doing" || arg == "--todo") {
+            cfg.action_set_to = arg.substr(2);   // 去掉开头的 "--"
+            try {
+                if (i + 1 < argc) cfg.action_set_id = std::stoll(argv[++i]);
+            } catch (const std::exception&) {
+                std::cerr << "[Config] " << arg << " 需要一个数字 id" << std::endl;
+                cfg.action_set_id = -1;
+            }
+        }
         else if (arg == "--args")          next(cfg.tools_args);
         else if (arg == "--ask")           cfg.ask_mode = AppConfig::AskMode::Always;
         else if (arg == "--no-ask")        cfg.ask_mode = AppConfig::AskMode::Never;

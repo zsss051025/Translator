@@ -11,6 +11,10 @@ struct sqlite3_stmt;
 // 只有前向声明 —— 这里不 include TriageCache.h，避免和它互相依赖。
 namespace triage { class TriageCache; }
 
+// 行动项（actions / action_sessions 两张表，5.5）同理复用这个连接 ——
+// 它必须和会话在**同一个文件**里，因为"这个任务出自哪几场"要 JOIN sessions 才算得出来。
+namespace actions { class ActionStore; }
+
 // 一条翻译记录（一场会话里的一句话）
 struct Segment {
     long long   id = 0;
@@ -122,6 +126,11 @@ private:
     //    于是编译期一路 C2248，报的还是"无法访问 private 成员"，
     //    看不出是 friend 写错了命名空间（这个坑当场踩了一次，记在这里）。
     friend class triage::TriageCache;
+
+    // 行动项同理（actions / action_sessions 表）。
+    // ⚠️ 这里能 friend 的**只有类**：`ActionStore` 的判同函数是命名空间里的自由函数，
+    //    它们拿不到 db_，所以刻意做成纯函数（不碰库）—— 见 ActionStore.h 的说明。
+    friend class actions::ActionStore;
 
     bool ensure_schema();           // 建表 + 预编译语句
 

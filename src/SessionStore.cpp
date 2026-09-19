@@ -102,8 +102,13 @@ const char* kSchemaCore =
     "CREATE INDEX IF NOT EXISTS idx_khistory_kid ON knowledge_history(knowledge_id);"
 
     // 行动项（跨会话追踪）
+    //
+    // 【5.5 之前这张表是死的】DDL 一直在，但**没有任何代码写它**（永远 0 行）。
+    // 行动项只在生成交付物时在内存里存在一次，然后写进 actions.csv 就没了 ——
+    // 于是"跨会话追踪"（原 2.8）根本没有落点：上周说要做的事，这周没人记得。
     "CREATE TABLE IF NOT EXISTS actions ("
     "  id             INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  key            TEXT NOT NULL DEFAULT '',"       // normalize_title(title)：判"是不是同一件事"的键
     "  title          TEXT NOT NULL,"
     "  owner          TEXT NOT NULL DEFAULT '',"
     "  due            TEXT NOT NULL DEFAULT '',"
@@ -111,10 +116,41 @@ const char* kSchemaCore =
     "  source_session INTEGER,"
     "  source_seq     INTEGER,"
     "  confidence     REAL NOT NULL DEFAULT -1.0,"
+    "  origin         TEXT NOT NULL DEFAULT 'summary'," // summary | agent | user（谁写进来的）
+    "  evidence       TEXT,"                            // 来源原话（5.7 Evidence 的落点）
     "  created_at     TEXT NOT NULL,"
     "  updated_at     TEXT NOT NULL"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status);"
+    // ⚠️ **这里刻意不建 `idx_actions_key`。**
+    //
+    // 它是 5.5 新加的列上的索引，而 `CREATE TABLE IF NOT EXISTS` 对**已存在**的表
+    // 是空操作 —— 老库的 actions 表没有 `key` 列，于是这条 CREATE INDEX 会报
+    // `no such column: key`，**整个 schema 批次失败、库直接打不开**。
+    // 我在真实库上跑第一次就撞了这个（`[DB] schema failed: no such column: key`）——
+    // 也就是说这个错误一旦发出去，用户的历史库就再也打不开了。
+    // 索引改建在**补列之后**，见文件下半部分 ensure_schema 的 fixups 段末尾。
+
+    // 行动项 × 会话 的**只追加台账**（跨会话聚合的骨架）。
+    //
+    // 【为什么必须单独一张表，而不是在 actions 上放个 seen_count 计数器】
+    // "这个任务在几场会话里被提到"必须**幂等**：同一场会话重新导出一次交付物
+    // 就会再 ingest 一次，用计数器的话 seen_count 会凭空涨 ——
+    // 而那个数字是要给用户看的（"上周提到过、这周又提了"），
+    // 涨错了就是"给用户看的数字是假的"（这个错本项目已经犯过两次：
+    // 抽取器计数、hits+1）。用 (action_id, session_id) 主键的台账，
+    // 重复 ingest 是 INSERT OR IGNORE，天然幂等。
+    //
+    // 它还直接就是 5.7 Evidence 要的东西："这条结论出自哪几场、哪一段"。
+    "CREATE TABLE IF NOT EXISTS action_sessions ("
+    "  action_id     INTEGER NOT NULL,"
+    "  session_id    INTEGER NOT NULL,"
+    "  first_seq     INTEGER,"                          // 第一次出现在这一场的第几段
+    "  evidence      TEXT,"                             // 这一场里的那句话说
+    "  first_seen_at TEXT NOT NULL,"
+    "  PRIMARY KEY (action_id, session_id)"
+    ");"
+    "CREATE INDEX IF NOT EXISTS idx_asessions_sid ON action_sessions(session_id);"
 
     // 判断缓存（步骤 2.12）。**判决不是知识** —— 所以它单独一张表，
     // 两头都不挨：不进 knowledge，也不从 knowledge 读。
@@ -281,6 +317,13 @@ bool SessionStore::ensure_schema() {
             // 老库不会有报错，只是"用户教会它的东西无处可存"，
             // 表现为问完定义之后 `--terms` 里什么都没有。
             {"knowledge", "definition",    "ALTER TABLE knowledge ADD COLUMN definition TEXT;"},
+            // 5.5：行动项落库需要的三列。**老库的 actions 表一定没有它们** ——
+            // 因为 5.5 之前那张表一行都没写过，谁也不会发现它缺列。
+            // 缺 `key` 的后果最隐蔽：聚合判同全靠它，没有这一列的话
+            // 每条行动项都算新任务，同一件事在每周的会上各出现一次。
+            {"actions",   "key",           "ALTER TABLE actions ADD COLUMN key TEXT NOT NULL DEFAULT '';"},
+            {"actions",   "origin",        "ALTER TABLE actions ADD COLUMN origin TEXT NOT NULL DEFAULT 'summary';"},
+            {"actions",   "evidence",      "ALTER TABLE actions ADD COLUMN evidence TEXT;"},
         };
         for (const auto& fx : fixes) {
             const std::string pragma = std::string("PRAGMA table_info(") + fx.table + ");";
@@ -305,6 +348,30 @@ bool SessionStore::ensure_schema() {
                 std::cerr << "[DB] 补列失败 " << fx.table << "." << fx.column
                           << ": " << (alt_err ? alt_err : "?") << std::endl;
                 if (alt_err) sqlite3_free(alt_err);
+                return false;
+            }
+        }
+
+        // ---- 补完列之后才能建的索引（5.5）----
+        //
+        // 【为什么必须放在这里，而不是上面的 schema 批次里】
+        // 它依赖 `actions.key` 这一列，而那一列在老库上是**刚刚才补上**的。
+        // 索引建在 schema 批次里的话，老库打开时那条 CREATE INDEX 会报
+        // `no such column: key` → **整个 schema 失败 → 库打不开**。
+        // 第一次在真实库上跑就撞了这个。顺序是：先补列，后建索引。
+        //
+        // ⚠️ 顺带记一条通用规则：**任何"依赖新列的 DDL"都不能放进
+        //    `CREATE TABLE IF NOT EXISTS` 那个批次** —— 因为那个批次在
+        //    老库上跑的时候，表还是旧的形状。这和"加列要另走 ALTER TABLE"
+        //    是同一件事的两半。
+        {
+            char* idx_err = nullptr;
+            if (sqlite3_exec(db_, "CREATE INDEX IF NOT EXISTS idx_actions_key "
+                                  "ON actions(key);",
+                             nullptr, nullptr, &idx_err) != SQLITE_OK) {
+                std::cerr << "[DB] 建 actions(key) 索引失败: "
+                          << (idx_err ? idx_err : "?") << std::endl;
+                if (idx_err) sqlite3_free(idx_err);
                 return false;
             }
         }

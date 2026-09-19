@@ -39,7 +39,8 @@ DB = os.path.join(ROOT, r"build\RelWithDebInfo\t.db")
 OUT_DIR = os.path.join(ROOT, "deliverables")
 
 EXPECTED = ["search_knowledge", "knowledge_history", "list_sessions",
-            "get_session", "get_session_report"]
+            "get_session", "get_session_report", "list_actions",
+            "propose_knowledge", "propose_action"]
 
 failures = []
 
@@ -111,6 +112,8 @@ def main():
         ("list_sessions", {"days": 3650, "limit": 5}, "场会话"),
         ("get_session", {"session_id": 42, "max_segments": 3}, "段转录"),
         ("get_session_report", {"session_id": 42}, "纪要"),
+        ("list_actions", {}, "行动项"),
+        ("list_actions", {"status": "todo", "limit": 5}, "行动项"),
     ]
     print("\n=== 真跑 ===")
     for name, args, expect_sub in cases:
@@ -178,6 +181,55 @@ def main():
         print(f"  不存在的会话 → rc={rc} 错误='{obj.get('error')}'")
     except Exception as e:                                     # noqa: BLE001
         failures.append(f"不存在会话路径没返回 JSON: {e}")
+
+    # propose_action 缺 title / title 过长 → 必须回一句话，不能写库
+    rc, out, _ = call_tool("propose_action", {})
+    try:
+        obj = json.loads(extract_json(out))
+        print(f"  propose_action 缺 title → rc={rc} 错误='{obj.get('error')}'")
+        if rc == 0:
+            failures.append("propose_action 缺 title 却报成功")
+    except Exception as e:                                     # noqa: BLE001
+        failures.append(f"propose_action 缺参数路径没返回 JSON: {e}")
+
+    # ---- 5) propose_action 真写 + 幂等（5.5）----
+    #
+    # 【为什么这条要跨进程验】"写进去"和"再写一次不重复"是两件事，
+    # 而后者只有真的落库再落一次才看得出来（内存里的行为可以完全正常）。
+    # 用**固定标题**，所以重复跑这个脚本不会在库里堆垃圾。
+    print("\n=== propose_action 落库与幂等 ===")
+    probe = "ZZ toolcheck probe 行动项"
+    rc1, out1, _ = call_tool("propose_action", {"title": probe, "evidence": "工具层自检"})
+    rc2, out2, _ = call_tool("propose_action", {"title": probe, "evidence": "工具层自检"})
+    try:
+        o1 = json.loads(extract_json(out1))
+        o2 = json.loads(extract_json(out2))
+        print(f"  第一次: rc={rc1} inserted={o1.get('inserted')} merged={o1.get('merged')}")
+        print(f"  第二次: rc={rc2} inserted={o2.get('inserted')} merged={o2.get('merged')}")
+        if rc1 != 0 or rc2 != 0:
+            failures.append("propose_action 真写失败")
+        # 第二次必须是"并入已有"（inserted=0），这是幂等在返回值上的样子
+        if o2.get("inserted") != 0 or o2.get("merged") != 1:
+            failures.append(f"propose_action 第二次应为「并入已有」，实际 {o2}")
+    except Exception as e:                                     # noqa: BLE001
+        failures.append(f"propose_action 落库路径没返回 JSON: {e}")
+
+    # 同一个标题必须只对应一条（幂等的可观测面）
+    rc, out, _ = call_tool("list_actions", {"limit": 80})
+    try:
+        obj = json.loads(extract_json(out))
+        hits = [i for i in obj.get("items", []) if i.get("title") == probe]
+        print(f"  列表里同名条目: {len(hits)} 条（应为 1）")
+        if len(hits) != 1:
+            failures.append(f"propose_action 不幂等：同名条目 {len(hits)} 条")
+        elif hits[0].get("origin") != "agent":
+            failures.append(f"agent 提议的行动项 origin 应为 agent，实际 "
+                            f"{hits[0].get('origin')!r}")
+        elif hits[0].get("status") != "todo":
+            failures.append(f"agent 提议的行动项状态必须是 todo，实际 "
+                            f"{hits[0].get('status')!r}")
+    except Exception as e:                                     # noqa: BLE001
+        failures.append(f"list_actions 核对幂等时失败: {e}")
 
     print()
     if failures:

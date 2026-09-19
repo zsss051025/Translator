@@ -147,6 +147,18 @@ struct AppConfig {
     std::string triage_forget;   // 非空 = 忘掉这一个词
     bool        triage_clear = false;
 
+    // --actions                    列出行动项（跨会话聚合后的总表）
+    // --actions --status todo      只看某一档
+    // --actions --done <id>        标记完成（--doing / --todo 同理）
+    //
+    // 【为什么状态流转是命令行而不是 agent 工具】见 ActionStore.h 的说明：
+    // "做完了吗"是**只有用户知道的事实**。模型从一句话推断出 done，
+    // 代价是那条任务**静默从待办列表里消失** —— 用户看不见它消失。
+    bool        show_actions = false;
+    std::string actions_status;       // 过滤（todo/doing/done，空 = 全部）
+    long long   action_set_id = -1;   // 要改状态的 id
+    std::string action_set_to;        // 改成什么
+
     // --glossary <文件>：术语表（每行一个词/短语，# 为注释）。
     // 内容会作为 initial_prompt 喂给 Whisper，让专有名词识别更稳定。
     std::string glossary_path;

@@ -1,4 +1,4 @@
-﻿#include "AgentTool.h"
+#include "AgentTool.h"
 
 #include <algorithm>
 #include <chrono>
@@ -11,6 +11,7 @@
 
 #include "KnowledgeExtract.h"
 #include "KnowledgeStore.h"
+#include "ActionStore.h"        // list_actions / propose_action（5.5）
 #include "SessionStore.h"
 #include "Utf8.h"
 #include "json.hpp"
@@ -39,6 +40,8 @@ constexpr int    kGetSessionDefaultSegs = 30;
 constexpr size_t kSegmentChars       = 400;     // 单段原文+译文的上限
 constexpr size_t kReportChars        = 6000;    // 整份纪要的上限
 constexpr size_t kResultChars        = 12000;   // 任何工具结果的硬上限（最后一道闸）
+constexpr int    kListActionsMax     = 80;      // 行动项条数上限
+constexpr size_t kProposeActionMaxTitle = 400;  // 一条行动项的标题上限（字节）
 
 // 当前本地时间，格式与 SessionStore::now_string() 一致：
 // "YYYY-MM-DD HH:MM:SS.mmm"。**这个格式按字典序比较 = 按时间比较**，
@@ -423,6 +426,120 @@ ToolResult tool_propose_knowledge(const std::string& args_json, const ToolContex
 
 }  // namespace
 
+// ---- list_actions：跨会话的待办总表（5.5）----
+//
+// 【为什么这个工具对"生成周报"是必需的】周报的核心内容之一就是
+// "上周定的事这周怎么样了"。这件事的状态**只存在于这张表里** ——
+// 转录里只有零散的句子，读 5 场转录去自己拼"哪些事一直挂着"既贵又不准。
+static ToolResult tool_list_actions(const std::string& args_json,
+                                    const ToolContext&, std::string* err) {
+    (void)err;
+    const json args = json::parse(args_json);
+
+    const std::string status = str_arg(args, "status");
+    if (!status.empty() &&
+        std::find(actions::valid_statuses().begin(), actions::valid_statuses().end(),
+                  status) == actions::valid_statuses().end()) {
+        return fail("status 只能是 todo / doing / done");
+    }
+    const int limit = int_arg(args, "limit", 30, 1, kListActionsMax);
+
+    const auto rows = actions::ActionStore::list(status, limit);
+    if (rows.empty()) {
+        // ⚠️ **空结果也必须是 JSON。**
+        // 第一版这里返回的是一句中文散文 —— 于是跨进程回归立刻报
+        // `list_actions({}) 结果不是合法 JSON`。而"工具结果必须是 JSON"
+        // 不是格式洁癖：模型那边的解析器期待的是 JSON，散文会让它
+        // 把工具结果当内容读，而这**只在"库是空的"这一天**发作 ——
+        // 也就是最不容易被自己撞到的时刻。空列表 + 一句 note 才对。
+        const auto st = actions::ActionStore::stats();
+        const std::string why = st.total == 0
+            ? u8"行动项表是空的。行动项是在**导出交付物**时自动落库的，"
+              u8"所以如果还没有导出过任何一场会，这里就没有内容 —— "
+              u8"这种情况下改用 get_session 读转录，从里面自己找待办。"
+            : (u8"没有" + (status.empty() ? std::string(u8"任何") : status)
+               + u8"状态的行动项（表里共 " + std::to_string(st.total) + u8" 条）。");
+        ToolResult r;
+        r.ok      = true;
+        r.content = json_dump(json{{"count", 0}, {"items", json::array()},
+                                   {"note", why}});
+        r.audit   = u8"读行动项：0 条";
+        return r;
+    }
+
+    json arr = json::array();
+    for (const auto& it : rows) {
+        arr.push_back({
+            {"id", it.id},
+            {"status", it.status},
+            {"title", it.title},
+            {"owner", it.owner},
+            {"due", it.due},
+            // 跨会话的痕迹 —— "这件事一直挂着"唯一有据可依的表述
+            {"seen_sessions", it.seen_sessions},
+            {"last_session", it.last_session},
+            {"origin", it.origin},
+            {"evidence", utf8::truncate(it.evidence, 200)},
+        });
+    }
+    ToolResult r;
+    r.ok      = true;
+    r.content = json_dump(json{{"count", rows.size()}, {"items", arr},
+                               {"note", u8"你只能读；改状态要用户自己做（--actions --done <id>）"}});
+    r.audit   = u8"读行动项：" + std::to_string(rows.size()) + u8" 条";
+    return r;
+}
+
+// ---- propose_action：提议一条行动项（5.5 的写工具）----
+//
+// 【为什么它和 propose_knowledge 的"闸"不一样】
+// 知识走的是 candidate → 用户确认 → 才生效（§6.5 红线：模型猜的不能变成约束）。
+// 行动项**没有那条红线** —— 它不进识别提示、不进翻译约束，
+// 提议错了的代价只是"待办列表里多一条"，而那条**就摆在 `--actions` 里**
+// 等用户自己删或标完成。所以它可以真写进去。
+// 但它带 `origin='agent'` + confidence 0.5（压低），
+// 于是"模型提议的"和"会上真说的"在列表里能分得清。
+//
+// ⚠️ **状态一律 todo**：agent 不能替用户宣称某件事做完了（见 ActionStore.h）。
+static ToolResult tool_propose_action(const std::string& args_json,
+                                      const ToolContext&, std::string* err) {
+    (void)err;
+    const json args = json::parse(args_json);
+
+    const std::string title = str_arg(args, "title");
+    if (title.empty()) return fail(u8"缺少参数 title");
+    if (title.size() > kProposeActionMaxTitle) {
+        return fail(u8"title 太长 —— 行动项应该是一句话，不是一整段");
+    }
+
+    actions::Incoming in;
+    in.title    = title;
+    in.owner    = str_arg(args, "owner");
+    in.due      = str_arg(args, "due");
+    in.evidence = str_arg(args, "evidence");
+
+    // session_id 用 -1：**这条不是从某场会话里抽出来的**，是 agent 归纳的。
+    // 传个假会话号会让"出自哪几场"变成假话，而那个数字是要给用户看的。
+    const auto oc = actions::ActionStore::ingest(-1, {in}, nullptr, "agent", 0.5);
+    if (!oc.err.empty()) return fail(u8"写入失败：" + oc.err);
+
+    ToolResult r;
+    r.ok = true;
+    // 同上：成功路径也一律 JSON，别因为"这次只是并入已有条目"就换成散文。
+    r.content = json_dump(json{
+        {"inserted", oc.inserted},
+        {"merged",   oc.merged},
+        {"title",    title},
+        {"status",   "todo"},
+        {"note", oc.inserted
+            ? u8"已记下（状态 todo，来源标记 agent，用户会在待办列表里看到它）"
+            : u8"这条已经在列表里了（并入已有条目，没有重复添加）"},
+    });
+    r.audit   = oc.inserted ? (u8"新增行动项「" + title + u8"」")
+                            : (u8"行动项已存在「" + title + u8"」");
+    return r;
+}
+
 void register_readonly_tools(ToolRegistry& reg) {
     std::string err;
     auto add = [&](Tool t) {
@@ -481,6 +598,22 @@ void register_readonly_tools(ToolRegistry& reg) {
     });
 
     add({
+        "list_actions",
+        "读**跨会话来袭的任务清单**（待办/进行中/已完成），带负责人、截止、以及"
+        "“这件事在几场会话里被提到过”。\n"
+        "**做周报、月报、进度汇报时必须先看它** —— “上周定的事这周怎么样了”"
+        "只有这张表里有；一场一场去读转录既慢又会漏。\n"
+        "你只能读。**改状态要用户自己来做**（--actions --done <id>），"
+        "因为“做完了吗”是只有他知道的事实。",
+        R"({"type":"object","properties":{
+            "status":{"type":"string","enum":["todo","doing","done"],
+                      "description":"只看某一档；不填 = 全部"},
+            "limit":{"type":"integer","description":"最多返回几条，默认 30，最大 80"}
+        }})",
+        tool_list_actions,
+    });
+
+    add({
         "get_session_report",
         "读某场会话**已经生成过的**纪要（markdown，含概述/要点/行动项/双语全文）。"
         "**整理历史工作时应优先用它**：又快又准，不用重新总结。"
@@ -516,6 +649,23 @@ void register_write_tools(ToolRegistry& reg) {
             "reason":{"type":"string","description":"为什么觉得它值得记（一句话）"}
         },"required":["value","kind"]})",
         tool_propose_knowledge,
+    });
+
+    add({
+        "propose_action",
+        "**提议**一条行动项（待办）记进跨会话清单。"
+        "当你在整理会议/任务时发现一件“明确该做、但还没在任何纪要里被记下”的事，用它。\n"
+        "⚠️ 和 propose_knowledge 不同：行动项**没有**用户确认环节，写进去就直接出现在"
+        "用户的待办列表里。所以**只在有明确依据时用** —— 依据写进 evidence，"
+        "用户会看到它，也会照着它判断该不该留着。\n"
+        "⚠️ 状态一律是 todo：你**不能**替用户宣称某件事做完了。",
+        R"({"type":"object","properties":{
+            "title":{"type":"string","description":"要做的事，一句话（如 重写凤凰项目的接口文档）"},
+            "owner":{"type":"string","description":"负责人（不确定就留空，不要猜）"},
+            "due":{"type":"string","description":"截止时间（不确定就留空，不要编）"},
+            "evidence":{"type":"string","description":"依据：哪句话/哪场会话让你认为有这件事"}
+        },"required":["title"]})",
+        tool_propose_action,
     });
 }
 

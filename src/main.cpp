@@ -16,6 +16,7 @@
 #include "SpeechEngine.h"
 #include "CandidateTriage.h"
 #include "TriageCache.h"
+#include "ActionStore.h"
 #include "CommonWords.h"
 #include "ModelLog.h"
 #include "SessionStore.h"
@@ -491,6 +492,46 @@ static DeliverableOutcome generate_deliverables(const AppConfig& cfg, long long 
         }
     }
 
+    // ---- 行动项落库 + 跨会话聚合（5.5）----
+    //
+    // 【为什么正好在这里】上面那个 `sanitize_actions` 是**三条摘要后端唯一的汇合点**
+    // （云端 / 本地 / 规则都要过它），所以校验完的行动项在这里就是"已经可信"的。
+    // 在这之后落库，意味着库里永远不会有"被校验器否掉的句子"。
+    //
+    // 【为什么不在 DeliverableWriter::write 里写】它刻意是**纯函数**
+    // （头文件写着"不访问数据库，便于单独测试"）。为了省一次调用破坏那个性质，
+    // 换来的是"交付物渲染需要数据库"，以后单独测渲染就必须先建库。
+    {
+        std::vector<actions::Incoming> inc;
+        inc.reserve(summary.actions.size());
+        for (const auto& a : summary.actions) {
+            actions::Incoming in;
+            in.title      = a.task;
+            in.owner      = a.owner;
+            in.due        = a.due;
+            in.evidence   = a.source;      // 来源原话 —— 5.7 Evidence 的落点
+            in.source_seq = a.seq;
+            inc.push_back(std::move(in));
+        }
+        if (!inc.empty()) {
+            // 判同器暂时不接模型：① 确定性层（同一个 key）已经能覆盖
+            // "上周说过的这周又提一次"这个主场景；② 接模型就要联网，
+            // 而这一步跑在**会话结束的收尾路径**上 —— 收尾路径必须离线可用。
+            // 留了接口（ingest 的 judge 参数），要接随时能接。
+            const auto oc = actions::ActionStore::ingest(sid, inc, nullptr, "summary");
+            if (oc.inserted || oc.merged || oc.linked) {
+                std::cout << "[行动项] 新建 " << oc.inserted << " 条，"
+                          << "并入已有 " << oc.merged << " 条"
+                          << "（本轮新增关联 " << oc.linked << " 条）" << std::endl;
+            }
+            if (!oc.err.empty()) {
+                // 落库失败**不能**让交付物生成失败：文件已经写好了，
+                // 行动项表只是附加的长期记忆。说清楚但继续。
+                std::cerr << "[行动项] 落库有问题: " << oc.err << std::endl;
+            }
+        }
+    }
+
     const auto res = DeliverableWriter::write(sid, segs, meta, summary, cfg.deliverable_dir);
     if (!res.ok) {
         out.error = res.error;
@@ -933,8 +974,16 @@ static int run_tools(const AppConfig& cfg) {
     ctx.deliverable_root = cfg.deliverable_dir;
 
     if (cfg.tools_list_only) {
+        // 【不要把这个数字写死】原来写的是"5 个只读 + 1 个「提议」"，
+        // 加了两个行动项工具之后它还那么打 —— 又是一处**会撒谎的硬编码**。
+        // 总数用 reg.size()，两个分类从名字数出来，写死的只有"哪些算提议"这件事。
+        int n_write = 0;
+        for (const auto& n : reg.names()) {
+            if (n.rfind("propose_", 0) == 0) ++n_write;
+        }
         std::cout << "[Tools] 已注册 " << reg.size() << " 个工具"
-                     "（5 个只读 + 1 个「提议」；**提议只在 --report 派活时可用**）："
+                     "（" << (reg.size() - n_write) << " 个只读 + " << n_write
+                  << " 个「提议」；**提议只在 --report 派活时可用**）："
                   << std::endl;
         for (const auto& n : reg.names()) {
             const agent::Tool* t = reg.find(n);
@@ -1224,6 +1273,97 @@ static int run_triage_cache(const AppConfig& cfg) {
 
     std::cout << "\n[triage-cache] total=" << st.total
               << " reused=" << st.reused << std::endl;
+    return 0;
+}
+
+// --actions [--status X] [--done|--doing|--todo <id>]：行动项总表与状态流转（5.5）
+//
+// 【为什么需要一个"看"的入口】5.5 之前 `actions` 表**一行都没有过** ——
+// 行动项只在生成交付物时在内存里活一次就没了。所以"跨会话追踪"从来没有落点：
+// 上周会上定的事，这周没人记得。现在它落库了，就必须能被看见；
+// 否则"你的待办里有 3 件事一直挂着"这句话没有任何人能验证。
+//
+// 不加载任何模型，几秒出结果。
+static int run_actions(const AppConfig& cfg) {
+    using actions::ActionStore;
+    SessionStore::instance().init(cfg.db_path);
+
+    // ---- 状态流转（用户的操作）----
+    if (cfg.action_set_id >= 0 || !cfg.action_set_to.empty()) {
+        if (cfg.action_set_id < 0) {
+            std::cerr << "要改状态得给一个 id：--" << cfg.action_set_to
+                      << " <id>。先用 `--actions` 看 id。" << std::endl;
+            return 1;
+        }
+        std::string err;
+        if (!ActionStore::set_status(cfg.action_set_id, cfg.action_set_to, &err)) {
+            std::cerr << "改状态失败：" << err << std::endl;
+            return 1;
+        }
+        actions::Item it;
+        if (ActionStore::get(cfg.action_set_id, &it)) {
+            std::cout << "已把 #" << it.id << " 标成 " << it.status
+                      << "：「" << it.title << "」" << std::endl;
+        } else {
+            std::cout << "已把 #" << cfg.action_set_id << " 标成 "
+                      << cfg.action_set_to << "。" << std::endl;
+        }
+        return 0;
+    }
+
+    // ---- 列表 ----
+    const std::string filter = cfg.actions_status;
+    if (!filter.empty() &&
+        std::find(actions::valid_statuses().begin(), actions::valid_statuses().end(),
+                  filter) == actions::valid_statuses().end()) {
+        std::cerr << "未知状态「" << filter << "」（只能是 todo / doing / done）"
+                  << std::endl;
+        return 1;
+    }
+
+    const auto st = ActionStore::stats();
+    std::cout << "库: " << cfg.db_path << std::endl;
+    std::cout << "行动项: 共 " << st.total << " 条 —— "
+              << "待办 " << st.todo << " / 进行中 " << st.doing
+              << " / 已完成 " << st.done << std::endl;
+
+    if (st.total == 0) {
+        std::cout << "\n（空的）" << std::endl;
+        // 空的时候要解释为什么空 —— 否则用户分不清"没有行动项"
+        // 和"这个命令坏了 / 读错库了"。这正是 §1.3 说的"说话要有理由"。
+        std::cout << "行动项是在**导出交付物**时落库的（会话结束时自动导出）。" << std::endl;
+        std::cout << "所以：还没导出过任何一场会 → 这张表就是空的。" << std::endl;
+        std::cout << "可以试：Translator.exe --export <会话id> --summarizer rules --db "
+                  << cfg.db_path << std::endl;
+        return 0;
+    }
+
+    const auto rows = ActionStore::list(filter, 500);
+    std::cout << "\n" << (filter.empty() ? "全部" : filter) << "：" << rows.size()
+              << " 条" << std::endl;
+    for (const auto& a : rows) {
+        std::cout << "  #" << a.id << "  [" << a.status << "]  " << a.title;
+        if (!a.owner.empty()) std::cout << "   负责人: " << a.owner;
+        if (!a.due.empty())   std::cout << "   截止: " << a.due;
+        // "在几场会话里被提到"是跨会话聚合**唯一诚实的量化口径** ——
+        // 它来自台账（action_sessions），不是估算。
+        if (a.seen_sessions > 1) {
+            std::cout << "   （在 " << a.seen_sessions << " 场会话里被提到";
+            if (a.last_session > 0) std::cout << "，最近 #" << a.last_session;
+            std::cout << "）";
+        }
+        std::cout << std::endl;
+        if (!a.origin.empty() && a.origin != "summary") {
+            std::cout << "        来源: " << a.origin << std::endl;
+        }
+        if (!a.evidence.empty()) {
+            std::cout << "        原话: " << a.evidence << std::endl;
+        }
+    }
+
+    std::cout << "\n改状态：--actions --doing <id> / --done <id> / --todo <id>" << std::endl;
+    std::cout << "[actions] total=" << st.total << " todo=" << st.todo
+              << " doing=" << st.doing << " done=" << st.done << std::endl;
     return 0;
 }
 
@@ -2975,10 +3115,16 @@ static int run_selftest(const AppConfig& cfg) {
                     // ① 注册清单
                     const char* must_have[] = {"search_knowledge", "knowledge_history",
                                                "list_sessions", "get_session",
-                                               "get_session_report"};
-                    if (reg.size() != 5) {
+                                               "get_session_report", "list_actions"};
+                    // 数目跟着 must_have 走，不写死 —— 写死的数字在加工具时
+                    // 会以"测试失败"的形式提醒你，但更常见的是有人顺手把数字改大
+                    // 而不去想"新工具是不是也该有断言"。用数组长度则两者必然同步。
+                    const int want = static_cast<int>(sizeof(must_have) / sizeof(*must_have));
+                    if (reg.size() != want) {
                         a_ok = false;
-                        whya = "应注册 5 个工具，实际 " + std::to_string(reg.size());
+                        whya = "应注册 " + std::to_string(want) + " 个只读工具，实际 "
+                               + std::to_string(reg.size())
+                               + "（加了工具就往 must_have 里加一条）";
                     }
                     for (const char* n : must_have) {
                         if (!a_ok) break;
@@ -4979,6 +5125,210 @@ static int run_selftest(const AppConfig& cfg) {
             if (!c_ok) { std::cerr << "    " << cwhy << std::endl; return 1; }
         }
 
+        // ㉓ **行动项落库 + 跨会话聚合**（§7 步骤 5.5）
+        //
+        // 【为什么这一组必须存在】5.5 之前 `actions` 表**一行都没被写过**，
+        // 所以"落库"这条路从来没被任何测试或真跑碰过 —— 里面写错什么都不会有人发现。
+        // 而它有三个"错了会静默失败"的点：
+        //   ① 聚合判同（错了 → 同一件事攒成 N 条，或者两件事并成一条）
+        //   ② 幂等（错了 → 数字凭空涨，而那个数字是给用户看的）
+        //   ③ 状态不被重跑打回（错了 → 用户标好的 done 被下周的会打回 todo）
+        {
+            using actions::ActionStore;
+            using actions::Item;
+            bool a_ok = true;
+            std::string a_why;
+            auto afail = [&](const std::string& m) {
+                a_ok = false;
+                if (a_why.empty()) a_why = m;      // 第一条失败锁定
+            };
+
+            // ---- ① 纯函数：判同。**用的是演示数据里那三对真实句子** ----
+            //
+            // 需求原话要的就是"上周说的事这周还记得"，而这件事能不能成立
+            // 全押在这个判同函数上。所以用例直接用当时端到端跑出来的句子。
+            {
+                struct Pair { const char* a; const char* b; bool same; const char* why; };
+                const Pair ps[] = {
+                    // 同一件事，第二场多说了一句补充 → **必须合并**
+                    //（实测：第一版只有"key 完全相同"时这一对没合上，
+                    //   三场会攒出 8 条重复任务，聚合等于没做）
+                    {"凤凰项目的接口文档需要重写，这块张伟负责跟进。",
+                     "凤凰项目的接口文档需要重写，这个上周就说了，张伟负责跟进，这周五之前完成。",
+                     true, "同一任务加了一句补充，没被判成同一件事"},
+                    // 换了个说法、差异在**分句内部**的同一件事 → **不合并**。
+                    //
+                    // ⚠️ 这一条断言的是**已知的漏判**，不是"正确行为"。
+                    //    「另外李经理需要提交一份极光平台的压测报告。」
+                    //    「李经理需要提交一份压测报告，负责极光平台那部分。」
+                    //    这是同一件事，但相同片段「李经理需要提交一份」在两条里
+                    //    都不是分句结尾 —— 确定性规则认不出来。
+                    //    它交给可注入的判断器（模型）那一档。
+                    //
+                    // 【为什么断言 false 而不是把规则改松直到它变成 true】
+                    //    因为把规则改松就会顺手把上面「重写 vs 评审」也合掉，
+                    //    而那是**一条真待办从列表里消失**。两害相权：
+                    //    不合并 = 多一行（用户看得见）；错合并 = 少一条（看不见）。
+                    //    所以这条断言的作用是**把这个取舍钉住**：
+                    //    哪天有人想放松规则，他会先看到这条用例在说什么。
+                    {"另外李经理需要提交一份极光平台的压测报告。",
+                     "李经理需要提交一份压测报告，负责极光平台那部分。",
+                     false, "已知漏判：差异在分句内部的换说法没被合并 —— "
+                            "如果这条变成失败，说明有人放松了判同规则，"
+                            "请先确认「重写 vs 评审」那条还守得住"},
+                    // ⚠️ **这一对是最危险的一对**：用词极像，但是两件事。
+                    // 相似度阈值在这里必错（它一定判"很像"）；
+                    // 最初"连续相同 ≥8 字"的写法也错了 —— 这两条有 11 个字相同，
+                    // 自检当场报了出来。能分开它们的是"相同片段要在两边都
+                    // 落在分句结尾"：这里差异（重写/评审）落在**分句的谓语上**，
+                    // 也就是主干被改了，那是两件事。
+                    {"凤凰项目的接口文档需要重写。",
+                     "凤凰项目的接口文档需要评审。",
+                     false, "两个不同任务（重写 vs 评审）被错误合并了"},
+                    {"需要在周五之前提交压测报告。",
+                     "需要在周五之前安排安全评审。",
+                     false, "同前缀的两个不同任务被错误合并了"},
+                    // 空键不参与判同（不能因为"两条都算不出键"就把它们并起来）
+                    {"", "随便什么内容", false, "空标题被当成了同一件事"},
+                };
+                for (const auto& p : ps) {
+                    Item ia, ib;
+                    ia.key = actions::normalize_title(p.a); ia.title = p.a;
+                    ib.key = actions::normalize_title(p.b); ib.title = p.b;
+                    const bool got = actions::same_thing(ia, ib);
+                    if (got != p.same) afail(p.why);
+                }
+            }
+
+            // ---- ② 归一化要忽略大小写/标点/空白 ----
+            {
+                if (actions::normalize_title("Rewrite  the  API docs!") !=
+                    actions::normalize_title("rewrite the api docs")) {
+                    afail("归一化没有忽略大小写/多余空白/末尾标点");
+                }
+                if (actions::normalize_title(u8"重写接口文档。") !=
+                    actions::normalize_title(u8"重写接口文档")) {
+                    afail("归一化没有把中文句号当分隔符处理");
+                }
+                // 全角逗号也要当分隔符（中文会议里最常见的标点）
+                if (actions::normalize_title(u8"重写，接口文档") !=
+                    actions::normalize_title(u8"重写 接口文档")) {
+                    afail("归一化没有把全角逗号当分隔符处理");
+                }
+            }
+
+            // ---- ③ 真库往返 + 幂等 + 状态（走真实 ActionStore）----
+            const long long SID = 900001;      // 一次性探针会话号，刻意避开真实段
+            {
+                // 先清干净（上一次自检可能留了）
+                auto purge = [&]() {
+                    for (const auto& it : ActionStore::list("", 500)) {
+                        if (it.title.find("ZZActionProbe") != std::string::npos) {
+                            std::string e;
+                            ActionStore::set_status(it.id, "done", &e);  // 先移出未完成集合
+                        }
+                    }
+                };
+                (void)purge;
+
+                std::vector<actions::Incoming> batch;
+                {
+                    actions::Incoming i1;
+                    i1.title = u8"ZZActionProbe 提交凤凰项目的接口文档";
+                    i1.owner = u8"张伟";
+                    i1.due   = u8"周五";
+                    i1.evidence = u8"张伟说他会在这周五之前完成。";
+                    i1.source_seq = 3;
+                    batch.push_back(i1);
+                    // 同一个任务的换说法版本（应该并进去，不该新建）
+                    actions::Incoming i2;
+                    i2.title = u8"ZZActionProbe 提交凤凰项目的接口文档，这周五之前";
+                    batch.push_back(i2);
+                }
+
+                const auto o1 = ActionStore::ingest(SID, batch, nullptr, "summary");
+                if (!o1.err.empty()) afail("落库报错：" + o1.err);
+                if (o1.inserted != 1 || o1.merged != 1) {
+                    afail("第一轮应为「新建 1 / 并入 1」，实际 新建 "
+                          + std::to_string(o1.inserted) + " / 并入 "
+                          + std::to_string(o1.merged));
+                }
+
+                // **幂等**：同一场再 ingest 一次，一条都不该多
+                const auto o2 = ActionStore::ingest(SID, batch, nullptr, "summary");
+                if (o2.inserted != 0 || o2.linked != 0) {
+                    afail("重复 ingest 不幂等：新建 " + std::to_string(o2.inserted)
+                          + " 条、台账新增 " + std::to_string(o2.linked)
+                          + " 条（都应为 0）—— 会把「提到过几次」这个数字弄假");
+                }
+
+                // 找到那条，核对派生字段
+                long long pid = 0;
+                for (const auto& it : ActionStore::for_session(SID)) {
+                    if (it.title.find("ZZActionProbe") != std::string::npos) pid = it.id;
+                }
+                if (pid == 0) {
+                    afail("台账里查不到刚写进去的行动项（for_session 失效）");
+                } else {
+                    Item got;
+                    if (!ActionStore::get(pid, &got)) {
+                        afail("get() 读不回刚写的行动项");
+                    } else {
+                        if (got.owner != u8"张伟") {
+                            // 并入时"空字段才填"：i2 没带 owner，不能把 i1 的覆盖成空
+                            afail("并入时把已有的负责人覆盖成空了（应为 张伟，实际「"
+                                  + got.owner + "」）");
+                        }
+                        if (got.status != "todo") afail("新建的行动项状态不是 todo");
+                        if (got.seen_sessions != 1) {
+                            afail("seen_sessions 应为 1，实际 "
+                                  + std::to_string(got.seen_sessions));
+                        }
+                    }
+
+                    // ---- 状态流转 ----
+                    std::string se;
+                    if (!ActionStore::set_status(pid, "doing", &se)) {
+                        afail("标 doing 失败：" + se);
+                    }
+                    if (!ActionStore::set_status(pid, "done", &se)) {
+                        afail("标 done 失败：" + se);
+                    }
+                    // 【关键】标成 done 之后再 ingest 同一场：
+                    // 不许新建一行（这是修过的真 bug —— 原来排除 done 之后
+                    // "用户标完成"这个动作本身就会导致重复行）
+                    const auto o3 = ActionStore::ingest(SID, batch, nullptr, "summary");
+                    if (o3.inserted != 0) {
+                        afail("标成 done 之后再 ingest 又新建了 "
+                              + std::to_string(o3.inserted)
+                              + " 行 —— 用户的一个操作导致了重复待办");
+                    }
+                    Item after;
+                    if (ActionStore::get(pid, &after) && after.status != "done") {
+                        afail("新一场的 ingest 把用户标好的 done 打回了 "
+                              + after.status + "（用户做完的事不该被重跑复活）");
+                    }
+
+                    // ---- 非法状态必须被拒 ----
+                    if (ActionStore::set_status(pid, "finished", &se)) {
+                        afail("非法状态 finished 被接受了");
+                    }
+                    // 不存在的 id 要报错，而**"状态没变"不算错**（§2.6d 同类）
+                    if (ActionStore::set_status(999999999, "todo", &se)) {
+                        afail("不存在的 id 却报成功");
+                    }
+                    if (!ActionStore::set_status(pid, "done", &se)) {
+                        afail("把已经是 done 的再标一次 done 报了失败 —— "
+                              "「无需变更」不是错误");
+                    }
+                }
+            }
+
+            std::cout << "[SelfTest] 行动项落库（判同/幂等/状态不打回/空字段不覆盖/台账）: "
+                      << (a_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+            if (!a_ok) { std::cerr << "    " << a_why << std::endl; return 1; }
+        }
+
         // 【这里刻意不写"共 N 例"】原来写死了 `"✅ 11 例通过"`，
         // 而加用例的人（我）不会记得回来改数字 —— 本轮加了 ⑫⑬⑭ 三条之后，
         // 它照样打"11 例通过"，**在骗人**。手写计数就是这个下场。
@@ -5293,6 +5643,7 @@ static int run_app(int argc, char** argv) {
     if (!cfg.search_query.empty()) return run_search(cfg);
     if (cfg.dump_terms) return run_dump_terms(cfg);
     if (cfg.triage_cache) return run_triage_cache(cfg);
+    if (cfg.show_actions || cfg.action_set_id >= 0) return run_actions(cfg);
     if (!cfg.dump_prompt.empty()) return run_dump_prompt(cfg);
     if (cfg.export_session >= 0) return run_export(cfg);
 
