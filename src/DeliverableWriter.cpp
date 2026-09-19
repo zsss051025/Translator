@@ -1,5 +1,6 @@
 #include "DeliverableWriter.h"
 #include "Evidence.h"   // 出处格式的唯一来源（5.7）
+#include "KnowledgeExtract.h"   // looks_like_person_name（负责人抽取和抽取器共用一套姓氏表）
 #include "Utf8.h"   // 写出边界的 UTF-8 净化
 
 #include <algorithm>
@@ -459,29 +460,51 @@ std::string find_due(const std::string& src) {
     return best_zh.size() >= best_en.size() ? best_zh : best_en;
 }
 
-// 从原文里挑出负责人。命中率有限，抽不到就留空——宁可空着也不写错。
+// 从原文里挑出负责人。命中率有限，抽不到就留空——**宁可空着也不写错**。
+//
+// 【2026-09-19 修：原来会抽出「了，张伟」「这块张伟」「我们需要」】
+// 旧实现是"从动词往前数 4 个汉字"，就四条断言都没有：
+//   · 把标点数进去了   → 「这个上周就说了，张伟负责跟进」抽出「了，张伟」
+//   · 把修饰语带上了   → 「这块张伟负责跟进」抽出「这块张伟」
+//   · 完全不判断是不是人名 → 「我们需要跟进一下」抽出「我们需要」
+// 后果是**纪要里负责人那一栏写着不存在的人**，而这是最不该错的地方
+// （评审照着它去找人）。用户真跑时那一栏就是脏的，agent 还专门在周报里
+// 注明"原始记录里的负责人字段是脏的，建议核对一遍"—— 一个数字字段需要
+// 模型替我们道歉，那就该修。
+//
+// 现在：先截出**纯 CJK 的一段**（标点/ASCII 处断开），再从右往左
+// 逐个可能的长度问 `looks_like_person_name()`（那个谓词和抽取器的 R6
+// 共用同一套姓氏表/常用词表）。取**最短的合法人名**：
+// 「这块张伟」→ 试「张伟」成立 → 返回「张伟」，
+// 而不是把"这块"一起带走。
 std::string find_owner(const std::string& src) {
-    // 中文："张三负责" / "由张三跟进"
-    // 注意：不能用 find_first_of 查标点——它按单字节比较，
-    // 而 UTF-8 汉字的后续字节会与标点字节撞车，导致合法姓名被误判。
-    // 这里改为要求候选"整段都是非 ASCII 字节"（即纯 CJK）。
     for (const char* verb : {u8"负责", u8"跟进", u8"落实"}) {
         const size_t pos = src.find(verb);
         if (pos == std::string::npos || pos < 6) continue;
-        size_t s = pos;
-        size_t chars = 0;
-        while (s > 0 && chars < 4) {
-            --s;
-            while (s > 0 && (static_cast<unsigned char>(src[s]) & 0xC0) == 0x80) --s;
-            ++chars;
+
+        // ① 收集动词之前每个**字符起点**的偏移（含 pos 自己），最多往回 6 个字。
+        //
+        // 只需要判"这个字节是不是字符起点"（`(b & 0xC0) != 0x80`），
+        // **不需要解码 UTF-8** —— 因为标点/ASCII 的排除交给
+        // `looks_like_person_name()` 了：它要求整段都是 CJK 汉字。
+        // 自己再解一遍就等于第二份 UTF-8 实现（本项目栽过：按字节比多字节标点
+        // 产出过整份非法 UTF-8 的交付物，见 Utf8.h 开头）。
+        std::vector<size_t> starts;
+        starts.push_back(pos);
+        size_t i = pos;
+        while (i > 0 && starts.size() <= 6) {
+            --i;
+            while (i > 0 && (static_cast<unsigned char>(src[i]) & 0xC0) == 0x80) --i;
+            starts.push_back(i);
         }
-        const std::string cand = src.substr(s, pos - s);
-        if (cand.size() < 6 || cand.size() > 12) continue;      // 2~4 个汉字
-        bool pure_cjk = true;
-        for (unsigned char c : cand) {
-            if (c < 0x80) { pure_cjk = false; break; }
+
+        // ② 从**最短**的候选试起：starts[2] 就是"紧挨动词的那 2 个字"。
+        //    「这块张伟负责」→ 先试「张伟」成立就返回，
+        //    而不是把"这块"一起带走（那是旧实现的行为）。
+        for (size_t take = 2; take < starts.size() && take <= 5; ++take) {
+            const std::string cand = src.substr(starts[take], pos - starts[take]);
+            if (knowledge::looks_like_person_name(cand)) return cand;
         }
-        if (pure_cjk) return cand;
     }
 
     // 英文："John will" / "Alice should"

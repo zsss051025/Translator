@@ -945,6 +945,43 @@ std::vector<ExtractedCandidate> extract_candidates(const std::vector<Segment>& s
     return out;
 }
 
+// 谓词的实现放在文件末尾（它用的是上面匿名 namespace 里的姓氏表/称谓表，
+// 而"表只有一份"这件事比"函数放在哪"重要得多）。
+bool looks_like_person_name(const std::string& s) {
+    if (s.empty()) return false;
+
+    // 必须整段是 CJK **汉字**：出现 ASCII、标点、空白都不是名字。
+    // （这正是 "了，张伟" 被挡住的地方 —— 里面有全角逗号。）
+    // `is_cjk_ideograph` 只认汉字区，所以全角标点（，。：）自然被排除。
+    size_t n = 0;
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        const size_t len = utf8_len_of(c);
+        if (len < 2 || i + len > s.size()) return false;      // ASCII/半截字符
+        const uint32_t cp = utf8_cp(s, i, len);
+        if (!is_cjk_ideograph(cp)) return false;
+        i += len;
+        ++n;
+    }
+    // 中文人名：2~4 个字（含"李经理""王工程师"这类带称谓的）
+    if (n < 2 || n > 5) return false;
+    if (is_false_person_word(s)) return false;
+    if (name_tail_has_function_char(s)) return false;
+
+    // ① 姓氏开头
+    const size_t first_len = utf8_len_of(static_cast<unsigned char>(s[0]));
+    if (is_surname_char(utf8_cp(s, 0, first_len))) {
+        // 名字部分（第 2 个字起）不能只剩称谓这种"半个词"
+        return true;
+    }
+
+    // ② 称谓结尾（"张总" 这种情况上面已覆盖；这里管"老张""阿伟"这类非姓氏开头的
+    //    称呼 —— 但**不猜**，只认称谓：谓词保守，认不出就给空）。
+    //    实际实现里我们要求以姓氏开头，所以这一支不放开 —— 写在这里是为了
+    //    说明**为什么不放开**：放开之后"经理""总监"这种裸称谓会被当成人名。
+    return false;
+}
+
 int save_candidates(const std::vector<ExtractedCandidate>& cands, std::string* err) {
     int saved = 0;
     for (const auto& c : cands) {

@@ -5562,6 +5562,78 @@ static int run_selftest(const AppConfig& cfg) {
             if (!e_ok) { std::cerr << "    " << e_why << std::endl; return 1; }
         }
 
+        // ㉕ **负责人抽取**：宁可留空，也不许写出一个不存在的人
+        //
+        // 【为什么值得单开一组】交付物里"负责人"那一栏是**评审照着去找人**的字段，
+        // 写错比留空坏得多。而旧实现是"从 负责/跟进 往前数 4 个汉字"：
+        //     「…说了，张伟负责跟进」→ 「了，张伟」   ← 把标点数进去了
+        //     「这块张伟负责跟进」    → 「这块张伟」   ← 多带了修饰语
+        //     「我们需要跟进一下」    → 「我们需要」   ← 压根不是人名
+        // 用户真跑时那一栏就是脏的，agent 还专门在周报里替我们道歉
+        // （"原始记录里的负责人字段是脏的，建议核对一遍"）——
+        // 一个字段需要模型替我们解释，那就该修，而且该有回归。
+        {
+            bool o_ok = true;
+            std::string o_why;
+            auto ofail = [&](const std::string& m) {
+                o_ok = false;
+                if (o_why.empty()) o_why = m;
+            };
+
+            // 谓词层（和抽取器 R6 共用同一套姓氏表）
+            struct PCase { const char* s; bool want; const char* why; };
+            const PCase pcs[] = {
+                {u8"张伟",   true,  "张伟 应该被认成人名"},
+                {u8"李经理", true,  "李经理（姓氏+称谓）应该被认成人名"},
+                {u8"王工",   true,  "王工（姓氏+单字称谓）应该被认成人名"},
+                {u8"了，张伟", false, "带标点的片段不是人名"},
+                {u8"这块张伟", false, "带修饰语的片段本身不是人名（应取其中「张伟」）"},
+                {u8"我们需要", false, "我们需要 不是人名"},
+                {u8"测报告，", false, "测报告， 不是人名"},
+                {u8"报告",    false, "报告 不是人名"},
+                {u8"",        false, "空串不是人名"},
+            };
+            for (const auto& c : pcs) {
+                const bool got = knowledge::looks_like_person_name(c.s);
+                if (got != c.want) ofail(c.why);
+            }
+
+            // 端到端：走**真实**的规则抽取路径，用出问题的那几句话
+            {
+                const std::pair<const char*, const char*> cases[] = {
+                    // 句子, 期望的负责人（空 = 必须留空）
+                    {u8"凤凰项目的接口文档需要重写，这个上周就说了，张伟负责跟进，这周五之前完成。",
+                     u8"张伟"},
+                    {u8"凤凰项目的接口文档需要重写，这块张伟负责跟进。", u8"张伟"},
+                    {u8"另外李经理需要提交一份极光平台的压测报告。", u8""},
+                    {u8"我们需要跟进一下 Gecko 模块的遗留问题。", u8""},
+                };
+                for (const auto& cs : cases) {
+                    std::vector<Segment> segs;
+                    Segment s;
+                    s.id = 1; s.session_id = 1; s.seq = 1;
+                    s.ts = "2026-09-19 10:00:00.000";
+                    s.src_text = cs.first; s.tgt_text = cs.first;
+                    s.engine = "SelfTest"; s.ms = 0; s.confidence = -1.0;
+                    segs.push_back(s);
+
+                    const auto sum = DeliverableWriter::extract_by_rules(segs);
+                    std::string got;
+                    for (const auto& a : sum.actions) {
+                        if (!a.owner.empty()) { got = a.owner; break; }
+                    }
+                    if (got != cs.second) {
+                        ofail(std::string(u8"「") + cs.first + u8"」的负责人应为「"
+                              + cs.second + u8"」，实际「" + got + u8"」");
+                    }
+                }
+            }
+
+            std::cout << "[SelfTest] 负责人抽取（留空好过写错人 / 标点与修饰语不误入）: "
+                      << (o_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+            if (!o_ok) { std::cerr << "    " << o_why << std::endl; return 1; }
+        }
+
         // 【这里刻意不写"共 N 例"】原来写死了 `"✅ 11 例通过"`，
         // 而加用例的人（我）不会记得回来改数字 —— 本轮加了 ⑫⑬⑭ 三条之后，
         // 它照样打"11 例通过"，**在骗人**。手写计数就是这个下场。

@@ -78,4 +78,22 @@ std::vector<ExtractedCandidate> extract_candidates(const std::vector<Segment>& s
 //    并沿用它的 kind，那句话才算真的成立。详见 KnowledgeStore::find_by_key 的说明。
 int save_candidates(const std::vector<ExtractedCandidate>& cands, std::string* err = nullptr);
 
+// 这一小段中文**看起来像人名吗**？
+//   ① 以常见姓氏字开头，且不是"姓氏开头的常用词"（需要/于是/成为…），且名字部分没有虚词
+//   ② 或者以称谓结尾（张总 / 李经理 / 王工）
+//
+// 【为什么把它公开出来，而不是让调用方自己判断】
+// 交付物里的"负责人"抽取（`DeliverableWriter::find_owner`）要做的判断，
+// 和抽取器的 R6 规则是**同一件事**：这一小段是不是人名。
+// 那边原来自己写了个"从动词往前数 4 个汉字"，于是抽出这些垃圾：
+//     「负责人: 了，张伟」   ← 往前数 4 个字，把标点也数进去了
+//     「负责人: 这块张伟」   ← 多带了"这块"
+//     「负责人: 我们需要」   ← "需要"以姓氏字"需"?不是 —— 是它压根没判断是不是人名
+// 而且它不知道这里有姓氏表和"姓氏开头的常用词"表。
+// 本项目"两份实现迟早走散"已经栽过四次，所以公开**谓词**，不复制判断。
+//
+// 判据刻意保守（宁可返回 false）：返回 false 的后果只是"负责人留空"，
+// 而返回 true 判错的后果是**纪要里写着一个不存在的人**。
+bool looks_like_person_name(const std::string& s);
+
 }  // namespace knowledge
