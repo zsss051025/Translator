@@ -119,6 +119,20 @@ AppConfig AppConfig::from(int argc, char** argv) {
                 cfg.tools_list_only = false;
             }
         }
+        else if (arg == "--endpoint-ms") {
+            std::string v; next(v);
+            try { if (!v.empty()) cfg.endpoint_ms = std::stoi(v); }
+            catch (const std::exception&) {
+                std::cerr << "[Config] --endpoint-ms 需要数字（毫秒），收到: " << v << std::endl;
+            }
+        }
+        else if (arg == "--max-utter-sec") {
+            std::string v; next(v);
+            try { if (!v.empty()) cfg.max_utter_sec = std::stod(v); }
+            catch (const std::exception&) {
+                std::cerr << "[Config] --max-utter-sec 需要数字（秒），收到: " << v << std::endl;
+            }
+        }
         else if (arg == "--actions")       cfg.show_actions = true;
         else if (arg == "--verify-report") next(cfg.verify_report);
         else if (arg == "--status")        next(cfg.actions_status);

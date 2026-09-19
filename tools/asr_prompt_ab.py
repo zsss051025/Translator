@@ -95,20 +95,39 @@ def terms_from_real_db():
     return vals or None
 
 
-def prompt_of(db):
-    """用 --terms 读出真实会喂进去的那串 prompt（几秒，不加载模型）。"""
-    p = subprocess.run([EXE, "--terms", "--db", db], capture_output=True,
+def prompt_of(db, n_terms=0):
+    """用 --terms 读出真实会喂进去的那串 prompt（几秒，不加载模型）。
+
+    ⚠️ 必须和 `run_wav` 传**同一个** `--asr-prompt-kb`，否则这行显示会撒谎：
+    它会说"prompt 是空的"，而实际跑的时候 prompt 是喂进去的 ——
+    我第一版就是这样，差点把"两档一样"当成"prompt 无害"的证据。
+    """
+    args = [EXE, "--terms", "--db", db]
+    if n_terms > 0:
+        args += ["--asr-prompt-kb", str(n_terms)]
+    p = subprocess.run(args, capture_output=True,
                        text=True, encoding="utf-8", errors="replace",
                        cwd=ROOT, timeout=120)
     m = re.search(r"--- ① 识别提示（Whisper initial_prompt）---\n(.+)", p.stdout)
     return (m.group(1).strip() if m else ""), p.stdout
 
 
-def run_wav(db, out_dir):
-    """跑一次 --wav，返回转录文本列表。"""
-    p = subprocess.run([EXE, "--wav", WAV, "--summarizer", "rules",
-                        "--db", db, "--out", out_dir],
-                       capture_output=True, text=True, encoding="utf-8",
+def run_wav(db, out_dir, n_terms=0):
+    """跑一次 --wav，返回转录文本列表。
+
+    ⚠️ **必须显式传 `--asr-prompt-kb`**：2026-09-19 起知识库**默认不进**识别提示
+    （实测会漏字，见 tools/asr_prompt_ab.py 开头的说明）。所以"造一个带 N 条
+    confirmed 知识的库"本身**不会**让它们进提示 —— 这个脚本第一版就栽在这里：
+    两档跑出来一模一样，而屏幕上那行 prompt 明明写着"(空)"，
+    我差点把"没差别"当成"prompt 无害"的证据。
+
+    测试脚本和产品之间这种"默认值悄悄变了、脚本没跟上"，和
+    「诊断工具撒谎」是同一类问题：**它不报错，只是测的东西不是你以为的那个。**
+    """
+    args = [EXE, "--wav", WAV, "--summarizer", "rules", "--db", db, "--out", out_dir]
+    if n_terms > 0:
+        args += ["--asr-prompt-kb", str(n_terms)]
+    p = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
                        errors="replace", cwd=ROOT, timeout=1800)
     import sqlite3
     con = sqlite3.connect(db)
@@ -158,15 +177,21 @@ def main():
     for n in sizes:
         db = os.path.join(WORK, f"n{n}.db")
         make_db(db, n, real)
-        prompt, terms_out = prompt_of(db)
+        prompt, terms_out = prompt_of(db, n)
         print("=" * 70)
         print(f"档位 N={n}：initial_prompt {len(prompt)} 字符"
               f"（近似 {len(prompt)//4}~{len(prompt)//2} token）")
         if prompt:
             print("  " + (prompt[:200] + ("…" if len(prompt) > 200 else "")))
+        elif n > 0:
+            # ⚠️ **这一行是个断言，不是提示**：造了 N 条 confirmed 知识，prompt 却是空的
+            # ⇒ 说明产品侧"知识库进提示"是关着的，而这档测的其实是"无提示"。
+            # 出现这行时**整份对照都不成立**，别把它当成"prompt 没影响"的证据。
+            print("  ⚠️ 造了 %d 条 confirmed 知识，但 initial_prompt 是空的 ——" % n)
+            print("     说明 --asr-prompt-kb 没生效，本档实际等于「无提示」，对照不成立！")
         runs = []
         for k in range(max(1, a.repeat)):
-            rows, p = run_wav(db, os.path.join(WORK, f"out{n}_{k}"))
+            rows, p = run_wav(db, os.path.join(WORK, f"out{n}_{k}"), n)
             text = "\n".join(rows)
             runs.append(text)
             print(f"  第 {k+1} 次：{len(rows)} 段 / {len(text)} 字符")

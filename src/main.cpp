@@ -203,8 +203,39 @@ static std::vector<std::string> load_glossary_terms(const std::string& path) {
     return terms;
 }
 
-// 把词条拼成 Whisper 的 initial_prompt。
-// 实测提示的约束力有限（名字仍会乱跳），所以识别后纠错那一环不能省。
+// ---- 句尾判定：**纯函数**，所以能进自检 ----
+//
+// 【为什么要抽出来】这段逻辑原来直接写在采集主循环里，条件是
+// "静音够了 + 攒够了 + 有过人声"，几个条件互相嵌套、边界全是 off-by-one。
+// 而它错了的症状是**偶尔少一句、或者又变回碎片** —— 两种都不会报错，
+// 而且在实时路径上要靠真录音+耳听才发现。抽成纯函数之后，
+// 自检可以拿各种（静音块数、缓冲区长度、有没有人声）的组合直接断言。
+//
+// 判定语义见调用点上方那一大段说明。
+enum class FlushReason {
+    None,          // 继续攒
+    SentenceEnd,   // 停顿够了，一句话说完了
+    ShortFlush,    // 一直没声音，哪怕是半个字也收尾（"哦。""谢谢。"这种）
+};
+
+inline FlushReason decide_flush(int    silence_blocks,
+                                bool   has_speech,
+                                size_t acc_samples,
+                                size_t sample_rate,
+                                int    end_pause_blocks,
+                                int    flush_short_blocks,
+                                size_t min_utter_samples) {
+    if (!has_speech) return FlushReason::None;      // 还没听到人说话，别切
+    if (silence_blocks >= flush_short_blocks && acc_samples > 0) {
+        return FlushReason::ShortFlush;
+    }
+    if (silence_blocks >= end_pause_blocks && acc_samples >= min_utter_samples) {
+        return FlushReason::SentenceEnd;
+    }
+    return FlushReason::None;
+}
+
+// 把词条拼成 Whisper 的 initial_prompt。// 实测提示的约束力有限（名字仍会乱跳），所以识别后纠错那一环不能省。
 static std::string terms_to_prompt(const std::vector<std::string>& terms) {
     std::string out;
     for (const auto& t : terms) {
@@ -5793,6 +5824,67 @@ static int run_selftest(const AppConfig& cfg) {
             if (!f_ok) { std::cerr << "    " << f_why << std::endl; return 1; }
         }
 
+        // ㉗ **句尾判定**（分句）—— 纯函数，不用音频就能验
+        //
+        // 【为什么值得单测】它是"碎片化"的开关：判早了句子被切断
+        //（就是这次要修的病），判晚了字幕迟迟不出来。
+        // 而两种错都**不报错**，只表现为"偶尔少一句"或"又变碎了"，
+        // 在实时路径上得靠真录音加耳听才能发现。抽成纯函数之后，
+        // 下面这些边界（静音刚好够/差一块、缓冲刚好够/差一点、
+        // 还没听到人声）可以逐条钉住。
+        {
+            bool s_ok = true;
+            std::string s_why;
+            auto sfail = [&](const std::string& m) {
+                s_ok = false;
+                if (s_why.empty()) s_why = m;
+            };
+
+            const size_t SR = 16000;
+            const int    END = 5;            // 500ms → 5 块
+            const int    FLUSH = END * 3;    // 1500ms
+            const size_t MIN = SR / 3;       // 0.33s
+
+            auto call = [&](int sil, bool speech, size_t acc) {
+                return decide_flush(sil, speech, acc, SR, END, FLUSH, MIN);
+            };
+
+            // ① 还没听到人声 → 永远不切（否则纯静音会切出空段）
+            if (call(999, false, SR * 5) != FlushReason::None)
+                sfail("没有人声时不该切（会切出空段）");
+
+            // ② 停顿差一块 → 不切（这是"别把句中的自然换气当句尾"的边界）
+            if (call(END - 1, true, SR * 2) != FlushReason::None)
+                sfail("停顿差一块就切了（句中的自然换气会被当成句尾 → 又变碎片）");
+
+            // ③ 停顿刚好够 + 缓冲够 → 句尾
+            if (call(END, true, MIN) != FlushReason::SentenceEnd)
+                sfail("停顿够了、缓冲也够，却没判成句尾");
+
+            // ④ 停顿够了但缓冲太短（刚开口一点点）→ 先别切，等短收尾兜底
+            if (call(END, true, MIN - 1) != FlushReason::None)
+                sfail("刚开口就按句尾切了（会把开头一两个字切成一段）");
+
+            // ⑤ 一直很安静 → 短收尾（"哦。""谢谢。"这种短话必须能出来）
+            if (call(FLUSH, true, 10) != FlushReason::ShortFlush)
+                sfail("长时间安静时没有兜底收尾（短语气词会卡在缓冲区里）");
+
+            // ⑥ 短收尾要求缓冲非空
+            if (call(FLUSH, true, 0) != FlushReason::None)
+                sfail("缓冲是空的也报了短收尾（会切出空段）");
+
+            // ⑦ **回归护栏**：旧的实现是"静音 > 20 块（2 秒）才切"，
+            //    而 3 秒定时器永远先触发 —— 也就是每一句都被从中间切断。
+            //    这里断言"停顿 5 块就切"，等于把"不再依赖 2 秒停顿"钉住。
+            if (call(END, true, SR * 2) != FlushReason::SentenceEnd)
+                sfail("回归：停顿 5 块（500ms）时应当切 —— "
+                      "如果这条失败，说明有人把门槛调回了 2 秒（碎片化会回来）");
+
+            std::cout << "[SelfTest] 句尾判定（停顿门槛/短收尾兜底/无人声不切）: "
+                      << (s_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+            if (!s_ok) { std::cerr << "    " << s_why << std::endl; return 1; }
+        }
+
         // 【这里刻意不写"共 N 例"】原来写死了 `"✅ 11 例通过"`，
         // 而加用例的人（我）不会记得回来改数字 —— 本轮加了 ⑫⑬⑭ 三条之后，
         // 它照样打"11 例通过"，**在骗人**。手写计数就是这个下场。
@@ -6345,8 +6437,10 @@ static int run_app(int argc, char** argv) {
         // --- 核心逻辑变量 ---
         std::vector<float> audio_accumulator;      // 音频累加缓冲区(后续换成环形缓冲区)
         const int sample_rate = 16000;             // Whisper 标准采样率
-        const float trigger_seconds = 3.0f;        // 攒够3秒音频再进行一次推理
-        const size_t trigger_size = static_cast<size_t>(sample_rate * trigger_seconds);
+        // ⚠️ 这两个是**分句**参数，语义见下面"句尾判定"那一段的说明。
+        // 做成开关是因为**它们该在真实会议录音上校**，而不是我在这里拍板：
+        //   --endpoint-ms      停多久算一句话说完（默认 500）
+        //   --max-utter-sec    连续说话的安全阀（默认 6.0）
 
         // ---- WAV 回放模式（--wav）----
         //
@@ -6474,12 +6568,60 @@ static int run_app(int argc, char** argv) {
             }
             float rms = std::sqrt(sum_squares / pcm_chunk.size());
 
-            // 
-            //拦截部分
+            // ---------------- 句尾判定（分句） ----------------
+            //
+            // =====================================================================
+            // 【2026-09-19 重做：原来是"攒够 3 秒就切"，那正是碎片化的根源】
+            // =====================================================================
+            // 旧逻辑是 `acc >= 3.0s && has_speech → 切`，而"自然停顿"的门槛是
+            // `silence_count > 20`（= 2 秒静音）。**真实说话不会有 2 秒停顿**，
+            // 所以 3 秒定时器永远先触发 —— 也就是**每一句都被从中间切断**，
+            // 切在哪完全看说话速度。
+            //
+            // 真实数据（用户 2026-09-19 跑的一部电影，126 段）里的碎片：
+            //     「we are not in the mood for this. Me and my partner just got」
+            //   | 「violated by a small Frenchman.」      ← 断在 just got | violated
+            //     「I know you probably don't understand how」
+            //   | 「in a word I'm saying, but I gotta tell you,」  ← 断在 how | in
+            //     「and I'm」                              ← 只有两个词，独立成段
+            // 而这一段最坏：**译文模型替它补全了** —— `and I'm` 被译成
+            // 「我是一个专业的翻译人员。」，一句凭空捏造的话进了交付物。
+            //
+            // jfk.wav 上可直接复现（11 秒的**一句话**被切成 5 段）：
+            //     Ask not! / what your country can do for you. /
+            //     ask what you can do for **yourself**. / can do for your country. / Thank you.
+            // 注意第三段 —— 原文是 "for your country"，它听成了 "for yourself"：
+            // **碎片化不只是切得难看，它直接让识别变差**，因为 Whisper 只看得到
+            // 这 3 秒，看不到后面那句能纠正它的 "for your country"。
+            //
+            // 【改法：按"停顿"切，不按"时长"切】
+            //   ① 静音满 `kEndPauseSec` → **一句话说完了**，立刻切
+            //      （通常比 3 秒更早，所以字幕延迟反而更低）
+            //   ② 连续说话到 `kMaxUtterSec` → 安全阀，必须切（Whisper 也不能无限长）
+            //   ③ 短促语气词（"哦。""谢谢。"）后面如果一直没声音，
+            //      由 `kFlushShortSec` 兜住 —— 否则它会卡在缓冲区里等到安全阀
+            //
+            // ⚠️ **这是权衡，不是纯赚**：停顿门槛定得太低，说话人句中的自然换气
+            //    也会被当成句尾（又变碎片）；定得太高就等于回到"按 3 秒切"。
+            //    取 500ms 是因为它落在"句中换气（200~400ms）"之上、
+            //    "句末停顿（500ms~1s）"之下。**这两个数应该在真实会议录音上再校**，
+            //    所以做成了 `--endpoint-ms` / `--max-utter-sec` 两个开关。
+            const float  trigger_seconds = cfg.max_utter_sec > 0.0 ? cfg.max_utter_sec : 4.0f;
+            const size_t trigger_size    = static_cast<size_t>(sample_rate * trigger_seconds);
+            const int    end_pause_blocks = std::max(1, cfg.endpoint_ms / 100);   // 100ms/块
+            const int    flush_short_blocks = end_pause_blocks * 3;               // 兜短语气词
+            const size_t min_utter_samples  = static_cast<size_t>(sample_rate) / 3;  // 0.33s
+
                 if (rms <= silence_threshold) {//小于设计的阈值说明没有说话
                     silence_count++;
-                    // 池子里有超过 1 秒的声音，就说明一句话说完了
-                    if (silence_count > 20 && audio_accumulator.size() > sample_rate * 1 && has_speech) {
+                    // 判定抽成了纯函数 decide_flush()（见文件上方）—— 这样它有单测。
+                    const FlushReason fr = decide_flush(silence_count, has_speech,
+                                                        audio_accumulator.size(),
+                                                        sample_rate,
+                                                        end_pause_blocks,
+                                                        flush_short_blocks,
+                                                        min_utter_samples);
+                    if (fr != FlushReason::None) {
                         engine.push_audio(audio_accumulator);
                         audio_accumulator.clear();
                         silence_count = 0;
@@ -6492,7 +6634,7 @@ static int run_app(int argc, char** argv) {
                     silence_count = 0;
                 }
 
-            // C. 检查是否达到推理长度阈值
+            // C. 安全阀：连续说话太久也必须切一次
             if (audio_accumulator.size() >= trigger_size && has_speech) {
                 // 将攒够的 3 秒音频通过生产者接口塞入 SpeechEngine
                 // 这里使用的是 std::move 来减少一次内存拷贝，
