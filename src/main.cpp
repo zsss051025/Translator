@@ -5814,7 +5814,7 @@ static int run_selftest(const AppConfig& cfg) {
                 {u8"字幕由 XX 字幕组制作", true, "中文字幕组署名应命中"},
                 {u8"谢谢观看", true, "中文侧套话应命中"},
 
-                // ⚠️ **反向：真人说的话绝不能被吃掉**（删真话比漏幻觉坏得多）
+                // **反向：真人说的话绝不能被吃掉**（删真话比漏幻觉坏得多）
                 {"Where you go? 50 Franklin.", false, "电影里的正常对白被误判成幻觉"},
                 {"I don't drive Americans.", false, "正常对白被误判成幻觉"},
                 {"Americans make me sick.", false, "正常对白被误判成幻觉"},
@@ -5823,16 +5823,42 @@ static int run_selftest(const AppConfig& cfg) {
                 {u8"我们下周再看一下这个方案。", false, "正常中文句子被误判成幻觉"},
                 {u8"这件事由李经理负责跟进。", false, "正常中文句子被误判成幻觉"},
                 {"", false, "空串不是幻觉（由非内容那一关处理）"},
+
+                // ---- 2026-09-19 合并黑名单时**专门删掉的三条**，这里钉住 ----
+                // 它们原来在 main.cpp 那份表里，会误杀真实内容：
+                //   「翻译」「字幕」「订阅」单独两个字太通用，讨论翻译/字幕/订阅业务的会上
+                //   **整段会消失**。删掉之后必须断言"含这些词的真实句子不被丢弃"。
+                {u8"我们在做字幕相关的工作。", false,
+                 "含「字幕」的真实句子被误杀 —— 原来 main.cpp 的表里就有裸的「字幕」"},
+                {u8"这个翻译项目下周要交付。", false,
+                 "含「翻译」的真实句子被误杀 —— 原来 main.cpp 的表里就有裸的「翻译」"},
+                {u8"我们计划推出一个订阅服务。", false,
+                 "含「订阅」的真实句子被误杀 —— 原来 main.cpp 的表里就有裸的「订阅」"},
+
+                // ---- 从 main.cpp 那份合并过来的表项，逐条确认真的生效 ----
+                {u8"请不吝点赞，打赏支持一下", true, "合并过来的中文推广语没生效"},
+                {u8"明镜与点点", true, "合并过来的频道名没生效"},
+                {"Amara.org", true, "合并过来的 amara 没生效"},
+                {u8"[音乐]", true, "音乐标记没生效"},
+                {u8"♪", true, "音符标记没生效"},
             };
             for (const auto& c : hcs) {
                 const bool got = speechfilter::is_boilerplate_hallucination(c.s);
                 if (got != c.want) {
-                    // 失败时把**归一化之后的样子**一起打出来：黑名单是一条条字符串，
-                    // 拼错了不会报错、只会安静地不干活（我自己就写错过一次），
-                    // 所以宁可把中间结果摊开。
+                    // 失败时把**归一化之后的样子**和**整张表**都打出来：
+                    // 黑名单是一条条字符串，拼错了或写法不对（比如带标点的条目
+                    // 在归一化那一遍里压根匹配不上）都不会报错、只会安静地不干活。
+                    // 我自己在这上面栽过两次，所以宁可把中间结果摊开。
                     std::cerr << "    [命中检查] raw=[" << c.s << "] norm=["
                               << speechfilter::normalize_for_compare(c.s)
                               << "] got=" << got << " want=" << c.want << std::endl;
+                    if (c.want) {
+                        std::cerr << "    [表] ";
+                        for (const auto& p : speechfilter::boilerplate_patterns()) {
+                            std::cerr << "[" << p << "]";
+                        }
+                        std::cerr << std::endl;
+                    }
                     ffail(c.why);
                 }
             }
@@ -6936,19 +6962,16 @@ static int run_app(int argc, char** argv) {
                 is_hallucination = true;
             }
 
-            // 黑名单是 no_speech_prob 之外的兜底。
-            // 表项一律小写，配合 to_lower_ascii(result) 做大小写不敏感匹配。
-            static const std::vector<std::string> blacklist = {
-                "谢谢观看", "请不吝点赞", "订阅", "打赏", "明镜与点点",
-                "字幕", "amara", "[音乐]", "(音乐)", "翻译", "yoyo", "♪"
-            };
-            const std::string result_lower = to_lower_ascii(result);
-            for (const auto& bad_word : blacklist) {
-                // std::string::npos 意思是“没找到”
-                if (result_lower.find(bad_word) != std::string::npos) {
-                    is_hallucination = true;
-                    break;
-                }
+            // 幻觉黑名单：**唯一一份在 SpeechFilter 里**（它带自检）。
+            //
+            // ⚠️ 这里原来自己养了一份 `static const std::vector<std::string> blacklist`
+            //（谢谢观看/请不吝点赞/订阅/打赏/明镜与点点/字幕/amara/[音乐]/(音乐)/翻译/yoyo/♪），
+            //    和 SpeechEngine 那份并存 —— 两份都活着，改哪边都只改一半。
+            //    2026-09-19 合并掉了，并且**删掉了其中三条会误杀真实内容的**：
+            //    `"翻译"`（丢弃任何含"翻译"二字的段落）、`"字幕"`、`"订阅"`。
+            //    理由与取舍写在 SpeechFilter.cpp 的表注释里。
+            if (speechfilter::is_boilerplate_hallucination(result)) {
+                is_hallucination = true;
             }
 
             if (!result.empty() && !is_hallucination) {
