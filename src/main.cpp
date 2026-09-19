@@ -17,6 +17,7 @@
 #include "CandidateTriage.h"
 #include "TriageCache.h"
 #include "ActionStore.h"
+#include "Evidence.h"
 #include "CommonWords.h"
 #include "ModelLog.h"
 #include "SessionStore.h"
@@ -846,6 +847,39 @@ static int run_report(const AppConfig& cfg) {
     if (r.no_tools_used) std::cout << "  ⚠️ 全程没调用任何工具";
     std::cout << "\n[报告] 停止原因：" << r.stop_reason << std::endl;
 
+    // ---- 出处核对（5.7）----
+    //
+    // 【为什么每次出报告都要跑一遍，而不是"信任模型"】
+    // 系统提示里要求它给每句结论标出处，但**要求不等于做到**，
+    // 而编出来的出处（`#9002·7` 当那一场只有 4 段）看起来和真的完全一样。
+    // 所以这里当场核对，并且把结果**写在报告后面** —— 让人一眼看到
+    // "这份东西有几句是可验证的、有没有编的"，而不是自己去抽查。
+    //
+    // ⚠️ 核对失败**不改变退出码**：报告本身是产出，出处有问题不等于任务失败。
+    //    但它必须显眼 —— 所以用 ⚠️ 而不是静默。
+    {
+        const auto vr = evidence::Evidence::verify(r.answer);
+        std::cout << "\n[报告] 出处核对：";
+        if (vr.total == 0) {
+            std::cout << "⚠️ 这份报告**一处出处都没标** —— 每句结论都无法回溯到原话。\n"
+                         "        系统提示里要求过标出处，所以这通常意味着模型忽略了它；\n"
+                         "        也可能这次任务本来就没有可引用的具体段落。"
+                      << std::endl;
+        } else {
+            std::cout << "共 " << vr.total << " 处，有效 " << vr.ok
+                      << " 处，对不上 " << vr.bad.size() << " 处" << std::endl;
+            for (const auto& l : vr.bad) {
+                std::cerr << "        ❌ " << evidence::format(l)
+                          << " 指向的位置不存在（编造或写错）" << std::endl;
+            }
+            if (vr.bad.empty()) {
+                std::cout << "        ✅ 每一处都可以回到库里查证" << std::endl;
+            }
+            std::cout << "        （复核：--verify-report <把报告存成的文件>）"
+                      << std::endl;
+        }
+    }
+
     SessionStore::instance().close();
     return r.ok ? 0 : 1;
 }
@@ -1364,6 +1398,84 @@ static int run_actions(const AppConfig& cfg) {
     std::cout << "\n改状态：--actions --doing <id> / --done <id> / --todo <id>" << std::endl;
     std::cout << "[actions] total=" << st.total << " todo=" << st.todo
               << " doing=" << st.doing << " done=" << st.done << std::endl;
+    return 0;
+}
+
+// --verify-report <文件>：核对一份报告里**每一处出处**是否真的存在（5.7）
+//
+// 【这个命令是"可验收"能不能成立的关键】
+// 一份"带出处的报告"看着比不带出处可信得多 —— 而这正是危险所在：
+// **模型编出来的出处，长得和真的一模一样**（`#9002·3` 和 `#9002·8` 没有区别，
+// 而那一场可能只有 6 段）。所以"带出处"如果不配一个**机器可执行的核对**，
+// 它带来的不是可信度，而是**更难被发现的可信度假象**。
+//
+// 这条命令就是那个核对：把报告当普通文本读，捞出所有 `#会话·段`，
+// 逐个回库里查。编造的、越界的、写错会话号的，全部点出来。
+//
+// 不加载任何模型，纯查库 + 正则，毫秒级。
+static int run_verify_report(const AppConfig& cfg) {
+    SessionStore::instance().init(cfg.db_path);
+
+    std::ifstream in(cfg.verify_report, std::ios::binary);
+    if (!in) {
+        std::cerr << "读不到文件：" << cfg.verify_report << std::endl;
+        return 1;
+    }
+    std::string text((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+    if (text.empty()) {
+        std::cerr << "文件是空的：" << cfg.verify_report << std::endl;
+        return 1;
+    }
+
+    const auto locs = evidence::extract(text);
+    const auto vr   = evidence::Evidence::verify(text);
+
+    std::cout << "文件: " << cfg.verify_report << "（" << text.size() << " 字节）"
+              << std::endl;
+    std::cout << "库  : " << cfg.db_path << std::endl;
+
+    if (locs.empty()) {
+        // ⚠️ **"零引用"不能报成通过。** 一份没有任何出处的报告
+        // 是"没做这件事"，不是"做对了" —— 把它算成 100% 通过，
+        // 等于给最该被质疑的那种报告发绿灯。
+        std::cout << "\n⚠️ 这份报告里**一处出处都没有**。" << std::endl;
+        std::cout << "   这不等于通过：不能核对的结论，读者只能选择信或不信。" << std::endl;
+        std::cout << "   出处格式是 #会话号·段号，例如 #9002·3。" << std::endl;
+        std::cout << "[verify-report] citations=0 ok=0 bad=0" << std::endl;
+        return 2;
+    }
+
+    std::cout << "\n核对 " << vr.total << " 处出处：" << std::endl;
+    for (const auto& l : locs) {
+        const int n = evidence::Evidence::segment_count(l.session_id);
+        Segment s;
+        const bool found = evidence::Evidence::resolve(l, &s);
+        std::cout << "  " << (found ? "✅" : "❌") << " "
+                  << evidence::format(l);
+        if (found) {
+            // 把那段原文开头摘出来 —— 让核对的人**当场看到**它确实在那儿，
+            // 而不是只看到一个绿勾（绿勾是程序说的，原话是自己的眼睛看到的）
+            std::cout << "  " << utf8::truncate(s.src_text, 40);
+        } else {
+            std::cout << "  ← 该位置不存在";
+            if (n == 0) std::cout << "（会话 #" << l.session_id << " 在库里没有段落）";
+            else        std::cout << "（会话 #" << l.session_id << " 只有 " << n << " 段）";
+        }
+        std::cout << std::endl;
+    }
+
+    std::cout << "\n[verify-report] citations=" << vr.total
+              << " ok=" << vr.ok << " bad=" << vr.bad.size() << std::endl;
+    if (!vr.bad.empty()) {
+        std::cerr << "\n❌ 有 " << vr.bad.size() << " 处出处对不上 —— "
+                     "**报告里有编造或写错的位置**。" << std::endl;
+        for (const auto& l : vr.bad) {
+            std::cerr << "   " << evidence::format(l) << std::endl;
+        }
+        return 1;
+    }
+    std::cout << "✅ 全部 " << vr.ok << " 处出处都指向真实存在的段落。" << std::endl;
     return 0;
 }
 
@@ -5329,6 +5441,127 @@ static int run_selftest(const AppConfig& cfg) {
             if (!a_ok) { std::cerr << "    " << a_why << std::endl; return 1; }
         }
 
+        // ㉔ **出处（5.7）**：格式、从散文里捞引用、以及**证伪**
+        //
+        // 【为什么"证伪"要和"打印"一起验】这一节的价值全在证伪那一半。
+        // 编出来的出处（`#9002·7` 当那一场只有 4 段）和真的长得一模一样，
+        // 所以"能标出处"这件事本身**不构成任何保证**；
+        // 只有"能当场抓出对不上的"才是。
+        {
+            using evidence::Locator;
+            bool e_ok = true;
+            std::string e_why;
+            auto efail = [&](const std::string& m) {
+                e_ok = false;
+                if (e_why.empty()) e_why = m;
+            };
+
+            // ---- ① 格式：唯一形状 ----
+            {
+                Locator l; l.session_id = 9002; l.seq = 3;
+                if (evidence::format(l) != u8"#9002·3") {
+                    efail("出处格式不对：应为 #9002·3，实际 " + evidence::format(l));
+                }
+                Locator bad;                    // session_id=-1, seq=0
+                if (!evidence::format(bad).empty()) {
+                    efail("无效位置却格式化出了字符串（会让人以为引用是有效的）");
+                }
+            }
+
+            // ---- ② 从散文里捞引用 ----
+            {
+                const std::string text =
+                    u8"接口文档需要重写（#9002·2）。压测报告由李经理负责（#9002·3）。"
+                    u8"另外 #9002·2 又提了一次。";
+                const auto got = evidence::extract(text);
+                if (got.size() != 2) {
+                    // 去重后应是 2（第三个是重复的同一处）
+                    efail("从散文里捞引用应为 2 处（去重后），实际 "
+                          + std::to_string(got.size()));
+                } else if (got[0].session_id != 9002 || got[0].seq != 2 ||
+                           got[1].seq != 3) {
+                    efail("捞出来的引用顺序/内容不对（应保持出现顺序）");
+                }
+
+                // ⚠️ **不该被误抓的几种**（正文里到处都是这些形状）
+                struct Neg { const char* text; const char* why; };
+                const Neg negs[] = {
+                    {u8"这个问题 #3 很关键", u8"光有段号没有会话号也被抓了"},
+                    {u8"会议定在 14:01 · 三点开始", u8"正文里的时间被当成引用了"},
+                    {u8"#9002 这一场整体不错", u8"只有会话号也被抓了"},
+                    {u8"第 3 段说了这件事", u8"「第 3 段」这种说法被当成引用了"},
+                    {u8"C++ 里 #define 是预处理指令", u8"代码片段被当成引用了"},
+                };
+                for (const auto& n : negs) {
+                    if (!evidence::extract(n.text).empty()) efail(n.why);
+                }
+            }
+
+            // ---- ③ 证伪：这是本组最重要的一条 ----
+            {
+                // 真库（自检的一次性 scratch 库）里造一场 3 段的会话
+                auto& store = SessionStore::instance();
+                const long long sid2 = store.begin_session("SelfTest", "出处用例");
+                if (sid2 <= 0) {
+                    efail("开不了自检会话");
+                } else {
+                    store.log_segment(u8"第一段：接口文档需要重写", u8"第一段", "SelfTest", 0);
+                    store.log_segment(u8"第二段：压测报告由李经理负责", u8"第二段", "SelfTest", 0);
+                    store.log_segment(u8"第三段：安全评审定在下周三", u8"第三段", "SelfTest", 0);
+                    store.end_session();
+
+                    Locator good; good.session_id = sid2; good.seq = 2;
+                    Segment s;
+                    if (!evidence::Evidence::resolve(good, &s)) {
+                        efail("真实存在的段落却 resolve 失败（引用全会被误判成编造）");
+                    } else if (s.src_text.find(u8"压测报告") == std::string::npos) {
+                        efail("resolve 回来的不是那一段（段号对错了行）");
+                    }
+
+                    // 越界：那一场只有 3 段
+                    Locator oob; oob.session_id = sid2; oob.seq = 99;
+                    if (evidence::Evidence::resolve(oob, nullptr)) {
+                        efail("越界的段号被判成存在 —— 编造的出处抓不出来");
+                    }
+                    // 不存在的会话
+                    Locator nos; nos.session_id = 987654321; nos.seq = 1;
+                    if (evidence::Evidence::resolve(nos, nullptr)) {
+                        efail("不存在的会话被判成存在");
+                    }
+                    if (evidence::Evidence::segment_count(sid2) != 3) {
+                        efail("segment_count 不对（应为 3，实际 "
+                              + std::to_string(evidence::Evidence::segment_count(sid2)) + "）");
+                    }
+
+                    // 整段文本核对：1 真 + 2 假 → 必须报 ok=1 bad=2
+                    const std::string report =
+                        u8"结论一（" + evidence::format(good) + u8"）。"
+                        u8"结论二（" + evidence::format(oob) + u8"）。"
+                        u8"结论三（" + evidence::format(nos) + u8"）。";
+                    const auto vr = evidence::Evidence::verify(report);
+                    if (vr.total != 3) {
+                        efail("核对应识别 3 处，实际 " + std::to_string(vr.total));
+                    } else if (vr.ok != 1) {
+                        efail("应只有 1 处有效，实际 " + std::to_string(vr.ok));
+                    } else if (vr.bad.size() != 2) {
+                        efail("应报 2 处对不上（编造/越界），实际 "
+                              + std::to_string(vr.bad.size()));
+                    }
+
+                    // 一份**没有出处**的报告：不能报错，但也不能算"通过"
+                    // （这一条对应 --verify-report 的 exit 2 —— 零引用不是成功）
+                    const auto vr0 = evidence::Evidence::verify(u8"这次会开了三个主题。");
+                    if (vr0.total != 0 || vr0.ok != 0 || !vr0.bad.empty()) {
+                        efail(u8"没有出处的文本被算成了有问题（应该只是「零引用」）");
+                    }
+                }
+            }
+
+            std::cout << "[SelfTest] 出处（格式/从散文捞引用/证伪编造与越界/零引用）: "
+                      << (e_ok ? "✅ 通过" : "❌ 失败") << std::endl;
+            if (!e_ok) { std::cerr << "    " << e_why << std::endl; return 1; }
+        }
+
         // 【这里刻意不写"共 N 例"】原来写死了 `"✅ 11 例通过"`，
         // 而加用例的人（我）不会记得回来改数字 —— 本轮加了 ⑫⑬⑭ 三条之后，
         // 它照样打"11 例通过"，**在骗人**。手写计数就是这个下场。
@@ -5644,6 +5877,7 @@ static int run_app(int argc, char** argv) {
     if (cfg.dump_terms) return run_dump_terms(cfg);
     if (cfg.triage_cache) return run_triage_cache(cfg);
     if (cfg.show_actions || cfg.action_set_id >= 0) return run_actions(cfg);
+    if (!cfg.verify_report.empty()) return run_verify_report(cfg);
     if (!cfg.dump_prompt.empty()) return run_dump_prompt(cfg);
     if (cfg.export_session >= 0) return run_export(cfg);
 

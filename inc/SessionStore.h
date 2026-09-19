@@ -15,6 +15,9 @@ namespace triage { class TriageCache; }
 // 它必须和会话在**同一个文件**里，因为"这个任务出自哪几场"要 JOIN sessions 才算得出来。
 namespace actions { class ActionStore; }
 
+// 出处核对（5.7）：要把报告里的引用回去查 segments 表。
+namespace evidence { class Evidence; }
+
 // 一条翻译记录（一场会话里的一句话）
 struct Segment {
     long long   id = 0;
@@ -131,6 +134,9 @@ private:
     // ⚠️ 这里能 friend 的**只有类**：`ActionStore` 的判同函数是命名空间里的自由函数，
     //    它们拿不到 db_，所以刻意做成纯函数（不碰库）—— 见 ActionStore.h 的说明。
     friend class actions::ActionStore;
+
+    // 出处核对同理（读 segments 判断"这个引用指向的段落存不存在"）。
+    friend class evidence::Evidence;
 
     bool ensure_schema();           // 建表 + 预编译语句
 

@@ -1,4 +1,5 @@
 #include "DeliverableWriter.h"
+#include "Evidence.h"   // 出处格式的唯一来源（5.7）
 #include "Utf8.h"   // 写出边界的 UTF-8 净化
 
 #include <algorithm>
@@ -752,6 +753,32 @@ OutputLabels labels_for(const std::string& type) {
              u8"三、行动项", u8"（本场未识别到明确行动项）", u8"四、双语全文" };
 }
 
+// 标记里的出处单元格：`[#9002·3](#seg-3)`，没有段号时给一个破折号。
+//
+// 【为什么是链接而不是纯文本】"可跳回段落"这个要求，纯文本做不到 ——
+// 读者还是得自己滚到下面找。而 markdown 的 `[文字](#锚点)` 在 GitHub/编辑器里
+// 是真能点的。锚点用 `seg-<seq>`，和全文表格里的 `<a id="seg-<seq>">` 对上。
+//
+// ⚠️ 段号为 0 表示"规则路径没回填上来源"（不是错误，是已知情况）——
+// 这种情况下**不编一个出处出来**，写 `—`。编出来的出处比没有出处更坏。
+static std::string cite_md(long long sid, int seq) {
+    if (seq <= 0) return u8"—";
+    evidence::Locator loc;
+    loc.session_id = sid;
+    loc.seq        = seq;
+    return "[" + evidence::format(loc) + "](#seg-" + std::to_string(seq) + ")";
+}
+
+// HTML 里的出处：`<a class="cite" href="#seg-3">#9002·3</a>`
+static std::string cite_html(long long sid, int seq) {
+    if (seq <= 0) return u8"—";
+    evidence::Locator loc;
+    loc.session_id = sid;
+    loc.seq        = seq;
+    return "<a class=\"cite\" href=\"#seg-" + std::to_string(seq) + "\">" +
+           html_escape(evidence::format(loc)) + "</a>";
+}
+
 std::string render_markdown(long long sid,
                             const std::vector<Segment>& segs,
                             const SessionMeta& meta,
@@ -788,14 +815,18 @@ std::string render_markdown(long long sid,
     if (sum.actions.empty()) {
         o << "_" << L.actions_empty << "_\n\n";
     } else {
-        o << u8"| # | 负责人 | 事项 | 截止 | 来源段落 |\n|---|---|---|---|---|\n";
+        // 【出处这一列从"只写段号"改成"会话号·段号 + 可点链接"】
+        // 原来写的是 `#3` —— 在一份**跨会话**的周报里，`#3` 指的是哪一场的第 3 段？
+        // 每个会话都有一模一样的段号，所以那种引用在跨会话场景下**根本没法核对**。
+        // 格式统一由 evidence::format 出，且能点回下面的全文表格。
+        o << u8"| # | 负责人 | 事项 | 截止 | 出处 |\n|---|---|---|---|---|\n";
         for (size_t i = 0; i < sum.actions.size(); ++i) {
             const auto& a = sum.actions[i];
             o << "| " << (i + 1)
               << " | " << (a.owner.empty() ? u8"—" : md_cell(a.owner))
               << " | " << md_cell(a.task)
               << " | " << (a.due.empty() ? u8"—" : md_cell(a.due))
-              << " | " << (a.seq > 0 ? ("#" + std::to_string(a.seq)) : u8"—")
+              << " | " << md_cell(cite_md(sid, a.seq))
               << " |\n";
         }
         o << "\n";
@@ -805,9 +836,12 @@ std::string render_markdown(long long sid,
     if (segs.empty()) {
         o << u8"_（无）_\n";
     } else {
+        // 行首加 `<a id="seg-N">` 锚点：上面"出处"列里点一下就跳到这里。
+        // **锚点必须和出处用同一个段号来源**（都是 s.seq）——
+        // 一个用数组下标、一个用 seq 的话，在段号不连续时会静默跳错行。
         o << u8"| # | 时间 | 原文 | 译文 | 引擎 | 耗时 |\n|---|---|---|---|---|---|\n";
         for (const auto& s : segs) {
-            o << "| " << s.seq
+            o << "| <a id=\"seg-" << s.seq << "\"></a>" << s.seq
               << " | " << md_cell(s.ts)
               << " | " << md_cell(s.src_text)
               << " | " << md_cell(s.tgt_text)
@@ -885,16 +919,14 @@ std::string render_html(long long sid,
         o << "<p class=\"muted\">" << html_escape(L.actions_empty) << "</p>\n";
     } else {
         o << "<table>\n<tr><th>#</th><th>" << u8"负责人" << "</th><th>" << u8"事项"
-          << "</th><th>" << u8"截止" << "</th><th>" << u8"来源" << "</th></tr>\n";
+          << "</th><th>" << u8"截止" << "</th><th>" << u8"出处" << "</th></tr>\n";
         for (size_t i = 0; i < sum.actions.size(); ++i) {
             const auto& a = sum.actions[i];
             o << "<tr><td class=\"num\">" << (i + 1) << "</td>"
               << "<td>" << (a.owner.empty() ? u8"—" : html_escape(a.owner)) << "</td>"
               << "<td>" << html_escape(a.task) << "</td>"
               << "<td>" << (a.due.empty() ? u8"—" : html_escape(a.due)) << "</td>"
-              << "<td class=\"num\">"
-              << (a.seq > 0 ? ("#" + std::to_string(a.seq)) : u8"—")
-              << "</td></tr>\n";
+              << "<td class=\"num\">" << cite_html(sid, a.seq) << "</td></tr>\n";
         }
         o << "</table>\n";
     }
@@ -906,7 +938,11 @@ std::string render_html(long long sid,
         o << "<table>\n<tr><th>#</th><th>" << u8"时间" << "</th><th>" << u8"原文"
           << "</th><th>" << u8"译文" << "</th><th>" << u8"耗时" << "</th></tr>\n";
         for (const auto& s : segs) {
-            o << "<tr><td class=\"num\">" << s.seq << "</td>"
+            // `id="seg-N"` 是上面"出处"列的落点 —— 点一下直接跳到这一行。
+            // ⚠️ 用 `s.seq` 而不是循环下标：段号不连续时（清洗过、或跨场合并过）
+            //    下标和 seq 会对不上，于是"点过去跳到隔壁一行"，
+            //    而这种错**没人会怀疑是 bug**，只会以为"记错了"。
+            o << "<tr id=\"seg-" << s.seq << "\"><td class=\"num\">" << s.seq << "</td>"
               << "<td class=\"num\">" << html_escape(s.ts) << "</td>"
               << "<td>" << html_escape(s.src_text) << "</td>"
               << "<td>" << html_escape(s.tgt_text) << "</td>"
@@ -920,16 +956,22 @@ std::string render_html(long long sid,
     return o.str();
 }
 
-std::string render_actions_csv(const MeetingSummary& sum) {
+// CSV 也要带上会话号 —— 这个文件最常见的用法是**几场的 CSV 拼起来看**，
+// 只写段号的话拼完之后就分不清哪一行出自哪一场了。
+std::string render_actions_csv(long long sid, const MeetingSummary& sum) {
     std::ostringstream o;
-    o << u8"序号,负责人,事项,截止,来源段落,来源原文\r\n";
+    o << u8"序号,负责人,事项,截止,出处,来源原文\r\n";
     for (size_t i = 0; i < sum.actions.size(); ++i) {
         const auto& a = sum.actions[i];
+        evidence::Locator loc;
+        loc.session_id = sid;
+        loc.seq        = a.seq;
         o << (i + 1) << ','
           << csv_escape(a.owner)  << ','
           << csv_escape(a.task)   << ','
           << csv_escape(a.due)    << ','
-          << a.seq                << ','
+          << csv_escape(loc.valid() ? evidence::format(loc) : std::string())
+          << ','
           << csv_escape(a.source) << "\r\n";
     }
     return o.str();
@@ -1002,7 +1044,7 @@ DeliverableWriter::Result DeliverableWriter::write(long long session_id,
     const Item items[] = {
         {dir / (base + ".md"),  render_markdown(session_id, segs, meta, sum), false},
         {dir / (base + ".html"), render_html(session_id, segs, meta, sum),    false},
-        {dir / "actions.csv",    render_actions_csv(sum),                     true},
+        {dir / "actions.csv",    render_actions_csv(session_id, sum),        true},
         {dir / "transcript.srt", render_srt(segs),                            false},
     };
 

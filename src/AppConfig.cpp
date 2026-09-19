@@ -120,6 +120,7 @@ AppConfig AppConfig::from(int argc, char** argv) {
             }
         }
         else if (arg == "--actions")       cfg.show_actions = true;
+        else if (arg == "--verify-report") next(cfg.verify_report);
         else if (arg == "--status")        next(cfg.actions_status);
         // --done/--doing/--todo 三个都是"把某条 action 改成这个状态"。
         // 合成一个分支是因为它们除了目标值之外完全一样 —— 写三遍就是三处要走散。

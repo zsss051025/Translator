@@ -159,6 +159,10 @@ struct AppConfig {
     long long   action_set_id = -1;   // 要改状态的 id
     std::string action_set_to;        // 改成什么
 
+    // --verify-report <文件>：核对一份报告里每处出处的真伪（5.7）。
+    // 非空 = 执行这条命令并退出。
+    std::string verify_report;
+
     // --glossary <文件>：术语表（每行一个词/短语，# 为注释）。
     // 内容会作为 initial_prompt 喂给 Whisper，让专有名词识别更稳定。
     std::string glossary_path;
